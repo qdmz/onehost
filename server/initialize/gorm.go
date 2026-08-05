@@ -68,10 +68,16 @@ func Gorm() *gorm.DB {
 	// 能通过 global.APP_DB 访问数据库连接，避免出现「数据库连接不可用」警告
 	global.APP_DB = db
 
-	// 只有在数据库连接成功时才进行表结构迁移
-	global.APP_LOG.Info("开始数据库表结构自动迁移")
-	RegisterTables(db)
-	global.APP_LOG.Info("数据库表结构迁移完成")
+	// 检查系统是否已初始化（表已存在）
+	// 如果已初始化则跳过自动迁移，避免MariaDB上AutoMigrate挂起的问题
+	if isSystemInitialized(db) {
+		global.APP_LOG.Info("系统已初始化，跳过数据库表结构自动迁移")
+	} else {
+		// 只有在数据库连接成功且系统未初始化时才进行表结构迁移
+		global.APP_LOG.Info("开始数据库表结构自动迁移")
+		RegisterTables(db)
+		global.APP_LOG.Info("数据库表结构迁移完成")
+	}
 
 	// 检测数据库方言，配置 ON DUPLICATE KEY UPDATE 兼容层
 	dbcompat.Init(db)
@@ -233,4 +239,34 @@ func ensureAuditLogTextCharset(db *gorm.DB) {
 	).Error; err != nil {
 		global.APP_LOG.Warn("修正审计日志字符集失败（可忽略，后续迁移会重试）", zap.Error(err))
 	}
+}
+
+// isSystemInitialized 检查系统是否已初始化（通过检查users表是否存在且有数据）
+// 用于跳过已初始化系统的自动迁移，避免MariaDB上AutoMigrate挂起问题
+func isSystemInitialized(db *gorm.DB) bool {
+	if db == nil {
+		return false
+	}
+
+	// 检查users表是否存在
+	var count int64
+	err := db.Raw("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'").Scan(&count).Error
+	if err != nil {
+		global.APP_LOG.Debug("检查users表是否存在失败", zap.Error(err))
+		return false
+	}
+
+	if count == 0 {
+		return false
+	}
+
+	// 检查users表是否有数据（至少有一个管理员用户）
+	var userCount int64
+	err = db.Raw("SELECT COUNT(*) FROM users").Scan(&userCount).Error
+	if err != nil {
+		global.APP_LOG.Debug("检查users表数据失败", zap.Error(err))
+		return false
+	}
+
+	return userCount > 0
 }
