@@ -6,7 +6,7 @@ import i18n from '@/i18n'
 
 const service = axios.create({
   baseURL: import.meta.env.VITE_BASE_API,
-  timeout: 6000, // 恢复原来的6秒全局超时
+  timeout: 15000, // 15秒全局超时
   headers: {
     'Content-Type': 'application/json'
   }
@@ -172,18 +172,18 @@ service.interceptors.response.use(
 
       if (!isAuthEndpoint) {
         const userStore = useUserStore()
-        userStore.clearUserData()
 
         // 避免重复提示和重定向
         if (!isRedirecting) {
           isRedirecting = true
+          userStore.clearUserData()
           ElMessage.warning(i18n.global.t('common.loginExpired'))
           // 使用 hash 模式重定向到首页（与路由的 createWebHashHistory 一致）
           const currentHash = window.location.hash
           if (!currentHash.includes('/home') && !currentHash.includes('/login')) {
             window.location.href = window.location.pathname + '#/home'
           }
-          setTimeout(() => { isRedirecting = false }, 1000)
+          setTimeout(() => { isRedirecting = false }, 1500)
         }
       }
     }

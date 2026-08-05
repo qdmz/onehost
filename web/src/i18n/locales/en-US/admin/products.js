@@ -53,6 +53,7 @@ export default {
   deleteFailed: '删除失败',
   saveSuccess: '保存成功',
   saveFailed: '保存失败',
+  validationFailed: '表单验证失败，请检查输入',
   nameRequired: '请输入产品名称',
   typeRequired: '请选择产品类型',
   cpuRequired: '请输入CPU核数',

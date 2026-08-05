@@ -142,7 +142,7 @@
           </el-col>
           <el-col :span="8">
             <el-form-item :label="t('admin.products.disk')" prop="disk">
-              <el-input-number v-model="form.disk" :min="1" style="width: 100%;" />
+              <el-input-number v-model="form.disk" :min="1024" :step="1024" style="width: 100%;" />
             </el-form-item>
           </el-col>
         </el-row>
@@ -189,15 +189,6 @@
 
         <el-form-item :label="t('admin.products.providerIds')" prop="providerIds">
           <el-input v-model="form.providerIds" :placeholder="t('admin.products.providerIdsPlaceholder')" />
-        </el-form-item>
-
-        <el-form-item :label="t('admin.products.nodeId')" prop="node_id">
-          <el-input v-model="form.node_id" :placeholder="t('admin.products.nodePlaceholder')" />
-        </el-form-item>
-
-        <el-form-item :label="t('admin.products.tags')">
-          <el-checkbox v-model="form.is_new">{{ t('admin.products.newTag') }}</el-checkbox>
-          <el-checkbox v-model="form.is_hot">{{ t('admin.products.hotTag') }}</el-checkbox>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -356,8 +347,13 @@ const handleEdit = (row) => {
 
 // 提交
 const handleSubmit = async () => {
-  const valid = await formRef.value?.validate().catch(() => false)
-  if (!valid) return
+  try {
+    const valid = await formRef.value?.validate()
+    if (!valid) return
+  } catch {
+    ElMessage.warning(t('admin.products.validationFailed'))
+    return
+  }
 
   submitting.value = true
   try {

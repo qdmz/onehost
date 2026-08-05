@@ -43,7 +43,7 @@
               <el-tag :type="getStatusType(ticket.status)" size="small">
                 {{ getStatusText(ticket.status) }}
               </el-tag>
-              <el-tag type="info" size="small">{{ ticket.category }}</el-tag>
+              <el-tag type="info" size="small">{{ getCategoryText(ticket.category) }}</el-tag>
             </div>
             <span class="ticket-time">{{ formatDate(ticket.updated_at || ticket.created_at) }}</span>
           </div>
@@ -123,7 +123,7 @@
           </div>
           <div class="meta-row">
             <span class="meta-label">{{ t('user.tickets.category') }}:</span>
-            <el-tag size="small">{{ currentTicket.category }}</el-tag>
+            <el-tag size="small">{{ getCategoryText(currentTicket.category) }}</el-tag>
             <el-tag :type="getStatusType(currentTicket.status)" size="small" style="margin-left: 8px;">
               {{ getStatusText(currentTicket.status) }}
             </el-tag>
@@ -232,6 +232,18 @@ const filterStatusMap = {
 
 const getStatusType = (status) => statusMap[status]?.type || 'info'
 const getStatusText = (status) => statusMap[status]?.text || status
+
+// 分类翻译
+const categoryMap = {
+  general: 'catGeneral',
+  technical: 'catTechnical',
+  billing: 'catBilling',
+  other: 'catOther'
+}
+const getCategoryText = (category) => {
+  const key = categoryMap[category]
+  return key ? t(`user.tickets.${key}`) : category
+}
 
 const formatDate = (dateString) => {
   if (!dateString) return '-'

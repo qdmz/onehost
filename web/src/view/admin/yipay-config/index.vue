@@ -30,6 +30,14 @@
           <el-input v-model="form.key" type="password" show-password :placeholder="t('admin.yipayConfig.keyPlaceholder')" style="width: 400px;" />
         </el-form-item>
 
+        <el-form-item :label="t('admin.yipayConfig.payType')" prop="payType">
+          <el-select v-model="form.payType" style="width: 300px;">
+            <el-option label="支付宝" value="alipay" />
+            <el-option label="微信支付" value="wxpay" />
+            <el-option label="QQ支付" value="qqpay" />
+          </el-select>
+        </el-form-item>
+
         <el-divider content-position="left">{{ t('admin.yipayConfig.callbackConfig') }}</el-divider>
 
         <el-form-item :label="t('admin.yipayConfig.notifyUrl')">
@@ -88,6 +96,7 @@ const form = ref({
   apiUrl: '',
   pid: '',
   key: '',
+  payType: 'alipay',
   notifyUrl: '',
   returnUrl: '',
   feePercent: 0,

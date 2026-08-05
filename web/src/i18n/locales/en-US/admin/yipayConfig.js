@@ -11,6 +11,7 @@ export default {
   pidPlaceholder: '请输入商户ID',
   key: '商户密钥',
   keyPlaceholder: '请输入商户密钥',
+  payType: '支付方式',
   notifyUrl: '异步通知地址',
   notifyUrlHint: '请将此地址填写到易支付平台的异步通知URL中',
   returnUrl: '同步跳转地址',

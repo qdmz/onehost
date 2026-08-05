@@ -66,5 +66,6 @@ export default {
   loadFailed: '加载站点配置失败',
   saveSuccess: '站点配置保存成功',
   saveFailed: '站点配置保存失败',
+  validationFailed: '表单验证失败，请检查输入',
   resetSuccess: '已重置为最新配置'
 }

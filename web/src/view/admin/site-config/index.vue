@@ -397,7 +397,7 @@ const rules = {
     { type: 'email', message: t('admin.siteConfig.emailFormatError'), trigger: 'blur' }
   ],
   primary_color: [
-    { pattern: /^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/, message: t('admin.siteConfig.colorFormatError'), trigger: 'blur' }
+    { pattern: /^(#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?|rgba?\([^)]+\))$/, message: t('admin.siteConfig.colorFormatError'), trigger: 'blur' }
   ]
 }
 
@@ -514,8 +514,13 @@ const removeFavicon = () => {
 
 // 提交表单
 const handleSubmit = async () => {
-  const valid = await formRef.value?.validate().catch(() => false)
-  if (!valid) return
+  try {
+    const valid = await formRef.value?.validate()
+    if (!valid) return
+  } catch {
+    ElMessage.warning(t('admin.siteConfig.validationFailed'))
+    return
+  }
 
   submitting.value = true
   try {
