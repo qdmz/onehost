@@ -75,7 +75,10 @@ export function setupRouterGuards(router) {
       
       // 获取用户信息
       try {
-        await userStore.fetchUserInfo()
+        const result = await userStore.fetchUserInfo()
+        if (!result || !result.success) {
+          throw new Error('fetchUserInfo returned failure')
+        }
         
         // 根据用户类型和视图模式跳转到相应页面
         const userType = userStore.userType
@@ -108,7 +111,10 @@ export function setupRouterGuards(router) {
       
       // 获取用户信息
       try {
-        await userStore.fetchUserInfo()
+        const result = await userStore.fetchUserInfo()
+        if (!result || !result.success) {
+          throw new Error('fetchUserInfo returned failure')
+        }
         
         // 清理OAuth2回调相关的localStorage
         localStorage.removeItem('username')
@@ -176,7 +182,10 @@ export function setupRouterGuards(router) {
       // 检查用户信息和状态
       if (!userStore.user) {
         try {
-          await userStore.fetchUserInfo()
+          const result = await userStore.fetchUserInfo()
+          if (!result || !result.success) {
+            throw new Error('fetchUserInfo returned failure')
+          }
         } catch (error) {
           console.error('获取用户信息失败:', error)
           userStore.logout()

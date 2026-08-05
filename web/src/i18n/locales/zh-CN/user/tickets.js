@@ -1,42 +1,71 @@
 export default {
   title: '我的工单',
   createTicket: '创建工单',
+  // 筛选
   all: '全部',
-  pending: '待处理',
-  processing: '处理中',
-  resolved: '已解决',
+  open: '待处理',
+  replied: '已回复',
   closed: '已关闭',
+  // 状态文本
+  openStatus: '待处理',
+  repliedStatus: '已回复',
+  solvedStatus: '已解决',
+  closedStatus: '已关闭',
+  // 分类
   category: '分类',
+  selectCategory: '请选择分类',
+  catGeneral: '一般咨询',
+  catTechnical: '技术问题',
+  catBilling: '账单问题',
+  catOther: '其他',
+  // 兼容旧键名
   categoryGeneral: '一般咨询',
   categoryTechnical: '技术问题',
   categoryBilling: '账单问题',
   categoryOther: '其他',
+  // 表单
   subject: '主题',
+  inputSubject: '请输入主题',
   content: '内容',
+  inputContent: '请输入工单内容',
+  inputReply: '请输入回复内容',
+  // 验证
+  categoryRequired: '请选择分类',
+  subjectRequired: '请输入工单主题',
+  contentRequired: '请输入工单内容',
+  // 列表
   status: '状态',
+  pending: '待处理',
+  processing: '处理中',
+  resolved: '已解决',
   createTime: '创建时间',
   updateTime: '更新时间',
   actions: '操作',
   view: '查看',
   reply: '回复',
   close: '关闭',
+  noTickets: '暂无工单',
+  loadFailed: '加载工单列表失败',
+  // 详情
   ticketDetail: '工单详情',
   conversation: '对话记录',
   yourReply: '您的回复',
-  sendReply: '发送回复',
+  me: '我',
+  staff: '客服',
+  admin: '客服',
+  closedHint: '该工单已关闭，无法继续回复。',
+  // 回复
   replyPlaceholder: '请输入回复内容...',
+  sendReply: '发送回复',
   replySuccess: '回复成功',
   replyFailed: '回复失败',
+  // 关闭
   closeConfirm: '确定要关闭该工单吗？关闭后将无法继续回复。',
   closeSuccess: '工单已关闭',
   closeFailed: '关闭工单失败',
+  // 创建
   createSuccess: '工单创建成功',
   createFailed: '工单创建失败',
-  subjectRequired: '请输入工单主题',
-  contentRequired: '请输入工单内容',
-  noTickets: '暂无工单',
-  loadFailed: '加载工单列表失败',
-  me: '我',
-  admin: '客服',
+  // 其他
   newMessage: '新消息'
 }

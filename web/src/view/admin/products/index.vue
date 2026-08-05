@@ -239,16 +239,14 @@ const form = ref({
   category: '',
   cpu: 1,
   memory: 1024,
-  disk: 10,
+  disk: 10240,
   bandwidth: 100,
   traffic: 0,
-  price: 0,
+  price: 1,
   periodType: 'month',
   periodValue: 1,
   providerIds: '',
-  node_id: '',
-  is_new: false,
-  is_hot: false
+  imageIds: ''
 })
 
 const formRules = {
@@ -331,16 +329,14 @@ const handleAdd = () => {
     category: '',
     cpu: 1,
     memory: 1024,
-    disk: 10,
+    disk: 10240,
     bandwidth: 100,
     traffic: 0,
-    price: 0,
+    price: 1,
     periodType: 'month',
     periodValue: 1,
     providerIds: '',
-    node_id: '',
-    is_new: false,
-    is_hot: false
+    imageIds: ''
   }
   dialogVisible.value = true
 }

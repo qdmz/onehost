@@ -56,7 +56,7 @@
         <el-table-column :label="t('admin.tickets.subject')" prop="title" min-width="180" />
         <el-table-column :label="t('admin.tickets.category')" width="100">
           <template #default="{ row }">
-            <el-tag size="small">{{ row.category }}</el-tag>
+            <el-tag size="small">{{ getCategoryText(row.category) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column :label="t('admin.tickets.status')" width="100">
@@ -121,7 +121,7 @@
           </div>
           <div class="meta-row">
             <span class="meta-label">{{ t('admin.tickets.category') }}:</span>
-            <el-tag size="small">{{ currentTicket.category }}</el-tag>
+            <el-tag size="small">{{ getCategoryText(currentTicket.category) }}</el-tag>
             <el-tag :type="getStatusType(currentTicket.status)" size="small" style="margin-left: 8px;">
               {{ getStatusText(currentTicket.status) }}
             </el-tag>
@@ -207,6 +207,18 @@ const statusMap = {
 
 const getStatusType = (status) => statusMap[status]?.type || 'info'
 const getStatusText = (status) => statusMap[status]?.text || status
+
+// 分类翻译映射
+const categoryMap = {
+  general: 'catGeneral',
+  technical: 'catTechnical',
+  billing: 'catBilling',
+  other: 'catOther'
+}
+const getCategoryText = (category) => {
+  const key = categoryMap[category]
+  return key ? t(`admin.tickets.${key}`) : category
+}
 
 const formatDate = (dateString) => {
   if (!dateString) return '-'

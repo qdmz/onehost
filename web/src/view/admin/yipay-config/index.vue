@@ -18,8 +18,8 @@
           <el-input v-model="form.name" style="width: 300px;" />
         </el-form-item>
 
-        <el-form-item :label="t('admin.yipayConfig.apiUrl')" prop="api_url">
-          <el-input v-model="form.api_url" :placeholder="t('admin.yipayConfig.apiUrlPlaceholder')" style="width: 400px;" />
+        <el-form-item :label="t('admin.yipayConfig.apiUrl')" prop="apiUrl">
+          <el-input v-model="form.apiUrl" :placeholder="t('admin.yipayConfig.apiUrlPlaceholder')" style="width: 400px;" />
         </el-form-item>
 
         <el-form-item :label="t('admin.yipayConfig.pid')" prop="pid">
@@ -33,28 +33,28 @@
         <el-divider content-position="left">{{ t('admin.yipayConfig.callbackConfig') }}</el-divider>
 
         <el-form-item :label="t('admin.yipayConfig.notifyUrl')">
-          <el-input v-model="form.notify_url" readonly style="width: 500px;" />
+          <el-input v-model="form.notifyUrl" readonly style="width: 500px;" />
           <div class="form-hint">{{ t('admin.yipayConfig.notifyUrlHint') }}</div>
         </el-form-item>
 
         <el-form-item :label="t('admin.yipayConfig.returnUrl')">
-          <el-input v-model="form.return_url" readonly style="width: 500px;" />
+          <el-input v-model="form.returnUrl" readonly style="width: 500px;" />
           <div class="form-hint">{{ t('admin.yipayConfig.returnUrlHint') }}</div>
         </el-form-item>
 
         <el-divider content-position="left">{{ t('admin.yipayConfig.feeConfig') }}</el-divider>
 
         <el-form-item :label="t('admin.yipayConfig.feePercent')">
-          <el-input-number v-model="form.fee_percent" :min="0" :max="100" :precision="2" style="width: 200px;" />
+          <el-input-number v-model="form.feePercent" :min="0" :max="100" :precision="2" style="width: 200px;" />
           <span style="margin-left: 8px;">%</span>
         </el-form-item>
 
         <el-form-item :label="t('admin.yipayConfig.minAmount')">
-          <el-input-number v-model="form.min_amount" :min="0" :precision="2" style="width: 200px;" />
+          <el-input-number v-model="form.minAmount" :min="0" :precision="2" style="width: 200px;" />
         </el-form-item>
 
         <el-form-item :label="t('admin.yipayConfig.maxAmount')">
-          <el-input-number v-model="form.max_amount" :min="0" :precision="2" style="width: 200px;" />
+          <el-input-number v-model="form.maxAmount" :min="0" :precision="2" style="width: 200px;" />
         </el-form-item>
 
         <el-alert type="info" :closable="false" style="margin: 20px 0;">
@@ -85,14 +85,14 @@ const submitting = ref(false)
 const form = ref({
   enabled: false,
   name: '易支付',
-  api_url: '',
+  apiUrl: '',
   pid: '',
   key: '',
-  notify_url: '',
-  return_url: '',
-  fee_percent: 0,
-  min_amount: 1,
-  max_amount: 10000
+  notifyUrl: '',
+  returnUrl: '',
+  feePercent: 0,
+  minAmount: 1,
+  maxAmount: 10000
 })
 
 const loadConfig = async () => {
@@ -104,11 +104,11 @@ const loadConfig = async () => {
     }
     // Auto-fill callback URLs based on current domain
     const origin = window.location.origin
-    if (!form.value.notify_url) {
-      form.value.notify_url = `${origin}/api/v1/public/payments/yipay/notify`
+    if (!form.value.notifyUrl) {
+      form.value.notifyUrl = `${origin}/api/v1/public/payments/yipay/notify`
     }
-    if (!form.value.return_url) {
-      form.value.return_url = `${origin}/api/v1/public/payments/yipay/return`
+    if (!form.value.returnUrl) {
+      form.value.returnUrl = `${origin}/api/v1/public/payments/yipay/return`
     }
   } catch (error) {
     ElMessage.error(error?.message || t('admin.yipayConfig.loadFailed'))

@@ -1,7 +1,8 @@
 import axios from 'axios'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useUserStore } from '@/pinia/modules/user'
 import { errorHandler } from './errorHandler'
+import i18n from '@/i18n'
 
 const service = axios.create({
   baseURL: import.meta.env.VITE_BASE_API,
@@ -13,6 +14,7 @@ const service = axios.create({
 
 
 let maintenanceDialogVisible = false
+let isRedirecting = false // 防止 401 重定向重复触发
 
 function shouldShowMaintenanceDialog(errorInfo) {
   const text = `${errorInfo?.message || ''} ${errorInfo?.details || ''}`
@@ -156,18 +158,47 @@ service.interceptors.response.use(
   async error => {
     error = await parseBlobErrorResponse(error)
     const config = error.config
-    
+
+    // 401 未授权处理：清除 Token 并重定向到首页
+    // 跳过认证相关接口（登录、注册等），避免登录失败时误触发重定向
+    if (error.response?.status === 401) {
+      const requestUrl = config?.url || ''
+      const isAuthEndpoint = requestUrl.includes('/auth/login') ||
+                             requestUrl.includes('/auth/register') ||
+                             requestUrl.includes('/auth/forgot-password') ||
+                             requestUrl.includes('/auth/reset-password') ||
+                             requestUrl.includes('/auth/captcha') ||
+                             requestUrl.includes('/auth/send-verify-code')
+
+      if (!isAuthEndpoint) {
+        const userStore = useUserStore()
+        userStore.clearUserData()
+
+        // 避免重复提示和重定向
+        if (!isRedirecting) {
+          isRedirecting = true
+          ElMessage.warning(i18n.global.t('common.loginExpired'))
+          // 使用 hash 模式重定向到首页（与路由的 createWebHashHistory 一致）
+          const currentHash = window.location.hash
+          if (!currentHash.includes('/home') && !currentHash.includes('/login')) {
+            window.location.href = window.location.pathname + '#/home'
+          }
+          setTimeout(() => { isRedirecting = false }, 1000)
+        }
+      }
+    }
+
     // 重试逻辑
     if (config && config.retry && config.__retryCount < config.retry) {
       config.__retryCount = config.__retryCount || 0
       config.__retryCount += 1
-      
+
       const delay = config.retryDelay || 1000
       await new Promise(resolve => setTimeout(resolve, delay))
-      
+
       return service(config)
     }
-    
+
     // 使用统一错误处理，但不自动显示错误消息
     const errorInfo = errorHandler.handleApiError(error, {
       showMessage: false, // 不自动显示错误消息，让组件自己处理

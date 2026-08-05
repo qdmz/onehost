@@ -9,6 +9,11 @@ export default {
   user: '用户',
   subject: '主题',
   category: '分类',
+  // 分类翻译
+  catGeneral: '一般咨询',
+  catTechnical: '技术问题',
+  catBilling: '账单问题',
+  catOther: '其他',
   status: '状态',
   priority: '优先级',
   createTime: '创建时间',
