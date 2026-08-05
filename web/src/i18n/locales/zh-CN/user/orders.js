@@ -32,5 +32,22 @@ export default {
   renewSuccess: '续费成功',
   renewFailed: '续费失败',
   noOrders: '暂无订单',
-  loadFailed: '加载订单列表失败'
+  loadFailed: '加载订单列表失败',
+  months: '个月',
+  viewInstance: '查看实例',
+  payNow: '立即支付',
+  totalPrice: '订单总额',
+  unitPrice: '单价',
+  renewOrder: '续费订单',
+  renewPrice: '续费金额',
+  pendingPay: '待支付',
+  paidStatus: '已支付',
+  activeStatus: '已开通',
+  expiredStatus: '已过期',
+  cancelledStatus: '已取消',
+  confirmPay: '确定支付该订单吗？金额 ¥{amount}',
+  confirmCancel: '确定要取消该订单吗？',
+  paySuccess: '支付成功',
+  payFailed: '支付失败',
+  balanceNotEnough: '余额不足，已为你创建易支付充值订单，支付完成后请返回本页使用余额支付'
 }

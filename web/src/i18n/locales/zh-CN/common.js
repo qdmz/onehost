@@ -158,5 +158,8 @@ export default {
   agentFMDeleteFailed: '删除失败',
   agentFMDeleteConfirm: '确定要删除 {name} 吗？此操作不可撤销。',
   agentFMMkdirFailed: '创建目录失败',
-  agentFMFileSizeLimit: '文件过大（最大 50 MB），请通过其他方式传输'
+  agentFMFileSizeLimit: '文件过大（最大 50 MB），请通过其他方式传输',
+  detail: '详情',
+  reply: '回复',
+  tip: '提示'
 }

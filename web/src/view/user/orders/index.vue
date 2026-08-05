@@ -280,6 +280,13 @@ const handleSizeChange = (size) => {
   loadOrders()
 }
 
+// 判断是否为「余额不足」错误：请求拦截器对非 200 的业务码会 reject，
+// 因此余额支付失败只能在 catch 中识别，不能靠 res.code 分支。
+const isInsufficientBalance = (error) => {
+  const msg = String(error?.message || error?.msg || '')
+  return msg.includes('余额不足') || msg.toLowerCase().includes('insufficient balance')
+}
+
 // 支付
 const handlePay = async (order) => {
   try {
@@ -288,21 +295,42 @@ const handlePay = async (order) => {
       t('common.tip'),
       { confirmButtonText: t('common.confirm'), cancelButtonText: t('common.cancel') }
     )
+  } catch {
+    return // 用户取消
+  }
+
+  // 优先使用余额支付
+  try {
     const res = await payWithBalance(order.id)
-    if (res.code === 200) {
+    if (res?.code === 200) {
       ElMessage.success(t('user.orders.paySuccess'))
       loadOrders()
+      return
+    }
+    throw new Error(res?.message || t('user.orders.payFailed'))
+  } catch (error) {
+    if (!isInsufficientBalance(error)) {
+      ElMessage.error(error?.message || t('user.orders.payFailed'))
+      return
+    }
+  }
+
+  // 余额不足：/payments/yipay 目前只支持余额充值（仅接受 amount + payType），
+  // 因此按订单金额发起充值，用户支付完成后回到订单页用余额完成支付。
+  try {
+    const payRes = await createYiPayOrder({
+      amount: Number(order.total_price),
+      payType: 'alipay'
+    })
+    const payUrl = payRes?.data?.payURL || payRes?.data?.pay_url
+    if (payRes?.code === 200 && payUrl) {
+      window.open(payUrl, '_blank')
+      ElMessage.success(t('user.orders.balanceNotEnough'))
     } else {
-      // 余额不足，尝试易支付
-      const payRes = await createYiPayOrder({ order_id: order.id, amount: order.total_price })
-      if (payRes.code === 200 && payRes.data?.pay_url) {
-        window.open(payRes.data.pay_url, '_blank')
-      }
+      throw new Error(payRes?.message || t('user.orders.payFailed'))
     }
   } catch (error) {
-    if (error !== 'cancel') {
-      ElMessage.error(error?.message || t('user.orders.payFailed'))
-    }
+    ElMessage.error(error?.message || t('user.orders.payFailed'))
   }
 }
 

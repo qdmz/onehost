@@ -34,5 +34,16 @@ export default {
   oauth2Management: 'OAuth2',
   apiTokenManagement: 'API Token',
   adminApiTokenManagement: 'API Tokens Management',
-  yipayConfig: 'YiPay Config'
+  yipayConfig: 'YiPay Config',
+  groupStore: 'Store',
+  groupTickets: 'Tickets',
+  store: 'Product Store',
+  storeDetail: 'Product Details',
+  orders: 'My Orders',
+  tickets: 'My Tickets',
+  wallet: 'My Wallet',
+  productManagement: 'Product Management',
+  orderManagement: 'Order Management',
+  ticketManagement: 'Ticket Management',
+  siteConfig: 'Site Configuration'
 }

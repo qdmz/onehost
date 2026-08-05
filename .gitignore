@@ -36,3 +36,8 @@ data
 .idea
 *.exe
 *.test
+# 交叉编译产物
+oneclickvirt-linux-amd64
+# 本地部署脚本（含服务器凭据，禁止提交）
+deploy/deploy.py
+deploy/rexec.py

@@ -27,5 +27,16 @@ export default {
   remark: '备注',
   time: '时间',
   noLogs: '暂无记录',
-  loadFailed: '加载余额信息失败'
+  loadFailed: '加载余额信息失败',
+  all: '全部',
+  income: '收入',
+  expense: '支出',
+  logType: '类型',
+  logAmount: '金额',
+  logDesc: '说明',
+  logTime: '时间',
+  selectAmount: '请选择或输入充值金额',
+  amountTooSmall: '充值金额不能小于 1 元',
+  openPayPage: '已打开支付页面，请在新窗口完成支付',
+  createPayFailed: '创建支付订单失败'
 }

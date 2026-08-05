@@ -356,17 +356,19 @@ const handlePurchase = async () => {
         throw new Error(payRes.message || t('user.store.payFailed'))
       }
     } else {
-      // 易支付
+      // 易支付：后端 /payments/yipay 只接受 amount + payType（payType 为必填），
+      // 且语义是余额充值，因此这里按订单金额充值，完成后到「我的订单」用余额支付。
       const payRes = await createYiPayOrder({
-        order_id: orderId,
-        amount: totalPrice.value
+        amount: Number(totalPrice.value),
+        payType: 'alipay'
       })
-      if (payRes.code === 200 && payRes.data?.pay_url) {
-        window.open(payRes.data.pay_url, '_blank')
-        ElMessage.success(t('user.store.openPayPage'))
+      const payUrl = payRes?.data?.payURL || payRes?.data?.pay_url
+      if (payRes?.code === 200 && payUrl) {
+        window.open(payUrl, '_blank')
+        ElMessage.success(t('user.store.yipayRedirectHint'))
         router.push('/user/orders')
       } else {
-        throw new Error(payRes.message || t('user.store.createPayFailed'))
+        throw new Error(payRes?.message || t('user.store.createPayFailed'))
       }
     }
   } catch (error) {

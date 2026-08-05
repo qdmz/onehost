@@ -30,16 +30,33 @@ func HighestConfiguredLevel() int {
 }
 
 // ResolveLevelLimit returns a normalized quota definition for the requested level.
+// 等级越界时不再直接返回错误，而是回退到有效范围内的等级：
+// 历史脏数据（例如内置管理员账号被写入 level=999）会让 /user/info、仪表盘等接口
+// 整体返回 400，表现为「登录成功却提示加载失败并退回登录页」。
+// 管理端写入等级仍由 binding:"min=1,max=99" 与 service_level.go 做严格校验，
+// 因此这里放宽只影响读取路径的容错，不会削弱输入校验。
 func ResolveLevelLimit(level int) (config.LevelLimitInfo, error) {
-	if level < 1 || level > 99 {
-		return config.LevelLimitInfo{}, fmt.Errorf("用户等级必须在1-99之间")
+	if level < 1 {
+		level = 1
+	} else if level > 99 {
+		if highest := HighestConfiguredLevel(); highest >= 1 && highest <= 99 {
+			level = highest
+		} else {
+			level = 99
+		}
 	}
 	levelLimit, exists := global.GetAppConfig().Quota.LevelLimits[level]
 	if !exists {
 		if defaultLimit, ok := config.DefaultLevelLimitInfo(level); ok {
 			levelLimit = defaultLimit
 		} else {
-			return config.LevelLimitInfo{}, fmt.Errorf("用户等级 %d 未配置资源限制", level)
+			// 兜底：回退到最低等级配置，避免因单个等级未配置而阻断整个页面
+			if fallback, ok := config.DefaultLevelLimitInfo(1); ok {
+				levelLimit = fallback
+				level = 1
+			} else {
+				return config.LevelLimitInfo{}, fmt.Errorf("用户等级 %d 未配置资源限制", level)
+			}
 		}
 	}
 	return config.NormalizeLevelLimitInfo(level, levelLimit), nil

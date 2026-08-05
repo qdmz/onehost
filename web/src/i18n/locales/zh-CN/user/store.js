@@ -54,6 +54,8 @@ export default {
   openPayPage: '已打开支付页面',
   createPayFailed: '创建支付订单失败',
   purchaseFailed: '购买失败',
+  purchaseConfig: '购买配置',
+  yipayRedirectHint: '已为你创建易支付充值订单，支付完成后请到「我的订单」用余额完成支付',
   // 旧版嵌套结构（兼容）
   detail: {
     back: '返回',

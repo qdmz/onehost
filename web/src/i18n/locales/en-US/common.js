@@ -158,5 +158,8 @@ export default {
   agentFMDeleteFailed: 'Delete failed',
   agentFMDeleteConfirm: 'Are you sure you want to delete {name}? This action cannot be undone.',
   agentFMMkdirFailed: 'Failed to create directory',
-  agentFMFileSizeLimit: 'File too large (max 50 MB), please use another transfer method'
+  agentFMFileSizeLimit: 'File too large (max 50 MB), please use another transfer method',
+  detail: 'Details',
+  reply: 'Reply',
+  tip: 'Tip'
 }
