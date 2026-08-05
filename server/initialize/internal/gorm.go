@@ -53,11 +53,13 @@ func GormMysql(m config.MysqlConfig) (*gorm.DB, error) {
 
 	mysqlConfig := mysql.Config{
 		DSN:                       dsn,
-		DefaultStringSize:         191,   // string 类型字段的默认长度
-		SkipInitializeWithVersion: false, // 根据版本自动配置
+		DefaultStringSize:         191,  // string 类型字段的默认长度
+		SkipInitializeWithVersion: true, // 跳过版本检查，兼容MariaDB
 	}
 
 	gormConfig := gormConfig(m.LogMode, m.LogZap)
+	// 禁用迁移时的外键约束，避免MariaDB上的死锁问题
+	gormConfig.DisableForeignKeyConstraintWhenMigrating = true
 
 	db, err := gorm.Open(mysql.New(mysqlConfig), gormConfig)
 	if err != nil {
@@ -140,7 +142,7 @@ func createDatabaseIfNotExists(m config.MysqlConfig) error {
 
 // gormConfig 根据配置决定是否开启日志
 func gormConfig(mod string, useZap bool) (config *gorm.Config) {
-	config = &gorm.Config{DisableForeignKeyConstraintWhenMigrating: false}
+	config = &gorm.Config{DisableForeignKeyConstraintWhenMigrating: true}
 	// IgnoreRecordNotFoundError=true 避免将期望的"查不到记录"行为打印成错误日志
 	switch mod {
 	case "silent", "Silent":
