@@ -1,0 +1,35 @@
+package docker
+
+import (
+	"regexp"
+	"strings"
+
+	"oneclickvirt/global"
+	"oneclickvirt/utils"
+
+	"go.uber.org/zap"
+)
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func containerNameFilter(name string) string {
+	return shellSingleQuote("name=^" + regexp.QuoteMeta(name) + "$")
+}
+
+// getDownloadURL 确定下载URL
+func (d *DockerProvider) getDownloadURL(originalURL, providerCountry string, useCDN bool) string {
+	// 如果不使用CDN，直接返回原始URL
+	if !useCDN {
+		global.APP_LOG.Debug("镜像配置不使用CDN，使用原始URL",
+			zap.String("originalURL", utils.TruncateString(originalURL, 100)))
+		return originalURL
+	}
+
+	// 默认随机尝试CDN，不再限制地区
+	if cdnURL := utils.GetCDNURL(d.sshClient, originalURL, "Docker"); cdnURL != "" {
+		return cdnURL
+	}
+	return originalURL
+}

@@ -1,0 +1,711 @@
+<template>
+  <div class="login-container">
+    <!-- 顶部栏 -->
+    <header class="auth-header">
+      <div class="header-content">
+        <div class="logo">
+          <img
+            :src="siteStore.logoSrc"
+            alt="OneClickVirt Logo"
+            class="logo-image"
+          >
+          <h1>{{ siteStore.displaySiteName }}</h1>
+        </div>
+        <nav class="nav-actions">
+          <button
+            class="nav-link theme-btn"
+            :title="themeStore.isDark ? t('navbar.lightMode') : t('navbar.darkMode')"
+            @click="toggleTheme"
+          >
+            <el-icon><component :is="themeStore.isDark ? Sunny : Moon" /></el-icon>
+          </button>
+          <button
+            class="nav-link language-btn"
+            @click="switchLanguage"
+          >
+            <el-icon><Operation /></el-icon>
+            {{ languageStore.currentLanguage === 'zh-CN' ? 'English' : '中文' }}
+          </button>
+          <router-link
+            to="/"
+            class="nav-link home-btn"
+          >
+            <el-icon><HomeFilled /></el-icon>
+            {{ t('common.backToHome') }}
+          </router-link>
+        </nav>
+      </div>
+    </header>
+
+    <div class="login-form">
+      <div class="login-header">
+        <h2>{{ t('login.title') }}</h2>
+        <p>{{ t('login.subtitle') }}</p>
+      </div>
+
+      <el-form
+        ref="loginFormRef"
+        :model="loginForm"
+        :rules="loginRules"
+        label-width="0"
+        size="large"
+      >
+        <el-form-item prop="username">
+          <el-input
+            v-model="loginForm.username"
+            :placeholder="t('login.pleaseEnterUsername')"
+            prefix-icon="User"
+            clearable
+          />
+        </el-form-item>
+
+        <el-form-item prop="password">
+          <el-input
+            v-model="loginForm.password"
+            type="password"
+            :placeholder="t('login.pleaseEnterPassword')"
+            prefix-icon="Lock"
+            show-password
+            clearable
+            @keyup.enter="handleLogin"
+          />
+        </el-form-item>
+
+        <el-form-item
+          v-if="captchaEnabled"
+          prop="captcha"
+        >
+          <div class="captcha-container">
+            <el-input
+              v-model="loginForm.captcha"
+              :placeholder="t('login.pleaseEnterCaptcha')"
+            />
+            <div
+              class="captcha-image"
+              @click="refreshCaptcha"
+            >
+              <img
+                v-if="captchaImage"
+                :src="captchaImage"
+                :alt="t('login.captchaAlt')"
+              >
+              <div
+                v-else
+                class="captcha-loading"
+              >
+                {{ t('common.loading') }}
+              </div>
+            </div>
+          </div>
+        </el-form-item>
+
+        <div class="form-options">
+          <el-checkbox v-model="loginForm.rememberMe">
+            {{ t('login.rememberMe') }}
+          </el-checkbox>
+          <router-link
+            to="/forgot-password"
+            class="forgot-link"
+          >
+            {{ t('login.forgotPassword') }}
+          </router-link>
+        </div>
+
+        <div class="form-actions">
+          <el-button
+            type="primary"
+            :loading="loading"
+            style="width: 100%;"
+            @click="handleLogin"
+          >
+            {{ t('common.login') }}
+          </el-button>
+        </div>
+
+        <div class="form-footer">
+          <p>
+            {{ t('login.noAccount') }} <router-link to="/register">
+              {{ t('login.registerNow') }}
+            </router-link>
+          </p>
+        </div>
+
+        <div class="admin-login">
+          <router-link
+            to="/admin/login"
+            class="admin-link"
+          >
+            {{ t('login.adminLogin') }}
+          </router-link>
+        </div>
+      </el-form>
+
+      <!-- OAuth2登录 -->
+      <div
+        v-if="oauth2Enabled && oauth2Providers.length > 0"
+        class="oauth2-login"
+      >
+        <el-divider>{{ t('login.thirdPartyLogin') }}</el-divider>
+        <div class="oauth2-providers">
+          <el-button
+            v-for="provider in oauth2Providers"
+            :key="provider.id"
+            class="oauth2-button"
+            :loading="oauth2Loading"
+            :disabled="oauth2Loading"
+            @click="handleOAuth2Login(provider)"
+          >
+            <el-icon><Connection /></el-icon>
+            {{ provider.displayName }}
+          </el-button>
+        </div>
+      </div>
+    </div>
+    <AppFooter />
+  </div>
+</template>
+
+<script setup>
+import { ref, reactive, onMounted, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { useUserStore } from '@/pinia/modules/user'
+import { getCaptcha } from '@/api/auth'
+import { useErrorHandler } from '@/composables/useErrorHandler'
+import { getPublicConfig } from '@/api/public'
+import { getEnabledOAuth2Providers } from '@/api/oauth2'
+import { Connection, Operation, HomeFilled, Sunny, Moon } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { useLanguageStore } from '@/pinia/modules/language'
+import { useThemeStore } from '@/pinia/modules/theme'
+import { useSiteStore } from '@/pinia/modules/site'
+import AppFooter from '@/view/layout/components/AppFooter.vue'
+
+const router = useRouter()
+const userStore = useUserStore()
+const { t, locale } = useI18n()
+const { executeAsync, handleSubmit } = useErrorHandler()
+const languageStore = useLanguageStore()
+const themeStore = useThemeStore()
+const siteStore = useSiteStore()
+
+const loginFormRef = ref()
+const loading = ref(false)
+const captchaImage = ref('')
+const captchaId = ref('')
+const oauth2Enabled = ref(false)
+const oauth2Providers = ref([])
+const oauth2Loading = ref(false) // OAuth2登录防重复点击
+const captchaEnabled = ref(false)
+
+const loginForm = reactive({
+  username: '',
+  password: '',
+  captcha: '',
+  rememberMe: false,
+  userType: 'user',
+  loginType: 'password'
+})
+
+const loginRules = computed(() => ({
+  username: [
+    { required: true, message: t('validation.usernameRequired'), trigger: 'blur' }
+  ],
+  password: [
+    { required: true, message: t('validation.passwordRequired'), trigger: 'blur' }
+  ],
+  ...(captchaEnabled.value ? {
+    captcha: [
+      { required: true, message: t('validation.captchaRequired'), trigger: 'blur' }
+    ]
+  } : {})
+}))
+
+const handleLogin = async () => {
+  if (!loginFormRef.value) return
+  
+  // 防止重复提交
+  if (loading.value) return
+
+  await loginFormRef.value.validate(async (valid) => {
+    if (!valid) return
+    
+    // 再次检查loading状态，防止表单验证期间的重复点击
+    if (loading.value) return
+    
+    loading.value = true
+    
+    try {
+      const result = await handleSubmit(async () => {
+        return await userStore.userLogin({
+          ...loginForm,
+          ...(captchaEnabled.value ? { captchaId: captchaId.value } : { captcha: undefined, captchaId: undefined })
+        })
+      }, {
+        successMessage: t('login.loginSuccess'),
+        showLoading: false // 使用组件自己的loading
+      })
+
+      if (result.success) {
+        // 根据用户类型和视图模式跳转
+        const userType = userStore.userType
+        const viewMode = userStore.viewMode || userType
+        
+        // 只有管理员可以访问管理员界面
+        if (userType === 'admin' && viewMode === 'admin') {
+          router.push('/admin/dashboard')
+        } else {
+          // 普通用户或管理员的用户视图
+          router.push('/user/dashboard')
+        }
+      } else {
+        if (captchaEnabled.value) {
+          refreshCaptcha() // 登录失败刷新验证码
+        }
+      }
+    } finally {
+      loading.value = false
+    }
+  })
+}
+
+const refreshCaptcha = async () => {
+  if (!captchaEnabled.value) {
+    captchaImage.value = ''
+    captchaId.value = ''
+    loginForm.captcha = ''
+    return
+  }
+
+  await executeAsync(async () => {
+    const response = await getCaptcha()
+    captchaImage.value = response.data.imageData
+    captchaId.value = response.data.captchaId
+    loginForm.captcha = ''
+  }, {
+    showError: false, // 静默处理验证码错误
+    showLoading: false
+  })
+}
+
+// OAuth2登录
+const handleOAuth2Login = (provider) => {
+  // 防止重复点击
+  if (oauth2Loading.value) return
+  
+  oauth2Loading.value = true
+  
+  // 跳转到后端的OAuth2登录接口，使用provider_id参数
+  window.location.href = `/api/v1/auth/oauth2/login?provider_id=${provider.id}`
+  
+  // 页面跳转后loading状态会自动重置，这里不需要手动重置
+}
+
+// 检查OAuth2配置并加载提供商列表
+const checkOAuth2Config = async () => {
+  try {
+    // 获取OAuth2全局开关状态
+    const configResponse = await getPublicConfig()
+    oauth2Enabled.value = configResponse.data?.oauth2Enabled || false
+    captchaEnabled.value = configResponse.data?.captchaEnabled || false
+    
+    // 如果启用了OAuth2，加载提供商列表
+    if (oauth2Enabled.value) {
+      const providersResponse = await getEnabledOAuth2Providers()
+      oauth2Providers.value = providersResponse.data || []
+    }
+  } catch (error) {
+    console.error(t('login.getOAuth2ConfigFailed'), error)
+  }
+}
+
+// 切换语言
+const switchLanguage = () => {
+  const newLang = languageStore.toggleLanguage()
+  locale.value = newLang
+  ElMessage.success(t('navbar.languageSwitched'))
+}
+
+const toggleTheme = () => {
+  themeStore.toggleTheme()
+}
+
+onMounted(async () => {
+  await checkOAuth2Config()
+  if (captchaEnabled.value) {
+    refreshCaptcha()
+  }
+})
+</script>
+
+<style scoped>
+.login-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--auth-page-bg);
+}
+
+
+/* 顶部栏样式 */
+.auth-header {
+  background: var(--auth-header-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: var(--box-shadow-light);
+  border-bottom: 1px solid var(--border-color);
+  padding-top: env(safe-area-inset-top);
+}
+
+.header-content {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  min-height: 60px;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-image {
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+}
+
+.logo h1 {
+  font-size: 24px;
+  color: var(--primary-color);
+  margin: 0;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.nav-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nav-link.theme-btn {
+  padding: 8px 10px;
+  min-width: 38px;
+  justify-content: center;
+}
+
+.nav-link {
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border-radius: 22px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-color-primary);
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.nav-link:hover {
+  background: var(--primary-color-bg-hover);
+  color: var(--accent-text-color);
+  transform: translateY(-2px);
+}
+
+.nav-link.home-btn {
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  color: white;
+  border: none;
+  box-shadow: 0 4px 15px var(--primary-color-shadow);
+}
+
+.nav-link.home-btn:hover {
+  background: linear-gradient(135deg, var(--primary-color-dark), var(--primary-color));
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px var(--primary-color-shadow-hover);
+}
+
+.login-form {
+  margin: 32px auto;
+  width: min(420px, calc(100% - 32px));
+  padding: 36px 38px;
+  background: var(--card-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 20px;
+  box-shadow: var(--box-shadow-heavy);
+  border: 1px solid var(--border-color);
+}
+
+.login-form :deep(.el-form) {
+  width: 100%;
+}
+
+.login-form :deep(.el-form-item) {
+  width: 100%;
+  margin-bottom: 20px;
+}
+
+.login-form :deep(.el-form-item__content) {
+  width: 100%;
+  line-height: normal;
+}
+
+.login-form :deep(.el-input) {
+  width: 100%;
+}
+
+.login-form :deep(.el-input__wrapper) {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.login-header {
+  text-align: center;
+  margin-bottom: 30px;
+}
+
+.login-header h2 {
+  font-size: 26px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.login-header p {
+  font-size: 14px;
+  color: var(--text-color-secondary);
+}
+
+.form-options {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  width: 100%;
+}
+
+.forgot-link {
+  color: var(--accent-text-color);
+  text-decoration: none;
+  font-weight: 500;
+  transition: color 0.2s;
+}
+
+.forgot-link:hover {
+  color: var(--accent-text-color-hover);
+}
+
+.form-actions {
+  margin-bottom: 20px;
+  width: 100%;
+}
+
+.form-actions .el-button {
+  width: 100% !important;
+  height: 45px;
+}
+
+.form-footer {
+  text-align: center;
+  margin-bottom: 20px;
+  width: 100%;
+  color: var(--text-color-secondary);
+}
+
+.form-footer a {
+  color: var(--accent-text-color);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.form-footer a:hover {
+  color: var(--accent-text-color-hover);
+}
+
+.admin-login {
+  text-align: center;
+  font-size: 14px;
+  color: var(--text-color-secondary);
+}
+
+.admin-link {
+  color: var(--text-color-tertiary);
+  text-decoration: none;
+  margin: 0 5px;
+}
+
+.admin-link:hover {
+  color: var(--accent-text-color);
+}
+
+.captcha-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+}
+
+.captcha-container .el-input {
+  flex: 1;
+}
+
+.captcha-image {
+  width: 120px;
+  height: 40px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.captcha-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.captcha-loading {
+  font-size: 12px;
+  color: var(--text-color-tertiary);
+}
+
+.oauth2-login {
+  margin: 20px 0 0 0;
+  width: 100%;
+  padding: 0;
+}
+
+.oauth2-login :deep(.el-divider) {
+  margin: 20px 0;
+}
+
+.oauth2-providers {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  margin: 0;
+}
+
+.oauth2-button {
+  width: 100% !important;
+  height: 45px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-color);
+  background: var(--surface-input);
+  color: var(--text-color-primary);
+  margin: 0 !important;
+  padding: 0 20px !important;
+  box-sizing: border-box;
+}
+
+.oauth2-button:hover {
+  border-color: var(--border-color-hover);
+  color: var(--accent-text-color);
+}
+
+.oauth2-providers :deep(.el-button) {
+  width: 100% !important;
+  margin: 0 !important;
+}
+
+@media (max-width: 768px) {
+  .header-content {
+    min-height: 56px;
+    padding: 8px 16px;
+    gap: 10px;
+  }
+
+  .logo {
+    gap: 8px;
+  }
+
+  .logo-image {
+    width: 38px;
+    height: 38px;
+  }
+
+  .logo h1 {
+    font-size: 21px;
+  }
+
+  .nav-actions {
+    gap: 6px;
+  }
+
+  .nav-link {
+    padding: 8px 10px;
+    font-size: 14px;
+  }
+
+  .login-form {
+    width: calc(100% - 24px);
+    margin: 24px auto;
+    padding: 24px;
+  }
+}
+
+@media (max-width: 480px) {
+  .header-content {
+    justify-content: center;
+    padding: 8px 12px;
+  }
+
+  .logo {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .logo-image {
+    width: 34px;
+    height: 34px;
+  }
+
+  .logo h1 {
+    font-size: 20px;
+  }
+
+  .nav-actions {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .nav-link {
+    padding: 7px 9px;
+    font-size: 13px;
+    border-radius: 18px;
+  }
+
+  .login-form {
+    padding: 22px 18px;
+  }
+}
+</style>

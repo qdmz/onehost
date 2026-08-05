@@ -1,0 +1,538 @@
+<template>
+  <el-form
+    :model="modelValue"
+    label-width="120px"
+    class="server-form"
+  >
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.bandwidthLimits') }}</span>
+    </el-divider>
+
+    <el-row :gutter="20">
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.defaultInboundBandwidth')"
+          prop="defaultInboundBandwidth"
+        >
+          <el-input-number
+            v-model="modelValue.defaultInboundBandwidth"
+            :min="1"
+            :max="1000000"
+            :step="50"
+            :controls="false"
+            placeholder="300"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.defaultInboundBandwidthTip') }}
+          </el-text>
+        </div>
+      </el-col>
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.defaultOutboundBandwidth')"
+          prop="defaultOutboundBandwidth"
+        >
+          <el-input-number
+            v-model="modelValue.defaultOutboundBandwidth"
+            :min="1"
+            :max="1000000"
+            :step="50"
+            :controls="false"
+            placeholder="300"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.defaultOutboundBandwidthTip') }}
+          </el-text>
+        </div>
+      </el-col>
+    </el-row>
+
+    <el-row :gutter="20">
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.maxInboundBandwidth')"
+          prop="maxInboundBandwidth"
+        >
+          <el-input-number
+            v-model="modelValue.maxInboundBandwidth"
+            :min="1"
+            :max="1000000"
+            :step="50"
+            :controls="false"
+            placeholder="1000"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.maxInboundBandwidthTip') }}
+          </el-text>
+        </div>
+      </el-col>
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.maxOutboundBandwidth')"
+          prop="maxOutboundBandwidth"
+        >
+          <el-input-number
+            v-model="modelValue.maxOutboundBandwidth"
+            :min="1"
+            :max="1000000"
+            :step="50"
+            :controls="false"
+            placeholder="1000"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.maxOutboundBandwidthTip') }}
+          </el-text>
+        </div>
+      </el-col>
+    </el-row>
+
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.trafficStatistics') }}</span>
+    </el-divider>
+
+    <el-form-item
+      :label="$t('admin.providers.enableTrafficControl')"
+      prop="enableTrafficControl"
+    >
+      <el-switch
+        v-model="modelValue.enableTrafficControl"
+        :active-text="$t('admin.providers.enabled')"
+        :inactive-text="$t('admin.providers.disabled')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.enableTrafficControlTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      v-show="modelValue.enableTrafficControl"
+      :label="$t('admin.providers.maxTraffic')"
+      prop="maxTraffic"
+    >
+      <el-input-number
+        v-model="maxTrafficTB"
+        :min="0.001"
+        :max="1000"
+        :step="0.1"
+        :precision="3"
+        :controls="false"
+        placeholder="1"
+        style="width: 100%"
+      />
+    </el-form-item>
+    <div
+      v-show="modelValue.enableTrafficControl"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.maxTrafficTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      v-show="modelValue.enableTrafficControl"
+      :label="$t('admin.providers.trafficCountMode')"
+      prop="trafficCountMode"
+    >
+      <el-select
+        v-model="modelValue.trafficCountMode"
+        :placeholder="$t('admin.providers.selectTrafficCountMode')"
+        style="width: 100%"
+      >
+        <el-option
+          :label="$t('admin.providers.trafficCountModeBoth')"
+          value="both"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficCountModeOut')"
+          value="out"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficCountModeIn')"
+          value="in"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      v-show="modelValue.enableTrafficControl"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.trafficCountModeTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      v-show="modelValue.enableTrafficControl"
+      :label="$t('admin.providers.trafficMultiplier')"
+      prop="trafficMultiplier"
+    >
+      <el-input-number
+        v-model="modelValue.trafficMultiplier"
+        :min="0.1"
+        :max="10"
+        :step="0.1"
+        :precision="2"
+        :controls="false"
+        placeholder="1.0"
+        style="width: 100%"
+      />
+    </el-form-item>
+    <div
+      v-show="modelValue.enableTrafficControl"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.trafficMultiplierTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      v-show="modelValue.enableTrafficControl"
+      :label="$t('admin.providers.trafficSyncMethod')"
+      prop="trafficSyncMethod"
+    >
+      <el-select
+        v-model="modelValue.trafficSyncMethod"
+        :placeholder="$t('admin.providers.selectTrafficSyncMethod')"
+        style="width: 100%"
+      >
+        <el-option
+          :label="$t('admin.providers.trafficSyncMethodPmacct')"
+          value="pmacct"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficSyncMethodAgent')"
+          value="agent"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      v-show="modelValue.enableTrafficControl"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.trafficSyncMethodTip') }}
+      </el-text>
+    </div>
+
+    <el-divider
+      v-show="modelValue.enableTrafficControl"
+      content-position="left"
+    >
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.trafficStatsConfig') }}</span>
+    </el-divider>
+
+    <el-form-item
+      v-show="modelValue.enableTrafficControl"
+      :label="$t('admin.providers.trafficStatsMode')"
+      prop="trafficStatsMode"
+    >
+      <el-select
+        v-model="modelValue.trafficStatsMode"
+        :placeholder="$t('admin.providers.selectTrafficStatsMode')"
+        style="width: 100%"
+        @change="handlePresetChange"
+      >
+        <el-option
+          :label="$t('admin.providers.trafficStatsModeHigh')"
+          value="high"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficStatsModeStandard')"
+          value="standard"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficStatsModeLight')"
+          value="light"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficStatsModeMinimal')"
+          value="minimal"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficStatsModeCustom')"
+          value="custom"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      v-show="modelValue.enableTrafficControl"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.trafficStatsModeTip') }}
+      </el-text>
+    </div>
+
+    <!-- 流量统计详细配置 - 始终显示，但非自定义模式为只读 -->
+    <el-row
+      v-show="modelValue.enableTrafficControl"
+      :gutter="20"
+    >
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.trafficCollectInterval')"
+          prop="trafficCollectInterval"
+        >
+          <el-input-number
+            v-model="modelValue.trafficCollectInterval"
+            :min="30"
+            :max="300"
+            :step="30"
+            :controls="false"
+            :disabled="modelValue.trafficStatsMode !== 'custom'"
+            placeholder="300"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.trafficCollectIntervalTip') }}{{ modelValue.trafficStatsMode !== 'custom' ? '（' + $t('common.presetValue') + '）' : '' }}
+          </el-text>
+        </div>
+      </el-col>
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.trafficCollectBatchSize')"
+          prop="trafficCollectBatchSize"
+        >
+          <el-input-number
+            v-model="modelValue.trafficCollectBatchSize"
+            :min="1"
+            :max="100"
+            :step="5"
+            :controls="false"
+            :disabled="modelValue.trafficStatsMode !== 'custom'"
+            placeholder="10"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.trafficCollectBatchSizeTip') }}{{ modelValue.trafficStatsMode !== 'custom' ? '（' + $t('common.presetValue') + '）' : '' }}
+          </el-text>
+        </div>
+      </el-col>
+    </el-row>
+
+    <el-row
+      v-show="modelValue.enableTrafficControl"
+      :gutter="20"
+    >
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.trafficLimitCheckInterval')"
+          prop="trafficLimitCheckInterval"
+        >
+          <el-input-number
+            v-model="modelValue.trafficLimitCheckInterval"
+            :min="60"
+            :max="3600"
+            :step="30"
+            :controls="false"
+            :disabled="modelValue.trafficStatsMode !== 'custom'"
+            placeholder="600"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.trafficLimitCheckIntervalTip') }}{{ modelValue.trafficStatsMode !== 'custom' ? '（' + $t('common.presetValue') + '）' : '' }}
+          </el-text>
+        </div>
+      </el-col>
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.trafficLimitCheckBatchSize')"
+          prop="trafficLimitCheckBatchSize"
+        >
+          <el-input-number
+            v-model="modelValue.trafficLimitCheckBatchSize"
+            :min="1"
+            :max="100"
+            :step="5"
+            :controls="false"
+            :disabled="modelValue.trafficStatsMode !== 'custom'"
+            placeholder="10"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.trafficLimitCheckBatchSizeTip') }}{{ modelValue.trafficStatsMode !== 'custom' ? '（' + $t('common.presetValue') + '）' : '' }}
+          </el-text>
+        </div>
+      </el-col>
+    </el-row>
+  </el-form>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+
+const props = defineProps({
+  modelValue: {
+    type: Object,
+    required: true
+  }
+})
+
+// 流量单位转换：TB 转 MB (1TB = 1024 * 1024 MB = 1048576 MB)
+const TB_TO_MB = 1048576
+
+// 计算属性：maxTraffic 的 TB 单位显示
+const maxTrafficTB = computed({
+  get: () => {
+    // 从 MB 转换为 TB
+    return Number((props.modelValue.maxTraffic / TB_TO_MB).toFixed(3))
+  },
+  set: (value) => {
+    // 从 TB 转换为 MB
+    props.modelValue.maxTraffic = Math.round(value * TB_TO_MB)
+  }
+})
+
+// 预设配置（与后端保持一致）- 简化版本，只保留实际使用的字段
+const presets = {
+  high: {
+    trafficCollectInterval: 30,  // 0.5分钟采集+统计
+    trafficCollectBatchSize: 20,
+    trafficLimitCheckInterval: 30,  // 30秒检测
+    trafficLimitCheckBatchSize: 20,
+    trafficAutoResetInterval: 600,  // 10分钟检查
+    trafficAutoResetBatchSize: 20
+  },
+  standard: {
+    trafficCollectInterval: 60,  // 1分钟采集+统计
+    trafficCollectBatchSize: 15,
+    trafficLimitCheckInterval: 60,  // 1分钟检测
+    trafficLimitCheckBatchSize: 15,
+    trafficAutoResetInterval: 900,  // 15分钟检查
+    trafficAutoResetBatchSize: 15
+  },
+  light: {
+    trafficCollectInterval: 90,   // 1.5分钟采集+统计
+    trafficCollectBatchSize: 10,
+    trafficLimitCheckInterval: 90,   // 1.5分钟检测
+    trafficLimitCheckBatchSize: 10,
+    trafficAutoResetInterval: 1800,  // 30分钟检查
+    trafficAutoResetBatchSize: 10
+  },
+  minimal: {
+    trafficCollectInterval: 120,  // 2分钟采集+统计
+    trafficCollectBatchSize: 5,
+    trafficLimitCheckInterval: 120,  // 2分钟检测
+    trafficLimitCheckBatchSize: 5,
+    trafficAutoResetInterval: 3600,  // 60分钟检查
+    trafficAutoResetBatchSize: 5
+  }
+}
+
+// 处理预设模式变更
+const handlePresetChange = (mode) => {
+  if (mode !== 'custom' && presets[mode]) {
+    Object.assign(props.modelValue, presets[mode])
+  }
+}
+</script>
+
+<style scoped>
+.server-form {
+  max-height: 500px;
+  overflow-y: auto;
+  padding-right: 10px;
+}
+
+.form-tip {
+  margin-top: 5px;
+}
+</style>

@@ -1,0 +1,855 @@
+package source
+
+import (
+	"bufio"
+	"fmt"
+	"net/http"
+	"path"
+	"regexp"
+	"strings"
+	"time"
+
+	"oneclickvirt/global"
+	"oneclickvirt/model/system"
+	"oneclickvirt/utils"
+
+	"go.uber.org/zap"
+)
+
+type SystemImageSyncResult struct {
+	Existing  int64  `json:"existing"`
+	Desired   int    `json:"desired"`
+	Processed int    `json:"processed"`
+	Source    string `json:"source"`
+}
+
+const defaultSystemImageListURL = "https://raw.githubusercontent.com/oneclickvirt/images_auto_list/refs/heads/main/images.txt"
+
+func SeedSystemImages() {
+	result, err := SyncSystemImages()
+	if err != nil {
+		global.APP_LOG.Error("系统镜像同步失败", zap.Error(err))
+		return
+	}
+	global.APP_LOG.Info("系统镜像同步完成",
+		zap.Int("processed", result.Processed),
+		zap.Int("desired", result.Desired),
+		zap.Int64("existing", result.Existing),
+		zap.String("source", result.Source))
+}
+
+func SyncSystemImages() (*SystemImageSyncResult, error) {
+	return SyncSystemImagesFromURL("")
+}
+
+func SyncSystemImagesFromURL(sourceURL string) (*SystemImageSyncResult, error) {
+	global.APP_LOG.Info("开始同步系统镜像列表")
+
+	// 初始化等级配置；该操作本身是幂等的，放在镜像同步前确保新库/老库启动口径一致。
+	initLevelConfigurations()
+
+	// 先记录当前数量，但不再因为已有数据而直接跳过。
+	// 主控从老版本升级时，数据库里可能已有旧初始化镜像，但新版本新增的系统镜像仍需自动补齐。
+	var count int64
+	if err := global.APP_DB.Model(&system.SystemImage{}).Count(&count).Error; err != nil {
+		return nil, fmt.Errorf("统计已有系统镜像失败: %w", err)
+	}
+	global.APP_LOG.Debug("当前系统镜像数量", zap.Int64("count", count))
+	result := &SystemImageSyncResult{Existing: count, Source: "remote"}
+
+	// 收集所有镜像URL
+	var imageURLs []string
+	useDefaultImages := false
+	customSource := strings.TrimSpace(sourceURL) != ""
+
+	// 从配置获取基础CDN端点
+	listURL := strings.TrimSpace(sourceURL)
+	if listURL == "" {
+		listURL = utils.GetBaseCDNEndpoint() + defaultSystemImageListURL
+	}
+	result.Source = listURL
+
+	// 获取镜像列表，使用带超时的HTTP客户端
+	client := &http.Client{
+		Timeout: 60 * time.Second, // 获取文本列表，60秒超时
+	}
+	resp, err := client.Get(listURL)
+	if err != nil {
+		if customSource {
+			return nil, fmt.Errorf("获取镜像列表失败: %w", err)
+		}
+		global.APP_LOG.Warn("获取远程镜像列表失败，将使用默认镜像列表", zap.Error(err))
+		useDefaultImages = true
+	} else {
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			if customSource {
+				return nil, fmt.Errorf("获取镜像列表失败，HTTP状态码: %d", resp.StatusCode)
+			}
+			global.APP_LOG.Warn("获取远程镜像列表失败，将使用默认镜像列表", zap.Int("status", resp.StatusCode))
+			useDefaultImages = true
+		} else {
+			// 从远程读取镜像URL
+			scanner := bufio.NewScanner(resp.Body)
+			scanner.Buffer(make([]byte, 1024), 1024*1024)
+			for scanner.Scan() {
+				imageURL := strings.TrimSpace(scanner.Text())
+				if imageURL != "" && !strings.HasPrefix(imageURL, "#") {
+					imageURLs = append(imageURLs, imageURL)
+				}
+			}
+
+			if err := scanner.Err(); err != nil {
+				if customSource {
+					return nil, fmt.Errorf("读取镜像列表失败: %w", err)
+				}
+				global.APP_LOG.Warn("读取远程镜像列表失败，将使用默认镜像列表", zap.Error(err))
+				useDefaultImages = true
+				imageURLs = nil // 清空可能部分读取的数据
+			}
+		}
+	}
+
+	// 如果远程获取失败，使用默认镜像列表
+	if useDefaultImages {
+		global.APP_LOG.Debug("使用默认镜像列表进行初始化/补齐")
+		imageURLs = getDefaultImageURLs()
+		result.Source = "default"
+	} else if !customSource {
+		remoteCount := len(imageURLs)
+		imageURLs = mergeDefaultImageURLs(imageURLs)
+		if len(imageURLs) > remoteCount {
+			result.Source = listURL + " + default"
+		}
+	}
+
+	// 如果仍然没有镜像URL，记录错误并返回
+	if len(imageURLs) == 0 {
+		return nil, fmt.Errorf("无法获取镜像列表，远程和默认列表均为空")
+	}
+
+	// 按优先级排序：cloud镜像优先
+	sortedURLs := prioritizeCloudImages(imageURLs)
+
+	// 确保 kvm_images 优先级最低：排到最后，pve_kvm_images 等先处理
+	{
+		primary := make([]string, 0, len(sortedURLs))
+		supplement := make([]string, 0)
+		for _, u := range sortedURLs {
+			if strings.Contains(u, "github.com/oneclickvirt/kvm_images/") {
+				supplement = append(supplement, u)
+			} else {
+				primary = append(primary, u)
+			}
+		}
+		sortedURLs = append(primary, supplement...)
+	}
+
+	desiredImages := buildDesiredSystemImages(sortedURLs)
+	if len(desiredImages) == 0 {
+		return nil, fmt.Errorf("镜像列表解析后没有可导入镜像")
+	}
+	result.Desired = len(desiredImages)
+
+	// 一次性加载已有镜像身份，避免逐条查询导致 N+1。
+	var existingImages []system.SystemImage
+	if err := global.APP_DB.Select("id", "provider_type", "instance_type", "architecture", "os_type", "os_version", "url").Find(&existingImages).Error; err != nil {
+		return nil, fmt.Errorf("查询已有系统镜像失败: %w", err)
+	}
+	existingKeys := make(map[string]struct{}, len(existingImages)+len(desiredImages))
+	for _, img := range existingImages {
+		existingKeys[SystemImageDedupKey(img)] = struct{}{}
+	}
+
+	missingImages := make([]system.SystemImage, 0)
+	for _, img := range desiredImages {
+		key := SystemImageDedupKey(img)
+		if _, exists := existingKeys[key]; exists {
+			continue
+		}
+		missingImages = append(missingImages, img)
+		existingKeys[key] = struct{}{}
+	}
+
+	if len(missingImages) == 0 {
+		return result, nil
+	}
+
+	if err := global.APP_DB.CreateInBatches(&missingImages, 100).Error; err != nil {
+		return nil, fmt.Errorf("批量创建遗漏系统镜像失败: %w", err)
+	}
+
+	result.Processed = len(missingImages)
+	return result, nil
+}
+
+func mergeDefaultImageURLs(imageURLs []string) []string {
+	merged := make([]string, 0, len(imageURLs)+len(getDefaultImageURLs()))
+	seen := make(map[string]struct{}, len(imageURLs))
+
+	appendURL := func(rawURL string) {
+		imageURL := strings.TrimSpace(rawURL)
+		if imageURL == "" {
+			return
+		}
+		if _, exists := seen[imageURL]; exists {
+			return
+		}
+		seen[imageURL] = struct{}{}
+		merged = append(merged, imageURL)
+	}
+
+	for _, imageURL := range imageURLs {
+		appendURL(imageURL)
+	}
+	for _, imageURL := range getDefaultImageURLs() {
+		appendURL(imageURL)
+	}
+
+	return merged
+}
+
+func SystemImageDedupKey(image system.SystemImage) string {
+	providerType := strings.ToLower(strings.TrimSpace(image.ProviderType))
+	instanceType := strings.ToLower(strings.TrimSpace(image.InstanceType))
+	architecture := strings.ToLower(strings.TrimSpace(image.Architecture))
+	osType := utils.NormalizeOSType(image.OSType)
+	osVersion := strings.ToLower(strings.TrimSpace(image.OSVersion))
+
+	if isUnresolvedSystemImageOS(osType) || osVersion == "" {
+		return strings.Join([]string{
+			"url",
+			providerType,
+			instanceType,
+			architecture,
+			normalizeSystemImageURL(image.URL),
+		}, "\x00")
+	}
+
+	parts := []string{
+		"identity",
+		providerType,
+		instanceType,
+		architecture,
+		osType,
+		osVersion,
+		systemImageURLFamily(image.URL),
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func normalizeSystemImageURL(imageURL string) string {
+	return strings.TrimSpace(imageURL)
+}
+
+func systemImageURLFamily(imageURL string) string {
+	clean := imageURLPathForParsing(imageURL)
+	lower := strings.ToLower(strings.TrimSpace(imageURL))
+
+	switch {
+	case strings.HasPrefix(lower, "docker://"):
+		return "docker"
+	case strings.Contains(clean, ".iso"):
+		return "iso"
+	case strings.Contains(clean, ".qcow2"):
+		return "qcow2"
+	case strings.HasSuffix(clean, ".tar.xz"):
+		return "tar.xz"
+	case strings.HasSuffix(clean, ".tar.gz"):
+		return "tar.gz"
+	case strings.HasSuffix(clean, ".zip"):
+		return "zip"
+	case strings.HasSuffix(clean, ".raw"):
+		return "raw"
+	case strings.HasSuffix(clean, ".img"):
+		return "img"
+	default:
+		ext := strings.TrimPrefix(path.Ext(clean), ".")
+		if ext != "" {
+			return ext
+		}
+		return "url"
+	}
+}
+
+func buildDesiredSystemImages(sortedURLs []string) []system.SystemImage {
+	importedImages := make(map[string]bool)
+	desiredKeys := make(map[string]bool)
+	desiredImages := make([]system.SystemImage, 0, len(sortedURLs))
+
+	for _, imageURL := range sortedURLs {
+		imageInfo := parseImageURL(imageURL)
+		if imageInfo == nil {
+			continue
+		}
+
+		imageInfo.OSType = utils.NormalizeOSType(imageInfo.OSType)
+		if isUnresolvedSystemImageOS(imageInfo.OSType) {
+			imageInfo.OSType = utils.DetectOSTypeFromText(imageInfo.Name + " " + imageInfo.URL)
+		}
+		if isUnresolvedSystemImageOS(imageInfo.OSType) {
+			global.APP_LOG.Warn("跳过无法识别操作系统的镜像",
+				zap.String("name", imageInfo.Name),
+				zap.String("url", imageInfo.URL))
+			continue
+		}
+
+		baseImageKey := fmt.Sprintf("%s-%s-%s-%s-%s",
+			imageInfo.ProviderType, imageInfo.InstanceType, imageInfo.Architecture,
+			imageInfo.OSType, imageInfo.OSVersion)
+		currentVariant := getImageVariant(imageURL)
+
+		// 如果是default镜像且已经导入了优先级更高的镜像（cloud/openrc/systemd），跳过
+		if currentVariant == "default" && importedImages[baseImageKey] {
+			global.APP_LOG.Debug("跳过default镜像，已有优先级更高的版本",
+				zap.String("url", imageURL), zap.String("variant", currentVariant))
+			continue
+		}
+
+		// 如果当前是openrc/systemd，但已经有cloud版本，跳过
+		if (currentVariant == "openrc" || currentVariant == "systemd") && importedImages[baseImageKey+"_cloud"] {
+			global.APP_LOG.Debug("跳过openrc/systemd镜像，已有cloud版本",
+				zap.String("url", imageURL), zap.String("variant", currentVariant))
+			continue
+		}
+
+		if isImageBlacklisted(imageInfo.ProviderType, imageInfo.InstanceType, imageInfo.Architecture, imageInfo.OSType, imageInfo.OSVersion) {
+			global.APP_LOG.Warn("跳过黑名单镜像",
+				zap.String("name", imageInfo.Name),
+				zap.String("provider", imageInfo.ProviderType),
+				zap.String("type", imageInfo.InstanceType),
+				zap.String("arch", imageInfo.Architecture),
+				zap.String("os", imageInfo.OSType),
+				zap.String("version", imageInfo.OSVersion))
+			continue
+		}
+
+		imageStatus := defaultSystemImageStatus(imageInfo.ProviderType, imageInfo.InstanceType, imageInfo.OSType)
+		minMemoryMB, minDiskMB := getMinHardwareRequirements(imageInfo.OSType, imageInfo.InstanceType)
+		useCDN := isGitHubURL(imageInfo.URL)
+
+		baseImage := system.SystemImage{
+			Name:         imageInfo.Name,
+			ProviderType: imageInfo.ProviderType,
+			InstanceType: imageInfo.InstanceType,
+			Architecture: imageInfo.Architecture,
+			URL:          imageInfo.URL,
+			Status:       imageStatus,
+			Description:  imageInfo.Description,
+			OSType:       imageInfo.OSType,
+			OSVersion:    imageInfo.OSVersion,
+			MinMemoryMB:  minMemoryMB,
+			MinDiskMB:    minDiskMB,
+			UseCDN:       useCDN,
+			CreatedBy:    nil,
+		}
+		if appendSystemImageIfNew(&desiredImages, desiredKeys, baseImage) {
+			importedImages[baseImageKey] = true
+			if currentVariant == "cloud" {
+				importedImages[baseImageKey+"_cloud"] = true
+			}
+			global.APP_LOG.Debug("准备导入镜像",
+				zap.String("name", imageInfo.Name),
+				zap.String("provider", imageInfo.ProviderType),
+				zap.String("url", imageURL),
+				zap.String("variant", currentVariant))
+		}
+
+		// 对于 PVE/QEMU 通用 qcow2 虚拟机镜像，同时为 QEMU 和 KubeVirt 创建镜像记录。
+		if imageInfo.ProviderType == "proxmox" && imageInfo.InstanceType == "vm" && strings.HasSuffix(imageInfo.URL, ".qcow2") {
+			for _, extraProvider := range []string{"qemu", "kubevirt"} {
+				providerLabel := strings.ToUpper(extraProvider[:1]) + extraProvider[1:]
+				extraImage := baseImage
+				extraImage.ProviderType = extraProvider
+				extraImage.InstanceType = "vm"
+				extraImage.Description = fmt.Sprintf("%s KVM %s image", providerLabel, imageInfo.Name)
+				appendSystemImageIfNew(&desiredImages, desiredKeys, extraImage)
+			}
+		}
+
+		// QEMU Provider 同时支持 libvirt-lxc 容器，可复用 Proxmox LXC rootfs 模板。
+		if imageInfo.ProviderType == "proxmox" && imageInfo.InstanceType == "container" && strings.HasSuffix(imageInfo.URL, ".tar.xz") {
+			extraImage := baseImage
+			extraImage.ProviderType = "qemu"
+			extraImage.InstanceType = "container"
+			extraImage.Description = fmt.Sprintf("QEMU/LXC %s image", imageInfo.Name)
+			appendSystemImageIfNew(&desiredImages, desiredKeys, extraImage)
+		}
+
+		// LXD/Incus Windows VM creation uses a normal Windows installer ISO
+		// which is repacked by distrobuilder before being attached to an
+		// empty VM. Keep VirtIO-prepatched PVE ISO images PVE-only.
+		if imageInfo.ProviderType == "proxmox" && imageInfo.InstanceType == "vm" && isOrdinaryWindowsInstallerISOURL(imageInfo.URL) {
+			for _, extraProvider := range []string{"lxd", "incus"} {
+				extraImage := baseImage
+				extraImage.ProviderType = extraProvider
+				extraImage.InstanceType = "vm"
+				extraImage.Description = fmt.Sprintf("%s Windows installer VM image", providerDisplayName(extraProvider))
+				appendSystemImageIfNew(&desiredImages, desiredKeys, extraImage)
+			}
+		}
+
+		// OCI 容器镜像归档在 Docker/Podman/Containerd/Orbstack/KubeVirt 容器场景可复用。
+		if imageInfo.InstanceType == "container" && isOCIArchiveProvider(imageInfo.ProviderType) && strings.HasSuffix(imageInfo.URL, ".tar.gz") {
+			for _, extraProvider := range []string{"docker", "podman", "containerd", "orbstack", "kubevirt"} {
+				if extraProvider == imageInfo.ProviderType {
+					continue
+				}
+				extraImage := baseImage
+				extraImage.ProviderType = extraProvider
+				extraImage.InstanceType = "container"
+				extraImage.Description = fmt.Sprintf("%s container %s image", providerDisplayName(extraProvider), imageInfo.Name)
+				appendSystemImageIfNew(&desiredImages, desiredKeys, extraImage)
+			}
+		}
+	}
+
+	return desiredImages
+}
+
+func isOCIArchiveProvider(providerType string) bool {
+	switch providerType {
+	case "docker", "podman", "containerd", "orbstack", "kubevirt":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerDisplayName(providerType string) string {
+	switch providerType {
+	case "docker":
+		return "Docker"
+	case "podman":
+		return "Podman"
+	case "containerd":
+		return "Containerd"
+	case "orbstack":
+		return "Orbstack"
+	case "kubevirt":
+		return "KubeVirt"
+	case "lxd":
+		return "LXD"
+	case "incus":
+		return "Incus"
+	default:
+		return providerType
+	}
+}
+
+func appendSystemImageIfNew(images *[]system.SystemImage, keys map[string]bool, image system.SystemImage) bool {
+	key := SystemImageDedupKey(image)
+	if keys[key] {
+		return false
+	}
+	keys[key] = true
+	*images = append(*images, image)
+	return true
+}
+
+func defaultSystemImageStatus(providerType, instanceType, osType string) string {
+	// The published LXD Alpine VM archives currently boot without a usable
+	// lxd-agent.  They can be imported and started, but the provider cannot run
+	// the commands required to finish instance configuration.  Keep those
+	// images visible for administrators to opt into, but do not advertise them
+	// as active defaults on a fresh installation.
+	if strings.EqualFold(providerType, "lxd") &&
+		strings.EqualFold(instanceType, "vm") &&
+		utils.NormalizeOSType(osType) == "alpine" {
+		return "inactive"
+	}
+
+	switch utils.NormalizeOSType(osType) {
+	case "debian", "alpine":
+		return "active"
+	default:
+		return "inactive"
+	}
+}
+
+func isUnresolvedSystemImageOS(osType string) bool {
+	value := strings.ToLower(strings.TrimSpace(osType))
+	return value == "" || value == "unknown" || value == "other"
+}
+
+// parseImageURL 解析镜像URL并提取信息
+func parseImageURL(imageURL string) *ImageInfo {
+	if imageInfo := parseDockerRuntimeImageURL(imageURL); imageInfo != nil {
+		return imageInfo
+	}
+
+	// Proxmox LXC AMD64 镜像
+	lxcAmd64Re := regexp.MustCompile(`https://github\.com/oneclickvirt/lxc_amd64_images/releases/download/([^/]+)/([^_]+)_([^_]+)_([^_]+)_([^_]+)_([^.]+)\.tar\.xz`)
+	if matches := lxcAmd64Re.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         fmt.Sprintf("%s-%s-%s", matches[2], matches[3], matches[6]),
+			ProviderType: "proxmox", // Proxmox VE的LXC镜像
+			InstanceType: "container",
+			Architecture: "amd64",
+			URL:          imageURL,
+			OSType:       matches[2],
+			OSVersion:    matches[3],
+			Description:  fmt.Sprintf("Proxmox LXC %s %s %s image", matches[2], matches[3], matches[6]),
+		}
+	}
+
+	// Proxmox LXC ARM64 镜像
+	lxcArmRe := regexp.MustCompile(`https://github\.com/oneclickvirt/lxc_arm_images/releases/download/([^/]+)/([^_]+)_([^_]+)_([^_]+)_([^_]+)_([^.]+)\.tar\.xz`)
+	if matches := lxcArmRe.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         fmt.Sprintf("%s-%s-%s", matches[2], matches[3], matches[6]),
+			ProviderType: "proxmox", // Proxmox VE的LXC镜像
+			InstanceType: "container",
+			Architecture: "arm64",
+			URL:          imageURL,
+			OSType:       matches[2],
+			OSVersion:    matches[3],
+			Description:  fmt.Sprintf("Proxmox LXC %s %s %s image", matches[2], matches[3], matches[6]),
+		}
+	}
+
+	// LXD KVM镜像
+	lxdKvmRe := regexp.MustCompile(`https://github\.com/oneclickvirt/lxd_images/releases/download/kvm_images/([^_]+)_([^_]+)_([^_]+)_([^_]+)_([^_]+)_kvm\.zip`)
+	if matches := lxdKvmRe.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         fmt.Sprintf("%s-%s-kvm-%s", matches[1], matches[2], matches[5]),
+			ProviderType: "lxd",
+			InstanceType: "vm",
+			Architecture: convertArch(matches[4]),
+			URL:          imageURL,
+			OSType:       matches[1],
+			OSVersion:    matches[2],
+			Description:  fmt.Sprintf("LXD KVM %s %s %s image", matches[1], matches[2], matches[5]),
+		}
+	}
+
+	// LXD 容器镜像
+	lxdContainerRe := regexp.MustCompile(`https://github\.com/oneclickvirt/lxd_images/releases/download/([^/]+)/([^_]+)_([^_]+)_([^_]+)_([^_]+)_([^.]+)\.zip`)
+	if matches := lxdContainerRe.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         fmt.Sprintf("%s-%s-%s", matches[2], matches[3], matches[6]),
+			ProviderType: "lxd",
+			InstanceType: "container",
+			Architecture: convertArch(matches[5]),
+			URL:          imageURL,
+			OSType:       matches[2],
+			OSVersion:    matches[3],
+			Description:  fmt.Sprintf("LXD %s %s %s image", matches[2], matches[3], matches[6]),
+		}
+	}
+
+	// Incus KVM镜像
+	incusKvmRe := regexp.MustCompile(`https://github\.com/oneclickvirt/incus_images/releases/download/kvm_images/([^_]+)_([^_]+)_([^_]+)_((?:x86_64|arm64))_([^_]+)_kvm\.zip`)
+	if matches := incusKvmRe.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         fmt.Sprintf("%s-%s-kvm-%s", matches[1], matches[2], matches[5]),
+			ProviderType: "incus",
+			InstanceType: "vm",
+			Architecture: convertArch(matches[4]),
+			URL:          imageURL,
+			OSType:       matches[1],
+			OSVersion:    matches[2],
+			Description:  fmt.Sprintf("Incus KVM %s %s %s image", matches[1], matches[2], matches[5]),
+		}
+	}
+
+	// Incus 容器镜像
+	incusContainerRe := regexp.MustCompile(`https://github\.com/oneclickvirt/incus_images/releases/download/([^/]+)/([^_]+)_([^_]+)_([^_]+)_((?:x86_64|arm64))_([^.]+)\.zip`)
+	if matches := incusContainerRe.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         fmt.Sprintf("%s-%s-%s", matches[2], matches[3], matches[6]),
+			ProviderType: "incus",
+			InstanceType: "container",
+			Architecture: convertArch(matches[5]),
+			URL:          imageURL,
+			OSType:       matches[2],
+			OSVersion:    matches[3],
+			Description:  fmt.Sprintf("Incus %s %s %s image", matches[2], matches[3], matches[6]),
+		}
+	}
+
+	// Docker镜像
+	dockerRe := regexp.MustCompile(`https://github\.com/oneclickvirt/docker/releases/download/([^/]+)/spiritlhl_([^_]+)_([^.]+)\.tar\.gz`)
+	if matches := dockerRe.FindStringSubmatch(imageURL); matches != nil {
+		osType := matches[2]
+		return &ImageInfo{
+			Name:         fmt.Sprintf("spiritlhl-%s", osType),
+			ProviderType: "docker",
+			InstanceType: "container",
+			Architecture: convertArch(matches[3]),
+			URL:          imageURL,
+			OSType:       osType,
+			OSVersion:    inferDockerOSVersion(osType),
+			Description:  fmt.Sprintf("Docker %s %s image", osType, matches[3]),
+		}
+	}
+
+	// Podman镜像
+	podmanRe := regexp.MustCompile(`https://github\.com/oneclickvirt/podman/releases/download/([^/]+)/spiritlhl_([^_]+)_([^.]+)\.tar\.gz`)
+	if matches := podmanRe.FindStringSubmatch(imageURL); matches != nil {
+		osType := matches[2]
+		return &ImageInfo{
+			Name:         fmt.Sprintf("spiritlhl-%s", osType),
+			ProviderType: "podman",
+			InstanceType: "container",
+			Architecture: convertArch(matches[3]),
+			URL:          imageURL,
+			OSType:       osType,
+			OSVersion:    inferDockerOSVersion(osType),
+			Description:  fmt.Sprintf("Podman %s %s image", osType, matches[3]),
+		}
+	}
+
+	// Containerd镜像
+	containerdRe := regexp.MustCompile(`https://github\.com/oneclickvirt/containerd/releases/download/([^/]+)/spiritlhl_([^_]+)_([^.]+)\.tar\.gz`)
+	if matches := containerdRe.FindStringSubmatch(imageURL); matches != nil {
+		osType := matches[2]
+		return &ImageInfo{
+			Name:         fmt.Sprintf("spiritlhl-%s", osType),
+			ProviderType: "containerd",
+			InstanceType: "container",
+			Architecture: convertArch(matches[3]),
+			URL:          imageURL,
+			OSType:       osType,
+			OSVersion:    inferDockerOSVersion(osType),
+			Description:  fmt.Sprintf("Containerd %s %s image", osType, matches[3]),
+		}
+	}
+
+	// Orbstack镜像
+	orbstackRe := regexp.MustCompile(`https://github\.com/oneclickvirt/orbstack/releases/download/([^/]+)/spiritlhl_([^_]+)_([^.]+)\.tar\.gz`)
+	if matches := orbstackRe.FindStringSubmatch(imageURL); matches != nil {
+		osType := matches[2]
+		return &ImageInfo{
+			Name:         fmt.Sprintf("spiritlhl-%s", osType),
+			ProviderType: "orbstack",
+			InstanceType: "container",
+			Architecture: convertArch(matches[3]),
+			URL:          imageURL,
+			OSType:       osType,
+			OSVersion:    inferDockerOSVersion(osType),
+			Description:  fmt.Sprintf("Orbstack %s %s image", osType, matches[3]),
+		}
+	}
+
+	// Proxmox KVM镜像（pve_kvm_images）
+	proxmoxRe := regexp.MustCompile(`https://github\.com/oneclickvirt/pve_kvm_images/releases/download/([^/]+)/(.+)\.qcow2`)
+	if matches := proxmoxRe.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         matches[2],
+			ProviderType: "proxmox",
+			InstanceType: "vm",
+			Architecture: "amd64", // Proxmox默认amd64
+			URL:          imageURL,
+			OSType:       extractOSFromFilename(matches[2]),
+			OSVersion:    extractVersionFromFilename(matches[2]),
+			Description:  fmt.Sprintf("Proxmox KVM %s image", matches[2]),
+		}
+	}
+
+	// KVM镜像（kvm_images仓库）
+	kvmImagesRe := regexp.MustCompile(`https://github\.com/oneclickvirt/kvm_images/releases/download/([^/]+)/(.+)\.qcow2`)
+	if matches := kvmImagesRe.FindStringSubmatch(imageURL); matches != nil {
+		return &ImageInfo{
+			Name:         matches[2],
+			ProviderType: "proxmox",
+			InstanceType: "vm",
+			Architecture: "amd64",
+			URL:          imageURL,
+			OSType:       extractOSFromFilename(matches[2]),
+			OSVersion:    extractVersionFromFilename(matches[2]),
+			Description:  fmt.Sprintf("KVM %s image", matches[2]),
+		}
+	}
+
+	if imageInfo := parseProxmoxInstallerImageURL(imageURL); imageInfo != nil {
+		return imageInfo
+	}
+
+	return parseGenericOneClickVirtImageURL(imageURL)
+}
+
+func parseProxmoxInstallerImageURL(imageURL string) *ImageInfo {
+	cleanPath := imageURLPathForParsing(imageURL)
+	if !strings.Contains(cleanPath, ".iso") {
+		return nil
+	}
+
+	fileName := imageURLBaseForParsing(imageURL)
+	if fileName == "" || fileName == "." || fileName == "/" {
+		return nil
+	}
+	imageName := installerImageNameFromFile(fileName)
+
+	switch {
+	case isWindowsInstallerISOURL(imageURL):
+		return &ImageInfo{
+			Name:         imageName,
+			ProviderType: "proxmox",
+			InstanceType: "vm",
+			Architecture: "amd64",
+			URL:          imageURL,
+			OSType:       "windows",
+			OSVersion:    extractWindowsVersionFromFilename(fileName),
+			Description:  fmt.Sprintf("Proxmox Windows installer %s", fileName),
+		}
+	case strings.Contains(cleanPath, "oneclickvirt/macos") || strings.Contains(cleanPath, "macos"):
+		return &ImageInfo{
+			Name:         imageName,
+			ProviderType: "proxmox",
+			InstanceType: "vm",
+			Architecture: "amd64",
+			URL:          imageURL,
+			OSType:       "macos",
+			OSVersion:    extractInstallerVersionFromFilename(fileName),
+			Description:  fmt.Sprintf("Proxmox macOS installer %s", fileName),
+		}
+	case strings.Contains(cleanPath, "android-x86") || strings.Contains(cleanPath, "blissos"):
+		return &ImageInfo{
+			Name:         imageName,
+			ProviderType: "proxmox",
+			InstanceType: "vm",
+			Architecture: "amd64",
+			URL:          imageURL,
+			OSType:       "android",
+			OSVersion:    extractInstallerVersionFromFilename(fileName),
+			Description:  fmt.Sprintf("Proxmox Android installer %s", fileName),
+		}
+	default:
+		return nil
+	}
+}
+
+func imageURLPathForParsing(imageURL string) string {
+	cleanPath := strings.TrimSpace(strings.Split(imageURL, "?")[0])
+	cleanPath = strings.TrimSuffix(cleanPath, "/download")
+	return strings.ToLower(cleanPath)
+}
+
+func imageURLBaseForParsing(imageURL string) string {
+	cleanPath := strings.TrimSpace(strings.Split(imageURL, "?")[0])
+	cleanPath = strings.TrimSuffix(cleanPath, "/download")
+	return path.Base(cleanPath)
+}
+
+func installerImageNameFromFile(fileName string) string {
+	name := strings.TrimSuffix(fileName, ".iso.7z")
+	name = strings.TrimSuffix(name, ".ISO.7Z")
+	name = strings.TrimSuffix(name, ".iso")
+	name = strings.TrimSuffix(name, ".ISO")
+	name = strings.NewReplacer("_", "-", " ", "-", "--", "-").Replace(name)
+	if len(name) > 120 {
+		name = name[:120]
+	}
+	return strings.Trim(name, "-")
+}
+
+func extractWindowsVersionFromFilename(fileName string) string {
+	lower := strings.ToLower(fileName)
+	for _, version := range []string{"2025", "2022", "2019", "2016", "2012", "2008"} {
+		if strings.Contains(lower, "server_"+version) || strings.Contains(lower, "server-"+version) || strings.Contains(lower, "server"+version) {
+			return version
+		}
+	}
+	if strings.Contains(lower, "windows_11") || strings.Contains(lower, "windows-11") || strings.Contains(lower, "win11") {
+		return "11"
+	}
+	if strings.Contains(lower, "windows_10") || strings.Contains(lower, "windows-10") || strings.Contains(lower, "win10") {
+		return "10"
+	}
+	if strings.Contains(lower, "windows_8.1") || strings.Contains(lower, "windows-8.1") {
+		return "8.1"
+	}
+	if strings.Contains(lower, "windows_8") || strings.Contains(lower, "windows-8") {
+		return "8"
+	}
+	if strings.Contains(lower, "windows_7") || strings.Contains(lower, "windows-7") {
+		return "7"
+	}
+	return extractInstallerVersionFromFilename(fileName)
+}
+
+func extractInstallerVersionFromFilename(fileName string) string {
+	name := strings.TrimSuffix(strings.ToLower(fileName), ".iso.7z")
+	name = strings.TrimSuffix(name, ".iso")
+	name = strings.NewReplacer("x86_64", "", "x86-64", "", "amd64", "", "x86", "").Replace(name)
+	versionRe := regexp.MustCompile(`([0-9]+(?:\.[0-9]+){0,3}(?:-[a-z0-9.]+)?)`)
+	if match := versionRe.FindStringSubmatch(name); match != nil {
+		return match[1]
+	}
+	name = strings.TrimPrefix(name, "virtio-")
+	return strings.Trim(name, "-_")
+}
+
+func isWindowsInstallerISOURL(imageURL string) bool {
+	cleanPath := imageURLPathForParsing(imageURL)
+	return strings.Contains(cleanPath, ".iso") &&
+		(strings.Contains(cleanPath, "/windows/") ||
+			strings.Contains(cleanPath, "/windows-virtio/") ||
+			strings.Contains(cleanPath, "windows_") ||
+			strings.Contains(cleanPath, "windows-") ||
+			strings.Contains(cleanPath, "win.iso"))
+}
+
+func isOrdinaryWindowsInstallerISOURL(imageURL string) bool {
+	cleanPath := imageURLPathForParsing(imageURL)
+	return isWindowsInstallerISOURL(imageURL) && !strings.Contains(cleanPath, "/windows-virtio/")
+}
+
+func parseDockerRuntimeImageURL(imageURL string) *ImageInfo {
+	cleanURL := strings.TrimSpace(strings.Split(imageURL, "?")[0])
+	if !strings.HasPrefix(cleanURL, "docker://") {
+		return nil
+	}
+
+	ref := strings.TrimPrefix(cleanURL, "docker://")
+	tag := "latest"
+	if idx := strings.LastIndex(ref, ":"); idx > strings.LastIndex(ref, "/") {
+		tag = strings.TrimSpace(ref[idx+1:])
+		ref = strings.TrimSpace(ref[:idx])
+	}
+	if ref == "" || tag == "" {
+		return nil
+	}
+
+	refLower := strings.ToLower(ref)
+	tagLower := strings.ToLower(tag)
+	switch refLower {
+	case "spiritlhl/wds", "dockurr/windows":
+		return &ImageInfo{
+			Name:         "windows-" + tagLower,
+			ProviderType: "docker",
+			InstanceType: "container",
+			Architecture: "amd64",
+			URL:          cleanURL,
+			OSType:       "windows",
+			OSVersion:    tagLower,
+			Description:  fmt.Sprintf("Docker Windows %s runtime image", tagLower),
+		}
+	case "redroid/redroid":
+		return &ImageInfo{
+			Name:         "android-" + tagLower,
+			ProviderType: "docker",
+			InstanceType: "container",
+			Architecture: "amd64",
+			URL:          cleanURL,
+			OSType:       "android",
+			OSVersion:    tagLower,
+			Description:  fmt.Sprintf("Docker Android %s runtime image", tagLower),
+		}
+	case "dockurr/macos":
+		return &ImageInfo{
+			Name:         "macos-" + tagLower,
+			ProviderType: "docker",
+			InstanceType: "container",
+			Architecture: "amd64",
+			URL:          cleanURL,
+			OSType:       "macos",
+			OSVersion:    tagLower,
+			Description:  fmt.Sprintf("Docker macOS %s runtime image", tagLower),
+		}
+	default:
+		return nil
+	}
+}

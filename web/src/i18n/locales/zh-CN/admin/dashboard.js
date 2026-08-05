@@ -1,0 +1,22 @@
+export default {
+  title: "管理员仪表盘",
+  systemOverview: "系统概览",
+  statistics: "统计信息",
+  totalUsers: "总用户数",
+  totalProviders: "服务器数量",
+  totalVMs: "虚拟机数量",
+  totalContainers: "容器数量",
+  totalInstances: "总实例数",
+  systemHealth: "系统健康",
+  recentActivities: "最近活动",
+  quickStats: "快速统计",
+  loadDataFailed: "获取仪表盘数据失败",
+  resourceOverview: "资源概览",
+  cpuCores: "CPU 核心",
+  memory: "内存",
+  disk: "磁盘",
+  used: "已用",
+  total: "总计",
+  runningInstances: "运行中实例",
+  activeProviders: "活跃节点"
+}

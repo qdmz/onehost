@@ -1,0 +1,485 @@
+package config
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// 配置标志文件路径和配置状态常量
+const (
+	ConfigModifiedFlagFile = "./storage/.config_modified" // 配置已通过API修改的标志文件
+)
+
+// 系统级配置键列表（启动必需配置，必须100%来自YAML，不能被数据库覆盖）
+// 这些配置包括：
+// - 数据库连接信息（必须在数据库连接前读取）
+// - 服务器端口和环境配置（影响启动行为）
+// - 基础系统设置（如OSS类型、是否使用Redis等）
+var systemLevelConfigKeys = map[string]bool{
+	// System 配置（所有 system.* 都是系统级配置）
+	"system.addr":                       true,
+	"system.db-type":                    true,
+	"system.env":                        true,
+	"system.frontend-url":               true,
+	"system.iplimit-count":              true,
+	"system.iplimit-time":               true,
+	"system.oauth2-state-token-minutes": true,
+	"system.oss-type":                   true,
+	"system.provider-inactive-hours":    true,
+	"system.use-multipoint":             true,
+	"system.use-redis":                  true,
+
+	// MySQL 配置（数据库连接信息，必须在连接数据库前读取）
+	"mysql.path":           true,
+	"mysql.port":           true,
+	"mysql.config":         true,
+	"mysql.db-name":        true,
+	"mysql.username":       true,
+	"mysql.password":       true,
+	"mysql.prefix":         true,
+	"mysql.singular":       true,
+	"mysql.engine":         true,
+	"mysql.max-idle-conns": true,
+	"mysql.max-open-conns": true,
+	"mysql.max-lifetime":   true,
+	"mysql.log-mode":       true,
+	"mysql.log-zap":        true,
+	"mysql.auto-create":    true,
+
+	// Redis 配置（如果启用Redis，也是启动必需）
+	"redis.addr":     true,
+	"redis.password": true,
+	"redis.db":       true,
+
+	// Zap 日志配置（日志系统启动必需）
+	"zap.level":              true,
+	"zap.format":             true,
+	"zap.prefix":             true,
+	"zap.director":           true,
+	"zap.encode-level":       true,
+	"zap.stacktrace-key":     true,
+	"zap.max-file-size":      true,
+	"zap.max-backups":        true,
+	"zap.max-log-length":     true,
+	"zap.retention-day":      true,
+	"zap.show-line":          true,
+	"zap.log-in-console":     true,
+	"zap.max-string-length":  true,
+	"zap.max-array-elements": true,
+}
+
+// isSystemLevelConfig 检查是否为系统级配置（启动必需，必须来自YAML）
+func isSystemLevelConfig(key string) bool {
+	return systemLevelConfigKeys[key]
+}
+
+// 公开配置键列表（不需要认证即可访问）
+var publicConfigKeys = map[string]bool{
+	"auth.enable-public-registration": true,
+	"other.default-language":          true,
+	"other.logo-url":                  true,
+	"other.site-name":                 true,
+}
+
+// SystemConfig 系统配置模型（避免循环导入）
+type SystemConfig struct {
+	ID          uint           `json:"id" gorm:"primarykey"`
+	Category    string         `json:"category" gorm:"size:50;not null;index"`
+	Key         string         `json:"key" gorm:"size:100;not null;index"`
+	Value       string         `json:"value" gorm:"type:text"`
+	Description string         `json:"description" gorm:"size:255"`
+	Type        string         `json:"type" gorm:"size:20;not null;default:string"`
+	IsPublic    bool           `json:"isPublic" gorm:"not null;default:false"`
+	CreatedAt   time.Time      `json:"createdAt"`
+	UpdatedAt   time.Time      `json:"updatedAt"`
+	DeletedAt   gorm.DeletedAt `json:"deletedAt" gorm:"index"`
+}
+
+func (SystemConfig) TableName() string {
+	return "system_configs"
+}
+
+// ConfigManager 统一的配置管理器
+type ConfigManager struct {
+	mu              sync.RWMutex
+	db              *gorm.DB
+	logger          *zap.Logger
+	configCache     map[string]interface{}
+	lastUpdate      time.Time
+	validationRules map[string]ConfigValidationRule
+	changeCallbacks []ConfigChangeCallback
+}
+
+// ConfigValidationRule 配置验证规则
+type ConfigValidationRule struct {
+	Required  bool
+	Type      string // string, int, bool, array, object
+	MinValue  interface{}
+	MaxValue  interface{}
+	Pattern   string
+	Validator func(interface{}) error
+}
+
+// ConfigChangeCallback 配置变更回调
+type ConfigChangeCallback func(key string, oldValue, newValue interface{}) error
+
+var (
+	configManager   *ConfigManager
+	configManagerMu sync.RWMutex // 保护包级 configManager 变量
+	once            sync.Once
+)
+
+// NewConfigManager 创建新的配置管理器
+func NewConfigManager(db *gorm.DB, logger *zap.Logger) *ConfigManager {
+	return &ConfigManager{
+		db:              db,
+		logger:          logger,
+		configCache:     make(map[string]interface{}),
+		validationRules: make(map[string]ConfigValidationRule),
+	}
+}
+
+// GetConfigManager 获取配置管理器实例
+func GetConfigManager() *ConfigManager {
+	configManagerMu.RLock()
+	defer configManagerMu.RUnlock()
+	return configManager
+}
+
+// PreInitializeConfigManager 预初始化配置管理器并注册回调（在InitializeConfigManager之前调用）
+func PreInitializeConfigManager(db *gorm.DB, logger *zap.Logger, callback ConfigChangeCallback) {
+	configManagerMu.Lock()
+	if configManager == nil {
+		configManager = NewConfigManager(db, logger)
+		configManager.initValidationRules()
+	}
+	cm := configManager
+	configManagerMu.Unlock()
+
+	// 注册回调（RegisterChangeCallback 内部有自己的锁）
+	if callback != nil {
+		cm.RegisterChangeCallbackOnce(callback)
+		logger.Info("配置变更回调已提前注册")
+	}
+}
+
+// InitializeConfigManager 初始化配置管理器
+func InitializeConfigManager(db *gorm.DB, logger *zap.Logger) {
+	once.Do(func() {
+		configManagerMu.Lock()
+		if configManager == nil {
+			configManager = NewConfigManager(db, logger)
+			configManager.initValidationRules()
+		}
+		cm := configManager
+		configManagerMu.Unlock()
+		// 加载配置在锁外执行（可能耗时），此时回调已经注册好了
+		cm.loadConfigFromDB()
+	})
+}
+
+// ReInitializeConfigManager 重新初始化配置管理器（用于系统初始化完成后）
+func ReInitializeConfigManager(db *gorm.DB, logger *zap.Logger) {
+	if db == nil || logger == nil {
+		if logger != nil {
+			logger.Error("重新初始化配置管理器失败: 数据库或日志记录器为空")
+		}
+		return
+	}
+
+	configManagerMu.Lock()
+	if configManager == nil {
+		configManager = NewConfigManager(db, logger)
+		configManager.initValidationRules()
+	} else {
+		// 不能在持有 configManagerMu 时直接写入 cm.db/cm.logger，
+		// 并发读取方法（GetConfig 等）只持有 cm.mu。
+		// 使用 cm.mu.Lock() 保护字段更新，确保与并发读写互斥。
+		cm := configManager
+		configManagerMu.Unlock()
+		cm.mu.Lock()
+		cm.db = db
+		cm.logger = logger
+		cm.mu.Unlock()
+		cm.loadConfigFromDB()
+		logger.Info("配置管理器重新初始化完成")
+		return
+	}
+	cm := configManager
+	configManagerMu.Unlock()
+
+	// 重新加载配置在锁外执行（可能耗时），此时回调应该已经注册好了
+	cm.loadConfigFromDB()
+
+	logger.Info("配置管理器重新初始化完成")
+}
+
+// GetConfig 获取配置
+func (cm *ConfigManager) GetConfig(key string) (interface{}, bool) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	value, exists := cm.configCache[key]
+	return value, exists
+}
+
+// GetAllConfig 获取所有配置
+func (cm *ConfigManager) GetAllConfig() map[string]interface{} {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	result := make(map[string]interface{})
+	for k, v := range cm.configCache {
+		result[k] = v
+	}
+	return result
+}
+
+// SetRuntimeConfigCache updates already-persisted runtime config values in memory only.
+// It is intentionally used by services that write their own DB rows outside of
+// ConfigManager but still need subsequent readers to observe the new value immediately.
+func (cm *ConfigManager) SetRuntimeConfigCache(values map[string]interface{}) {
+	if cm == nil || len(values) == 0 {
+		return
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	for k, v := range values {
+		cm.configCache[k] = v
+	}
+	cm.lastUpdate = time.Now()
+}
+
+// SetConfig 设置单个配置项
+func (cm *ConfigManager) SetConfig(key string, value interface{}) error {
+	cm.mu.Lock()
+
+	// 验证配置值
+	if err := cm.validateConfig(key, value); err != nil {
+		cm.mu.Unlock()
+		return fmt.Errorf("配置验证失败: %v", err)
+	}
+
+	// 保存旧值用于回调
+	oldValue := cm.configCache[key]
+
+	// 更新配置
+	cm.configCache[key] = value
+	cm.lastUpdate = time.Now()
+
+	// 保存到数据库
+	if err := cm.saveConfigToDB(key, value); err != nil {
+		// 回滚
+		cm.configCache[key] = oldValue
+		cm.mu.Unlock()
+		return fmt.Errorf("保存配置到数据库失败: %v", err)
+	}
+
+	// 提取 top-level category 并构建 category map（用于回调）
+	category, categoryMap := cm.buildCategoryMapFromCache(key)
+
+	// 复制回调列表（避免持锁时调用回调）
+	callbacks := make([]ConfigChangeCallback, len(cm.changeCallbacks))
+	copy(callbacks, cm.changeCallbacks)
+	cm.mu.Unlock()
+
+	// 在锁外触发回调
+	// 优先尝试 category 级别的回调（与 UpdateConfig 保持一致）
+	if category != "" && categoryMap != nil {
+		for _, callback := range callbacks {
+			if err := callback(category, nil, categoryMap); err != nil {
+				cm.logger.Error("配置变更回调失败",
+					zap.String("key", key),
+					zap.String("category", category),
+					zap.Error(err))
+			}
+		}
+	} else {
+		// 无法提取 category 时，使用原始 flat key 回调
+		for _, callback := range callbacks {
+			if err := callback(key, oldValue, value); err != nil {
+				cm.logger.Error("配置变更回调失败",
+					zap.String("key", key),
+					zap.Error(err))
+			}
+		}
+	}
+
+	return nil
+}
+
+// buildCategoryMapFromCache 从 configCache 中提取 top-level category 及其完整 map
+// key 格式为 "category.sub-key"，返回 category 名称和该 category 下的所有配置
+func (cm *ConfigManager) buildCategoryMapFromCache(key string) (string, map[string]interface{}) {
+	dotIdx := strings.Index(key, ".")
+	if dotIdx <= 0 {
+		// key 本身就是 top-level category（没有 dot）
+		if v, ok := cm.configCache[key]; ok {
+			if m, ok := v.(map[string]interface{}); ok {
+				return key, m
+			}
+		}
+		return "", nil
+	}
+	category := key[:dotIdx]
+	prefix := category + "."
+	result := make(map[string]interface{})
+	for k, v := range cm.configCache {
+		if strings.HasPrefix(k, prefix) {
+			result[k[len(prefix):]] = v
+		}
+	}
+	if len(result) == 0 {
+		return "", nil
+	}
+	return category, result
+}
+
+// UpdateConfig 批量更新配置
+func (cm *ConfigManager) UpdateConfig(config map[string]interface{}) error {
+	cm.mu.Lock()
+	// 将驼峰格式转换为连接符格式，以保持与YAML一致
+	kebabConfig := convertMapKeysToKebab(config)
+	cm.logger.Info("转换配置格式",
+		zap.Int("originalKeys", len(config)),
+		zap.Int("kebabKeys", len(kebabConfig)))
+
+	// 展开嵌套配置并验证
+	flatConfig := cm.flattenConfig(kebabConfig, "")
+	cm.logger.Info("扁平化后的配置",
+		zap.Int("count", len(flatConfig)),
+		zap.Any("keys", func() []string {
+			keys := make([]string, 0, len(flatConfig))
+			for k := range flatConfig {
+				keys = append(keys, k)
+			}
+			return keys
+		}()))
+
+	// 检查是否包含系统级配置，禁止通过API修改
+	for key := range flatConfig {
+		if isSystemLevelConfig(key) {
+			cm.mu.Unlock()
+			return fmt.Errorf("禁止修改系统级配置: %s（该配置必须通过config.yaml修改并重启服务）", key)
+		}
+	}
+
+	for key, value := range flatConfig {
+		if err := cm.validateConfig(key, value); err != nil {
+			cm.mu.Unlock()
+			return fmt.Errorf("配置 %s 验证失败: %v", key, err)
+		}
+	}
+	if err := cm.validateQuotaDefaultLevelReference(flatConfig); err != nil {
+		cm.mu.Unlock()
+		return fmt.Errorf("配额配置验证失败: %v", err)
+	}
+	if err := cm.validateQuotaLevelsInUse(flatConfig); err != nil {
+		cm.mu.Unlock()
+		return fmt.Errorf("配额配置验证失败: %v", err)
+	}
+
+	// 先准备所有配置数据（事务外）
+	oldValues := make(map[string]interface{})
+	var configsToSave []SystemConfig
+	for key, value := range flatConfig {
+		oldValues[key] = cm.configCache[key]
+		cm.configCache[key] = value
+
+		// 准备配置数据
+		config, err := cm.prepareConfigForDB(key, value)
+		if err != nil {
+			// 恢复配置
+			for k, v := range oldValues {
+				cm.configCache[k] = v
+			}
+			cm.mu.Unlock()
+			return fmt.Errorf("准备配置 %s 失败: %v", key, err)
+		}
+		configsToSave = append(configsToSave, config)
+	}
+
+	// 使用短事务批量保存
+	transactionErr := cm.db.Transaction(func(tx *gorm.DB) error {
+		// 批量保存配置（使用真正的批量 UPSERT）
+		if len(configsToSave) > 0 {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "category"}, {Name: "key"}},
+				DoUpdates: clause.AssignmentColumns([]string{"value", "is_public", "updated_at"}),
+			}).CreateInBatches(configsToSave, 50).Error; err != nil {
+				return fmt.Errorf("批量保存配置失败: %v", err)
+			}
+		}
+		return nil
+	})
+
+	if transactionErr != nil {
+		// 恢复配置
+		for k, v := range oldValues {
+			cm.configCache[k] = v
+		}
+		cm.mu.Unlock()
+		return fmt.Errorf("批量保存配置失败: %v", transactionErr)
+	}
+
+	// 创建配置修改标志文件
+	if err := cm.markConfigAsModified(); err != nil {
+		// 恢复配置
+		for k, v := range oldValues {
+			cm.configCache[k] = v
+		}
+		cm.logger.Error("创建配置修改标志文件失败", zap.Error(err))
+		cm.mu.Unlock()
+		return fmt.Errorf("创建配置修改标志文件失败: %v", err)
+	}
+
+	cm.lastUpdate = time.Now()
+
+	// 释放锁，准备执行可能耗时的操作
+	cm.mu.Unlock()
+
+	// 使用当前缓存快照重建完整的 top-level 配置，再统一同步到全局配置。
+	// 这样可以避免部分字段更新时全局内存配置与数据库缓存出现短暂不一致。
+	if err := cm.syncToGlobalConfig(kebabConfig); err != nil {
+		cm.logger.Error("同步配置到全局配置失败", zap.Error(err))
+	}
+
+	return nil
+}
+
+// RegisterChangeCallback 注册配置变更回调
+func (cm *ConfigManager) RegisterChangeCallback(callback ConfigChangeCallback) {
+	if callback == nil {
+		return
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	cm.changeCallbacks = append(cm.changeCallbacks, callback)
+}
+
+// RegisterChangeCallbackOnce is used by lifecycle initialization paths that may
+// run again after database recovery. Named callbacks are identified by their
+// function pointer so reconnects do not multiply side effects.
+func (cm *ConfigManager) RegisterChangeCallbackOnce(callback ConfigChangeCallback) {
+	if callback == nil {
+		return
+	}
+	callbackPointer := reflect.ValueOf(callback).Pointer()
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	for _, existing := range cm.changeCallbacks {
+		if existing != nil && reflect.ValueOf(existing).Pointer() == callbackPointer {
+			return
+		}
+	}
+	cm.changeCallbacks = append(cm.changeCallbacks, callback)
+}

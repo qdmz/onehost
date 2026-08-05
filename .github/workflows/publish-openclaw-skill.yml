@@ -1,0 +1,88 @@
+name: Publish OpenClaw Skill
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'skills/**'
+      - 'mcp.json'
+      - 'scripts/skill_release_check.sh'
+      - '.github/workflows/publish-openclaw-skill.yml'
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+concurrency:
+  group: openclaw-skill-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check skill files are in sync with MCP source
+        run: |
+          python3 scripts/generate_skills.py
+          if ! git diff --quiet skills/SKILL.md skills/SKILL_ZH.md; then
+            echo "ERROR: skills/SKILL.md and skills/SKILL_ZH.md are out of sync with server/mcp/server.go"
+            echo "Run 'python3 scripts/generate_skills.py' locally and commit the changes."
+            git diff skills/SKILL.md skills/SKILL_ZH.md
+            exit 1
+          fi
+          echo "Skill files are in sync with MCP source."
+
+      - name: Validate skill files
+        run: |
+          VERSION=""
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            VERSION="${GITHUB_REF_NAME:-}"
+          fi
+          bash scripts/skill_release_check.sh "${VERSION}"
+
+      - name: Package skill
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          mkdir -p dist/oneclickvirt
+          cp skills/SKILL.md skills/SKILL_ZH.md mcp.json dist/oneclickvirt/
+          tar -czf "oneclickvirt-skill-${VERSION}.tar.gz" -C dist oneclickvirt
+          sha256sum "oneclickvirt-skill-${VERSION}.tar.gz" > "oneclickvirt-skill-${VERSION}.sha256"
+
+      - name: Upload packaged skill artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: oneclickvirt-skill
+          path: |
+            oneclickvirt-skill-*.tar.gz
+            oneclickvirt-skill-*.sha256
+          if-no-files-found: error
+
+  publish-release-assets:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: validate-and-package
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged skill artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: oneclickvirt-skill
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            oneclickvirt-skill-*.tar.gz
+            oneclickvirt-skill-*.sha256

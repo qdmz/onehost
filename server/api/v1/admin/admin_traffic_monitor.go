@@ -1,0 +1,242 @@
+package admin
+
+import (
+	"strconv"
+
+	"oneclickvirt/global"
+	"oneclickvirt/middleware"
+	adminModel "oneclickvirt/model/admin"
+	"oneclickvirt/model/common"
+	providerModel "oneclickvirt/model/provider"
+	taskService "oneclickvirt/service/task"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+)
+
+// TrafficMonitorOperation 流量监控操作
+// @Summary 流量监控操作
+// @Description 批量启用、删除或检测Provider下所有实例的流量监控
+// @Tags 流量监控管理
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param request body adminModel.TrafficMonitorOperationRequest true "操作请求"
+// @Success 200 {object} common.Response{data=object} "操作成功"
+// @Failure 400 {object} common.Response "请求参数错误"
+// @Failure 500 {object} common.Response "服务器内部错误"
+// @Router /admin/provider/traffic-monitor [post]
+func TrafficMonitorOperation(c *gin.Context) {
+	var req adminModel.TrafficMonitorOperationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "参数错误: "+err.Error()))
+		return
+	}
+	if err := ensureProviderOwner(c, req.ProviderID); err != nil {
+		common.ResponseWithError(c, err)
+		return
+	}
+
+	// 确定任务类型
+	var taskType string
+	switch req.Operation {
+	case "enable":
+		taskType = "enable_all"
+	case "disable":
+		taskType = "disable_all"
+	case "detect":
+		taskType = "detect_all"
+	default:
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "不支持的操作类型"))
+		return
+	}
+
+	if err := taskService.GetTaskService().EnsureTaskPoolAccepting(); err != nil {
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	// 创建任务记录
+	task := adminModel.TrafficMonitorTask{
+		ProviderID: req.ProviderID,
+		TaskType:   taskType,
+		Status:     "pending",
+		Progress:   0,
+		Message:    "任务已创建，等待执行",
+	}
+
+	if err := global.APP_DB.Create(&task).Error; err != nil {
+		global.APP_LOG.Error("创建流量监控任务失败",
+			zap.Uint("providerID", req.ProviderID),
+			zap.String("operation", req.Operation),
+			zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	adminTask, err := taskService.CreateTrafficMonitorAdminTask(req.ProviderID, task.ID, req.Operation, middleware.GetOwnerAdminID(c))
+	if err != nil {
+		_ = global.APP_DB.Model(&task).Updates(map[string]interface{}{
+			"status":  "failed",
+			"message": err.Error(),
+		}).Error
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+	_ = global.APP_DB.Model(&task).Update("admin_task_id", adminTask.ID).Error
+
+	common.ResponseSuccess(c, map[string]interface{}{
+		"taskId":      task.ID,
+		"adminTaskId": adminTask.ID,
+	}, "任务已创建")
+}
+
+// GetTrafficMonitorTaskList 获取流量监控任务列表
+// @Summary 获取流量监控任务列表
+// @Description 查询流量监控操作任务列表
+// @Tags 流量监控管理
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param page query int false "页码" default(1)
+// @Param pageSize query int false "每页数量" default(10)
+// @Param providerId query int false "Provider ID"
+// @Param taskType query string false "任务类型"
+// @Param status query string false "任务状态"
+// @Success 200 {object} common.Response{data=object} "查询成功"
+// @Failure 500 {object} common.Response "服务器内部错误"
+// @Router /admin/provider/traffic-monitor/tasks [get]
+func GetTrafficMonitorTaskList(c *gin.Context) {
+	var req adminModel.TrafficMonitorTaskListRequest
+	req.Page = 1
+	req.PageSize = 10
+
+	if err := c.ShouldBindQuery(&req); err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "任务列表查询参数错误"))
+		return
+	}
+
+	if req.Page <= 0 {
+		req.Page = 1
+	}
+	if req.PageSize <= 0 || req.PageSize > 100 {
+		req.PageSize = 10
+	}
+
+	db := global.APP_DB.Model(&adminModel.TrafficMonitorTask{})
+	if ownerAdminID := middleware.GetOwnerAdminID(c); ownerAdminID > 0 {
+		providerIDs := global.APP_DB.Model(&providerModel.Provider{}).
+			Select("id").
+			Where("owner_admin_id = ?", ownerAdminID)
+		db = db.Where("provider_id IN (?)", providerIDs)
+	}
+
+	// 应用筛选条件
+	if req.ProviderID > 0 {
+		db = db.Where("provider_id = ?", req.ProviderID)
+	}
+	if req.TaskType != "" {
+		db = db.Where("task_type = ?", req.TaskType)
+	}
+	if req.Status != "" {
+		db = db.Where("status = ?", req.Status)
+	}
+
+	// 查询总数
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		global.APP_LOG.Error("查询任务总数失败", zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	// 查询列表
+	var tasks []adminModel.TrafficMonitorTask
+	offset := (req.Page - 1) * req.PageSize
+	if err := db.Order("created_at DESC").
+		Limit(req.PageSize).
+		Offset(offset).
+		Find(&tasks).Error; err != nil {
+		global.APP_LOG.Error("查询任务列表失败", zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	common.ResponseSuccessWithPagination(c, tasks, total, req.Page, req.PageSize)
+}
+
+// GetTrafficMonitorTaskDetail 获取流量监控任务详情
+// @Summary 获取流量监控任务详情
+// @Description 获取指定任务的详细信息和输出日志
+// @Tags 流量监控管理
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path int true "任务ID"
+// @Success 200 {object} common.Response{data=adminModel.TrafficMonitorTask} "查询成功"
+// @Failure 404 {object} common.Response "任务不存在"
+// @Failure 500 {object} common.Response "服务器内部错误"
+// @Router /admin/provider/traffic-monitor/tasks/{id} [get]
+func GetTrafficMonitorTaskDetail(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 32)
+	if err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "无效的任务ID"))
+		return
+	}
+
+	var task adminModel.TrafficMonitorTask
+	query := global.APP_DB.Where("traffic_monitor_tasks.id = ?", uint(id))
+	if ownerAdminID := middleware.GetOwnerAdminID(c); ownerAdminID > 0 {
+		providerIDs := global.APP_DB.Model(&providerModel.Provider{}).
+			Select("id").
+			Where("owner_admin_id = ?", ownerAdminID)
+		query = query.Where("traffic_monitor_tasks.provider_id IN (?)", providerIDs)
+	}
+	if err := query.First(&task).Error; err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeNotFound, "任务不存在"))
+		return
+	}
+
+	common.ResponseSuccess(c, task, "查询成功")
+}
+
+// GetLatestTrafficMonitorTask 获取Provider的最新流量监控任务
+// @Summary 获取Provider的最新流量监控任务
+// @Description 获取指定Provider的最新流量监控任务（用于显示运行中的任务）
+// @Tags 流量监控管理
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param providerId query int true "Provider ID"
+// @Success 200 {object} common.Response{data=adminModel.TrafficMonitorTask} "查询成功"
+// @Failure 404 {object} common.Response "没有任务"
+// @Failure 500 {object} common.Response "服务器内部错误"
+// @Router /admin/provider/traffic-monitor/latest [get]
+func GetLatestTrafficMonitorTask(c *gin.Context) {
+	providerIDStr := c.Query("providerId")
+	if providerIDStr == "" {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "缺少providerId参数"))
+		return
+	}
+
+	providerID, err := strconv.ParseUint(providerIDStr, 10, 32)
+	if err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "无效的providerId"))
+		return
+	}
+	if err := ensureProviderOwner(c, uint(providerID)); err != nil {
+		common.ResponseWithError(c, err)
+		return
+	}
+
+	var task adminModel.TrafficMonitorTask
+	if err := global.APP_DB.Where("provider_id = ?", uint(providerID)).
+		Order("created_at DESC").
+		First(&task).Error; err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeNotFound, "没有找到任务"))
+		return
+	}
+
+	common.ResponseSuccess(c, task, "查询成功")
+}

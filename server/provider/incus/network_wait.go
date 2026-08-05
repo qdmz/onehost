@@ -1,0 +1,160 @@
+package incus
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"oneclickvirt/global"
+
+	"go.uber.org/zap"
+)
+
+// waitForVMNetworkReady 等待虚拟机网络就绪
+func (i *IncusProvider) waitForVMNetworkReady(instanceName string) error {
+	global.APP_LOG.Debug("等待虚拟机网络就绪", zap.String("instanceName", instanceName))
+
+	maxRetries := 8 // 重试次数
+	delay := 15     // 虚拟机需要更长的启动时间
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		global.APP_LOG.Debug("等待虚拟机启动并获取IP地址",
+			zap.String("instanceName", instanceName),
+			zap.Int("attempt", attempt),
+			zap.Int("maxRetries", maxRetries),
+			zap.Int("delay", delay))
+
+		time.Sleep(time.Duration(delay) * time.Second)
+
+		// 检查虚拟机状态
+		statusCmd := fmt.Sprintf("incus info %s | grep \"Status:\" | awk '{print $2}'", shellSingleQuote(instanceName))
+		output, err := i.sshClient.Execute(statusCmd)
+		if err != nil {
+			global.APP_LOG.Warn("检查虚拟机状态失败",
+				zap.String("instanceName", instanceName),
+				zap.Int("attempt", attempt),
+				zap.Error(err))
+			continue
+		}
+
+		status := strings.TrimSpace(output)
+		if status != "RUNNING" {
+			global.APP_LOG.Debug("虚拟机尚未运行",
+				zap.String("instanceName", instanceName),
+				zap.String("status", status),
+				zap.Int("attempt", attempt))
+			continue
+		}
+
+		if err := i.ensureVMGuestNetworkUp(instanceName); err != nil {
+			global.APP_LOG.Debug("尝试唤醒虚拟机Guest网络失败，继续等待",
+				zap.String("instanceName", instanceName),
+				zap.Int("attempt", attempt),
+				zap.Error(err))
+		}
+
+		// 检查是否已获取到IP地址
+		if _, err := i.getInstanceIP(instanceName); err == nil {
+			global.APP_LOG.Debug("虚拟机网络已就绪",
+				zap.String("instanceName", instanceName),
+				zap.Int("attempt", attempt))
+			return nil
+		}
+
+		// 逐渐增加等待时间
+		if attempt < maxRetries {
+			delay = min(delay+5, 25)
+		}
+	}
+
+	return fmt.Errorf("虚拟机网络就绪超时，已等待 %d 次", maxRetries)
+}
+
+func (i *IncusProvider) ensureVMGuestNetworkUp(instanceName string) error {
+	script := `
+run_with_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 30 "$@"
+  else
+    "$@"
+  fi
+}
+for iface in enp5s0 eth0 ens3; do
+  ip link show "$iface" >/dev/null 2>&1 || continue
+  ip link set "$iface" up >/dev/null 2>&1 || true
+  if ip -4 addr show dev "$iface" 2>/dev/null | grep -q ' inet '; then
+    continue
+  fi
+  if command -v dhclient >/dev/null 2>&1; then
+    run_with_timeout dhclient -4 -v "$iface" >/dev/null 2>&1 || true
+  elif command -v dhcpcd >/dev/null 2>&1; then
+    run_with_timeout dhcpcd -4 "$iface" >/dev/null 2>&1 || true
+  elif command -v udhcpc >/dev/null 2>&1; then
+    run_with_timeout udhcpc -q -i "$iface" >/dev/null 2>&1 || true
+  fi
+done
+ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -1
+`
+	cmd := fmt.Sprintf("incus exec %s -- sh -c %s", shellSingleQuote(instanceName), shellSingleQuote(script))
+	output, err := i.sshClient.ExecuteWithTimeout(cmd, 45*time.Second)
+	if err != nil {
+		return fmt.Errorf("唤醒虚拟机Guest网络失败: %w", err)
+	}
+	global.APP_LOG.Debug("虚拟机Guest网络唤醒结果",
+		zap.String("instanceName", instanceName),
+		zap.String("output", strings.TrimSpace(output)))
+	return nil
+}
+
+// waitForContainerNetworkReady 等待容器网络就绪
+func (i *IncusProvider) waitForContainerNetworkReady(instanceName string) error {
+	global.APP_LOG.Debug("等待容器网络就绪", zap.String("instanceName", instanceName))
+
+	maxRetries := 10 // 容器启动较快
+	delay := 5       // 容器启动时间较短
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		global.APP_LOG.Debug("等待容器启动并获取IP地址",
+			zap.String("instanceName", instanceName),
+			zap.Int("attempt", attempt),
+			zap.Int("maxRetries", maxRetries),
+			zap.Int("delay", delay))
+
+		time.Sleep(time.Duration(delay) * time.Second)
+
+		// 检查容器状态
+		statusCmd := fmt.Sprintf("incus info %s | grep \"Status:\" | awk '{print $2}'", shellSingleQuote(instanceName))
+		output, err := i.sshClient.Execute(statusCmd)
+		if err != nil {
+			global.APP_LOG.Warn("检查容器状态失败",
+				zap.String("instanceName", instanceName),
+				zap.Int("attempt", attempt),
+				zap.Error(err))
+			continue
+		}
+
+		status := strings.TrimSpace(output)
+		if status != "RUNNING" {
+			global.APP_LOG.Debug("容器尚未运行",
+				zap.String("instanceName", instanceName),
+				zap.String("status", status),
+				zap.Int("attempt", attempt))
+			continue
+		}
+
+		// 检查是否已获取到IP地址
+		if _, err := i.getInstanceIP(instanceName); err == nil {
+			global.APP_LOG.Debug("容器网络已就绪",
+				zap.String("instanceName", instanceName),
+				zap.Int("attempt", attempt))
+			return nil
+		}
+
+		// 逐渐增加等待时间
+		if attempt < maxRetries {
+			delay = min(delay+2, 15) // 最大等待15秒
+		}
+	}
+
+	return fmt.Errorf("容器网络就绪超时，已等待 %d 次", maxRetries)
+}

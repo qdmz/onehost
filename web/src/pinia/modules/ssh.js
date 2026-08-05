@@ -1,0 +1,90 @@
+import { defineStore } from 'pinia'
+
+export const useSSHStore = defineStore('ssh', {
+  state: () => ({
+    // SSH/Exec连接状态
+    connections: {} // { instanceId: { visible, minimized, instanceName, isAdmin, mode } }
+  }),
+  
+  getters: {
+    // 获取所有最小化的连接
+	    minimizedConnections: (state) => {
+	      return Object.entries(state.connections)
+	        .filter(([, conn]) => conn.minimized)
+	        .map(([connectionKey, conn]) => ({
+	          connectionKey,
+	          ...conn
+        }))
+    },
+    
+    // 检查实例是否有活动连接
+    hasConnection: (state) => (instanceId) => {
+      return !!state.connections[instanceId]
+    },
+    
+    // 获取特定实例的连接状态
+    getConnection: (state) => (instanceId) => {
+      return state.connections[instanceId] || null
+    }
+  },
+  
+  actions: {
+    // 创建SSH/Exec连接
+    createConnection(instanceId, instanceName, isAdmin = false, mode = 'ssh', options = {}) {
+      // Use different key for exec vs ssh to allow both
+      const key = options.connectionKey || (mode === 'exec' ? `exec-${instanceId}` : instanceId)
+      this.connections[key] = {
+        visible: true,
+        minimized: false,
+        instanceName,
+        isAdmin,
+        mode,
+        shareToken: options.shareToken || '',
+        activeView: 'terminal',
+        instanceId,
+        createdAt: Date.now()
+      }
+    },
+    
+    // 显示SSH对话框
+    showConnection(instanceId) {
+      if (this.connections[instanceId]) {
+        this.connections[instanceId].visible = true
+        this.connections[instanceId].minimized = false
+      }
+    },
+    
+    // 最小化SSH连接
+    minimizeConnection(instanceId) {
+      if (this.connections[instanceId]) {
+        this.connections[instanceId].visible = false
+        this.connections[instanceId].minimized = true
+      }
+    },
+    
+    // 关闭SSH连接
+    closeConnection(instanceId) {
+      delete this.connections[instanceId]
+    },
+    
+    // 切换连接可见性
+    toggleConnection(instanceId) {
+      if (this.connections[instanceId]) {
+        const conn = this.connections[instanceId]
+        conn.visible = !conn.visible
+        conn.minimized = !conn.minimized
+      }
+    },
+
+    setActiveView(instanceId, view) {
+      if (this.connections[instanceId]) {
+        this.connections[instanceId].activeView = view
+      }
+    }
+  },
+  
+  // 持久化配置
+  persist: {
+    enabled: false // 不持久化SSH连接状态，避免刷新后尝试恢复已断开的连接
+  }
+})

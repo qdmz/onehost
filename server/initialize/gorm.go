@@ -1,0 +1,236 @@
+package initialize
+
+import (
+	"oneclickvirt/global"
+	adminModel "oneclickvirt/model/admin"
+	authModel "oneclickvirt/model/auth"
+	checkinModel "oneclickvirt/model/checkin"
+	"oneclickvirt/model/config"
+	domainModel "oneclickvirt/model/domain"
+	firewallModel "oneclickvirt/model/firewall"
+	kycModel "oneclickvirt/model/kyc"
+	monitoringModel "oneclickvirt/model/monitoring"
+	oauth2Model "oneclickvirt/model/oauth2"
+	permissionModel "oneclickvirt/model/permission"
+	productModel "oneclickvirt/model/product"
+	providerModel "oneclickvirt/model/provider"
+	resourceModel "oneclickvirt/model/resource"
+	systemModel "oneclickvirt/model/system"
+	userModel "oneclickvirt/model/user"
+	"oneclickvirt/service/database"
+	firewallService "oneclickvirt/service/firewall"
+	"oneclickvirt/utils/dbcompat"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+)
+
+// Gorm 初始化数据库并产生数据库全局变量
+// 使用DatabaseManager实现连接管理、自动重连和心跳检测
+func Gorm() *gorm.DB {
+	dbType := global.GetAppConfig().System.DbType
+	if dbType == "" {
+		dbType = "mysql"
+	}
+
+	// 获取数据库管理器
+	dbManager := GetDatabaseManager()
+
+	// 初始化数据库连接（包含自动重连和心跳检测）
+	mysqlConfig := config.MysqlConfig{
+		Path:         global.GetAppConfig().Mysql.Path,
+		Port:         global.GetAppConfig().Mysql.Port,
+		Config:       global.GetAppConfig().Mysql.Config,
+		Dbname:       global.GetAppConfig().Mysql.Dbname,
+		Username:     global.GetAppConfig().Mysql.Username,
+		Password:     global.GetAppConfig().Mysql.Password,
+		MaxIdleConns: global.GetAppConfig().Mysql.MaxIdleConns,
+		MaxOpenConns: global.GetAppConfig().Mysql.MaxOpenConns,
+		LogMode:      global.GetAppConfig().Mysql.LogMode,
+		LogZap:       global.GetAppConfig().Mysql.LogZap,
+		MaxLifetime:  global.GetAppConfig().Mysql.MaxLifetime,
+		AutoCreate:   global.GetAppConfig().Mysql.AutoCreate,
+	}
+
+	db, err := dbManager.Initialize(mysqlConfig)
+	if err != nil {
+		global.APP_LOG.Warn("数据库连接失败，系统将以待初始化模式运行",
+			zap.String("dbType", dbType),
+			zap.Error(err))
+		return nil
+	}
+
+	global.APP_LOG.Info("数据库连接成功",
+		zap.String("dbType", dbType),
+		zap.String("engine", global.GetAppConfig().Mysql.Engine))
+
+	// 提前设置全局 APP_DB，使 RegisterTables 内部调用的服务（如 FixAllDuplicateData）
+	// 能通过 global.APP_DB 访问数据库连接，避免出现「数据库连接不可用」警告
+	global.APP_DB = db
+
+	// 只有在数据库连接成功时才进行表结构迁移
+	global.APP_LOG.Info("开始数据库表结构自动迁移")
+	RegisterTables(db)
+	global.APP_LOG.Info("数据库表结构迁移完成")
+
+	// 检测数据库方言，配置 ON DUPLICATE KEY UPDATE 兼容层
+	dbcompat.Init(db)
+
+	return db
+} // validateDatabaseConnection 验证数据库连接是否可用
+func validateDatabaseConnection(db *gorm.DB) error {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+
+	// 测试连接
+	if err := sqlDB.Ping(); err != nil {
+		return err
+	}
+
+	// 简单的查询测试
+	var result int
+	if err := db.Raw("SELECT 1").Scan(&result).Error; err != nil {
+		return err
+	}
+
+	// 检查连接池状态
+	stats := sqlDB.Stats()
+	global.APP_LOG.Debug("数据库连接池状态",
+		zap.Int("max_open_connections", stats.MaxOpenConnections),
+		zap.Int("open_connections", stats.OpenConnections),
+		zap.Int("in_use", stats.InUse),
+		zap.Int("idle", stats.Idle))
+
+	return nil
+}
+
+// RegisterTables 注册数据库表专用
+func RegisterTables(db *gorm.DB) {
+	dbService := database.GetDatabaseService()
+
+	err := db.AutoMigrate(
+		// 用户相关表
+		&userModel.User{},     // 用户基础信息表
+		&authModel.Role{},     // 角色管理表
+		&userModel.UserRole{}, // 用户角色关联表
+
+		// OAuth2相关表
+		&oauth2Model.OAuth2Provider{}, // OAuth2提供商配置表
+
+		// 实例相关表
+		&providerModel.Instance{},          // 虚拟机/容器实例表
+		&providerModel.Provider{},          // 服务提供商配置表
+		&providerModel.AdminGroupSetting{}, // 管理员分组设置表
+		&providerModel.Port{},              // 端口映射表
+		&providerModel.ProviderIPv4Pool{},  // IPv4地址池表（dedicated_ipv4类型服务商）
+		&providerModel.InstanceShareLink{}, // 临时实例授权分享表
+		&providerModel.InstanceSnapshot{},  // 实例快照表
+		&providerModel.SnapshotSchedule{},  // 实例计划快照表
+		&providerModel.SnapshotTask{},      // 实例快照后台任务表
+		&adminModel.Task{},                 // 用户任务表
+
+		// 资源管理表
+		&resourceModel.ResourceReservation{}, // 资源预留表
+
+		// 认证相关表
+		&userModel.VerifyCode{},          // 验证码表（邮笱/短信）
+		&userModel.PasswordReset{},       // 密码重置令牌表
+		&userModel.JWTBlacklistedToken{}, // JWT黑名单持久化表
+
+		// 系统配置表
+		&adminModel.SystemConfig{},  // 系统配置表
+		&systemModel.Announcement{}, // 系统公告表
+		&systemModel.SystemImage{},  // 系统镜像模板表
+		&systemModel.Captcha{},      // 图形验证码表
+		&systemModel.JWTSecret{},    // JWT密钥表
+
+		// 邀请码相关表
+		&systemModel.InviteCode{},      // 邀请码表
+		&systemModel.InviteCodeUsage{}, // 邀请码使用记录表
+		&systemModel.RedemptionCode{},  // 兑换码表
+
+		// 权限管理表
+		&permissionModel.UserPermission{}, // 用户权限组合表
+
+		// 审计日志表
+		&adminModel.AuditLog{},              // 操作审计日志表
+		&providerModel.PendingDeletion{},    // 待删除资源表
+		&providerModel.HardwareTestReport{}, // 硬件测试报告表
+
+		// 管理员配置任务表
+		&adminModel.ConfigurationTask{},  // 管理员配置任务表
+		&adminModel.TrafficMonitorTask{}, // 流量监控操作任务表
+
+		// 监控数据表
+		&monitoringModel.PmacctTrafficRecord{},    // pmacct流量记录表（原始数据，5分钟粒度）
+		&monitoringModel.PmacctMonitor{},          // pmacct监控配置表
+		&monitoringModel.InstanceTrafficHistory{}, // 实例流量历史表
+		&monitoringModel.ProviderTrafficHistory{}, // Provider流量历史表
+		&monitoringModel.UserTrafficHistory{},     // 用户流量历史表
+		&monitoringModel.PerformanceMetric{},      // 性能指标历史表
+		// Agent监控表
+		&monitoringModel.AgentMonitor{},     // Agent监控映射表
+		&monitoringModel.ResourceMetric{},   // 资源监控数据表（24小时保留）
+		&monitoringModel.MonitoringConfig{}, // Provider监控配置表
+		&monitoringModel.MonitorSyncTask{},  // Provider监控同步后台任务表
+		// 防火墙/滥用屏蔽表
+		&firewallModel.BlockRule{},            // 屏蔽规则表
+		&firewallModel.BlockRuleApplication{}, // 屏蔽规则应用记录表
+
+		// 域名绑定表
+		&domainModel.Domain{},       // 域名绑定记录表
+		&domainModel.DomainConfig{}, // 域名绑定配置表
+
+		// 实名认证表
+		&kycModel.KYCRecord{}, // KYC认证记录表
+
+		// 签到续期表
+		&checkinModel.CheckinConfig{},       // 签到配置表
+		&checkinModel.CheckinRecord{},       // 签到记录表
+		&checkinModel.CheckinVerification{}, // 签到验证码表
+
+		// API Token表
+		&authModel.ApiToken{}, // API访问令牌表
+
+		// 产品商城表
+		&productModel.Product{},         // 产品定义表
+		&productModel.ProductOrder{},    // 产品订单表
+		&productModel.Ticket{},          // 用户工单表
+		&productModel.TicketReply{},     // 工单回复表
+		&productModel.SiteConfig{},      // 站点前端配置表
+		&productModel.UserBalanceLog{},  // 用户余额变动记录表
+		&productModel.YiPayConfig{},     // 易支付配置表
+	)
+	if err != nil {
+		global.APP_LOG.Error("register table failed", zap.Error(err))
+		return
+	}
+	ensureAuditLogTextCharset(db)
+	global.APP_LOG.Info("数据库表注册成功")
+
+	// AutoMigrate完成后再确认重复数据（表已存在才安全执行）
+	if fixErr := dbService.FixAllDuplicateData(); fixErr != nil {
+		global.APP_LOG.Warn("确认重复数据时出现警告（可忽略，如果是新数据库）", zap.Error(fixErr))
+	}
+
+	// Initialize default block rules
+	firewallSvc := &firewallService.Service{}
+	if err := firewallSvc.EnsureDefaultRules(); err != nil {
+		global.APP_LOG.Warn("初始化默认屏蔽规则失败（可忽略）", zap.Error(err))
+	}
+}
+
+func ensureAuditLogTextCharset(db *gorm.DB) {
+	if db == nil || db.Dialector.Name() != "mysql" {
+		return
+	}
+	if err := db.Exec(
+		"ALTER TABLE `audit_logs` " +
+			"MODIFY COLUMN `request` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci, " +
+			"MODIFY COLUMN `response` LONGTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+	).Error; err != nil {
+		global.APP_LOG.Warn("修正审计日志字符集失败（可忽略，后续迁移会重试）", zap.Error(err))
+	}
+}

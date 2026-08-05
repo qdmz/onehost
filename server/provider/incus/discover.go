@@ -1,0 +1,570 @@
+package incus
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+
+	"oneclickvirt/global"
+	"oneclickvirt/provider"
+	"oneclickvirt/utils"
+
+	"go.uber.org/zap"
+)
+
+// DiscoverInstances 发现Incus provider上的所有实例
+func (i *IncusProvider) DiscoverInstances(ctx context.Context) ([]provider.DiscoveredInstance, error) {
+	if !i.connected {
+		return nil, fmt.Errorf("not connected")
+	}
+
+	global.APP_LOG.Debug("开始发现Incus实例", zap.String("provider", i.config.Name))
+
+	// 优先使用API方式发现
+	if i.shouldUseAPI() {
+		instances, err := i.apiDiscoverInstances(ctx)
+		if err == nil {
+			global.APP_LOG.Debug("Incus API发现实例成功",
+				zap.String("provider", i.config.Name),
+				zap.Int("count", len(instances)))
+			return instances, nil
+		}
+		if fallbackErr := i.ensureSSHBeforeFallback(err, "发现实例"); fallbackErr != nil {
+			return nil, fallbackErr
+		}
+	}
+
+	if !i.shouldUseSSH() {
+		return nil, fmt.Errorf("执行规则不允许使用SSH")
+	}
+
+	return i.sshDiscoverInstances(ctx)
+}
+
+// apiDiscoverInstances 通过Incus API发现实例
+func (i *IncusProvider) apiDiscoverInstances(ctx context.Context) ([]provider.DiscoveredInstance, error) {
+	url := fmt.Sprintf("https://%s:8443/1.0/instances?recursion=2", i.config.Host)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	resp, err := i.apiClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API返回错误状态码: %d", resp.StatusCode)
+	}
+
+	var response struct {
+		Type     string `json:"type"`
+		Metadata []struct {
+			Name            string                 `json:"name"`
+			Status          string                 `json:"status"`
+			Type            string                 `json:"type"`
+			Config          map[string]string      `json:"config"`
+			Devices         map[string]interface{} `json:"devices"`
+			ExpandedDevices map[string]interface{} `json:"expanded_devices"`
+			ExpandedConfig  map[string]string      `json:"expanded_config"`
+			State           *struct {
+				Network map[string]struct {
+					Addresses []struct {
+						Family  string `json:"family"`
+						Address string `json:"address"`
+						Scope   string `json:"scope"`
+					} `json:"addresses"`
+					Hwaddr string `json:"hwaddr"`
+				} `json:"network"`
+			} `json:"state,omitempty"`
+		} `json:"metadata"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("解析响应失败: %w", err)
+	}
+
+	var discoveredInstances []provider.DiscoveredInstance
+
+	for _, inst := range response.Metadata {
+		effectiveConfig := inst.Config
+		if len(inst.ExpandedConfig) > 0 {
+			effectiveConfig = inst.ExpandedConfig
+		}
+		effectiveDevices := inst.Devices
+		if len(inst.ExpandedDevices) > 0 {
+			effectiveDevices = inst.ExpandedDevices
+		}
+		discovered := provider.DiscoveredInstance{
+			Name:               inst.Name,
+			ProviderInstanceID: inst.Name,
+			Status:             i.mapIncusStatus(inst.Status),
+			InstanceType:       i.mapIncusType(inst.Type),
+			RawData:            inst,
+		}
+
+		// 解析资源配置
+		if cpuLimit, ok := effectiveConfig["limits.cpu"]; ok {
+			discovered.CPU = utils.ParseCPUCount(cpuLimit)
+		}
+		if discovered.CPU == 0 {
+			discovered.CPU = 1
+		}
+
+		if memLimit, ok := effectiveConfig["limits.memory"]; ok {
+			discovered.Memory = i.parseMemoryLimit(memLimit)
+		}
+		if discovered.Memory == 0 {
+			discovered.Memory = 512
+		}
+
+		// 解析磁盘大小
+		if rootDevice, ok := effectiveDevices["root"].(map[string]interface{}); ok {
+			if size, ok := rootDevice["size"].(string); ok {
+				discovered.Disk = i.parseDiskSize(size)
+			}
+		}
+		if discovered.Disk == 0 {
+			discovered.Disk = 10240
+		}
+
+		// 解析容器设备中的GPU/NPU配置
+		discovered.GpuEnabled, discovered.GpuDeviceIds, discovered.NpuEnabled, discovered.NpuDeviceIds, discovered.Accelerators = parseIncusInstanceAccelerators(effectiveDevices)
+
+		// 解析网络信息
+		if inst.State != nil && inst.State.Network != nil {
+			networkNames := make([]string, 0, len(inst.State.Network))
+			for netName := range inst.State.Network {
+				networkNames = append(networkNames, netName)
+			}
+			sort.Strings(networkNames)
+			for _, netName := range networkNames {
+				netInfo := inst.State.Network[netName]
+				if netName == "lo" {
+					continue
+				}
+
+				if discovered.MACAddress == "" {
+					discovered.MACAddress = netInfo.Hwaddr
+				}
+
+				for _, addr := range netInfo.Addresses {
+					if addr.Scope != "global" {
+						continue
+					}
+					if addr.Family == "inet" && discovered.PrivateIP == "" {
+						discovered.PrivateIP = addr.Address
+					}
+					if addr.Family == "inet6" && discovered.IPv6Address == "" {
+						discovered.IPv6Address = addr.Address
+					}
+				}
+			}
+		}
+
+		// 镜像信息
+		if image, ok := effectiveConfig["image.description"]; ok {
+			discovered.Image = image
+		}
+		if osType, ok := effectiveConfig["image.os"]; ok {
+			discovered.OSType = osType
+		}
+
+		discovered.SSHPort = 22
+
+		// 解析 proxy 设备中的端口映射
+		var portMappings []provider.DiscoveredPortMapping
+		var extraPorts []int
+		for devName, devData := range effectiveDevices {
+			if devName == "root" {
+				continue
+			}
+			devMap, ok := devData.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			devType, _ := devMap["type"].(string)
+			if devType != "proxy" {
+				continue
+			}
+			listen, _ := devMap["listen"].(string)
+			connect, _ := devMap["connect"].(string)
+			if listen == "" || connect == "" {
+				continue
+			}
+			hostPort, hostProto := i.parseProxyAddress(listen)
+			guestPort, _ := i.parseProxyAddress(connect)
+			if hostPort > 0 && guestPort > 0 {
+				isSSH := guestPort == 22
+				if isSSH {
+					discovered.SSHPort = hostPort
+				}
+				extraPorts = append(extraPorts, hostPort)
+				portMappings = append(portMappings, provider.DiscoveredPortMapping{
+					HostPort: hostPort, GuestPort: guestPort, Protocol: hostProto,
+					IsSSH: isSSH, MappingMethod: "device_proxy",
+				})
+			}
+		}
+		discovered.ExtraPorts = extraPorts
+		discovered.PortMappings = portMappings
+
+		if uuid, ok := effectiveConfig["volatile.uuid"]; ok {
+			discovered.UUID = uuid
+		} else {
+			discovered.UUID = fmt.Sprintf("incus-%s-%s", i.config.Name, inst.Name)
+		}
+
+		discoveredInstances = append(discoveredInstances, discovered)
+	}
+
+	return discoveredInstances, nil
+}
+
+// sshDiscoverInstances 通过SSH命令发现实例
+func (i *IncusProvider) sshDiscoverInstances(ctx context.Context) ([]provider.DiscoveredInstance, error) {
+	if !i.sshClient.HasExecutor() {
+		return nil, fmt.Errorf("SSH client not initialized")
+	}
+
+	cmd := "incus list --format=json"
+	output, err := i.sshClient.Execute(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("执行SSH命令失败: %w", err)
+	}
+
+	var instances []struct {
+		Name            string                 `json:"name"`
+		Status          string                 `json:"status"`
+		Type            string                 `json:"type"`
+		Config          map[string]string      `json:"config"`
+		Devices         map[string]interface{} `json:"devices"`
+		ExpandedDevices map[string]interface{} `json:"expanded_devices"`
+		ExpandedConfig  map[string]string      `json:"expanded_config"`
+		State           *struct {
+			Network map[string]struct {
+				Addresses []struct {
+					Family  string `json:"family"`
+					Address string `json:"address"`
+					Scope   string `json:"scope"`
+				} `json:"addresses"`
+				Hwaddr string `json:"hwaddr"`
+			} `json:"network"`
+		} `json:"state,omitempty"`
+	}
+
+	if err := json.Unmarshal([]byte(output), &instances); err != nil {
+		return nil, fmt.Errorf("解析JSON失败: %w", err)
+	}
+
+	var discoveredInstances []provider.DiscoveredInstance
+
+	for _, inst := range instances {
+		effectiveConfig := inst.Config
+		if len(inst.ExpandedConfig) > 0 {
+			effectiveConfig = inst.ExpandedConfig
+		}
+		effectiveDevices := inst.Devices
+		if len(inst.ExpandedDevices) > 0 {
+			effectiveDevices = inst.ExpandedDevices
+		}
+		discovered := provider.DiscoveredInstance{
+			Name:               inst.Name,
+			ProviderInstanceID: inst.Name,
+			Status:             i.mapIncusStatus(inst.Status),
+			InstanceType:       i.mapIncusType(inst.Type),
+			RawData:            inst,
+		}
+
+		if cpuLimit, ok := effectiveConfig["limits.cpu"]; ok {
+			discovered.CPU = utils.ParseCPUCount(cpuLimit)
+		}
+		if discovered.CPU == 0 {
+			discovered.CPU = 1
+		}
+
+		if memLimit, ok := effectiveConfig["limits.memory"]; ok {
+			discovered.Memory = i.parseMemoryLimit(memLimit)
+		}
+		if discovered.Memory == 0 {
+			discovered.Memory = 512
+		}
+
+		// 解析容器设备中的GPU/NPU配置
+		if rootDevice, ok := effectiveDevices["root"].(map[string]interface{}); ok {
+			if size, ok := rootDevice["size"].(string); ok {
+				discovered.Disk = i.parseDiskSize(size)
+			}
+		}
+		if discovered.Disk == 0 {
+			discovered.Disk = 10240
+		}
+		discovered.GpuEnabled, discovered.GpuDeviceIds, discovered.NpuEnabled, discovered.NpuDeviceIds, discovered.Accelerators = parseIncusInstanceAccelerators(effectiveDevices)
+
+		// 网络信息
+		if inst.State != nil && inst.State.Network != nil {
+			networkNames := make([]string, 0, len(inst.State.Network))
+			for netName := range inst.State.Network {
+				networkNames = append(networkNames, netName)
+			}
+			sort.Strings(networkNames)
+			for _, netName := range networkNames {
+				netInfo := inst.State.Network[netName]
+				if netName == "lo" {
+					continue
+				}
+
+				if discovered.MACAddress == "" {
+					discovered.MACAddress = netInfo.Hwaddr
+				}
+
+				for _, addr := range netInfo.Addresses {
+					if addr.Scope != "global" {
+						continue
+					}
+					if addr.Family == "inet" && discovered.PrivateIP == "" {
+						discovered.PrivateIP = addr.Address
+					}
+					if addr.Family == "inet6" && discovered.IPv6Address == "" {
+						discovered.IPv6Address = addr.Address
+					}
+				}
+			}
+		}
+
+		if image, ok := effectiveConfig["image.description"]; ok {
+			discovered.Image = image
+		}
+		if osType, ok := effectiveConfig["image.os"]; ok {
+			discovered.OSType = osType
+		}
+
+		discovered.SSHPort = 22
+
+		// 解析 proxy 设备中的端口映射
+		var portMappings []provider.DiscoveredPortMapping
+		var extraPorts []int
+		for devName, devData := range effectiveDevices {
+			if devName == "root" {
+				continue
+			}
+			devMap, ok := devData.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			devType, _ := devMap["type"].(string)
+			if devType != "proxy" {
+				continue
+			}
+			listen, _ := devMap["listen"].(string)
+			connect, _ := devMap["connect"].(string)
+			if listen == "" || connect == "" {
+				continue
+			}
+			hostPort, hostProto := i.parseProxyAddress(listen)
+			guestPort, _ := i.parseProxyAddress(connect)
+			if hostPort > 0 && guestPort > 0 {
+				isSSH := guestPort == 22
+				if isSSH {
+					discovered.SSHPort = hostPort
+				}
+				extraPorts = append(extraPorts, hostPort)
+				portMappings = append(portMappings, provider.DiscoveredPortMapping{
+					HostPort: hostPort, GuestPort: guestPort, Protocol: hostProto,
+					IsSSH: isSSH, MappingMethod: "device_proxy",
+				})
+			}
+		}
+		discovered.ExtraPorts = extraPorts
+		discovered.PortMappings = portMappings
+
+		if uuid, ok := effectiveConfig["volatile.uuid"]; ok {
+			discovered.UUID = uuid
+		} else {
+			discovered.UUID = fmt.Sprintf("incus-%s-%s", i.config.Name, inst.Name)
+		}
+
+		discoveredInstances = append(discoveredInstances, discovered)
+	}
+
+	return discoveredInstances, nil
+}
+
+// 辅助函数
+func (i *IncusProvider) mapIncusStatus(status string) string {
+	switch strings.ToLower(status) {
+	case "running":
+		return "running"
+	case "stopped":
+		return "stopped"
+	case "frozen":
+		return "frozen"
+	default:
+		return status
+	}
+}
+
+func (i *IncusProvider) mapIncusType(incusType string) string {
+	if strings.Contains(strings.ToLower(incusType), "virtual") || incusType == "vm" {
+		return "vm"
+	}
+	return "container"
+}
+
+func (i *IncusProvider) parseMemoryLimit(memStr string) int64 {
+	memStr = strings.ToUpper(strings.TrimSpace(memStr))
+	memStr = strings.TrimSuffix(memStr, "B")
+
+	var multiplier int64 = 1
+	if strings.HasSuffix(memStr, "M") {
+		multiplier = 1
+		memStr = strings.TrimSuffix(memStr, "M")
+	} else if strings.HasSuffix(memStr, "G") {
+		multiplier = 1024
+		memStr = strings.TrimSuffix(memStr, "G")
+	} else if strings.HasSuffix(memStr, "T") {
+		multiplier = 1024 * 1024
+		memStr = strings.TrimSuffix(memStr, "T")
+	}
+
+	if value, err := strconv.ParseFloat(memStr, 64); err == nil {
+		return int64(value * float64(multiplier))
+	}
+
+	return 0
+}
+
+func (i *IncusProvider) parseDiskSize(sizeStr string) int64 {
+	sizeStr = strings.ToUpper(strings.TrimSpace(sizeStr))
+	sizeStr = strings.TrimSuffix(sizeStr, "B")
+
+	var multiplier int64 = 1
+	if strings.HasSuffix(sizeStr, "M") {
+		multiplier = 1
+		sizeStr = strings.TrimSuffix(sizeStr, "M")
+	} else if strings.HasSuffix(sizeStr, "G") {
+		multiplier = 1024
+		sizeStr = strings.TrimSuffix(sizeStr, "G")
+	} else if strings.HasSuffix(sizeStr, "T") {
+		multiplier = 1024 * 1024
+		sizeStr = strings.TrimSuffix(sizeStr, "T")
+	}
+
+	if value, err := strconv.ParseFloat(sizeStr, 64); err == nil {
+		return int64(value * float64(multiplier))
+	}
+
+	return 0
+}
+
+// parseProxyAddress 解析 Incus proxy 设备地址，格式如 "tcp:0.0.0.0:8080" 或 "udp:127.0.0.1:22"
+// 返回 (port, protocol)
+func (i *IncusProvider) parseProxyAddress(addr string) (int, string) {
+	protocol, endpoint, ok := strings.Cut(strings.TrimSpace(addr), ":")
+	if !ok {
+		return 0, "tcp"
+	}
+	protocol = strings.ToLower(protocol)
+	_, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		portStr = endpoint
+		if index := strings.LastIndex(endpoint, ":"); index >= 0 {
+			portStr = endpoint[index+1:]
+		}
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portStr))
+	if err != nil {
+		return 0, protocol
+	}
+	return port, protocol
+}
+
+func parseIncusInstanceAccelerators(devices map[string]interface{}) (bool, string, bool, string, []provider.DiscoveredAccelerator) {
+	if len(devices) == 0 {
+		return false, "", false, "", nil
+	}
+
+	gpuEnabled := false
+	npuEnabled := false
+	gpuIDs := make([]string, 0)
+	npuIDs := make([]string, 0)
+	accelerators := make([]provider.DiscoveredAccelerator, 0)
+
+	seenGpuID := make(map[string]struct{})
+	seenNpuID := make(map[string]struct{})
+
+	appendID := func(ids *[]string, seen map[string]struct{}, id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		*ids = append(*ids, id)
+	}
+
+	for name, devData := range devices {
+		devMap, ok := devData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		devType, _ := devMap["type"].(string)
+		if strings.ToLower(strings.TrimSpace(devType)) != "gpu" {
+			continue
+		}
+
+		kind := "gpu"
+		deviceName := strings.TrimSpace(name)
+		if v, ok := devMap["vendorid"].(string); ok {
+			lowerVendor := strings.ToLower(strings.TrimSpace(v))
+			if strings.Contains(lowerVendor, "huawei") || strings.Contains(lowerVendor, "ascend") {
+				kind = "npu"
+			}
+		}
+		if v, ok := devMap["gputype"].(string); ok {
+			lowerType := strings.ToLower(strings.TrimSpace(v))
+			if strings.Contains(lowerType, "npu") || strings.Contains(lowerType, "neural") {
+				kind = "npu"
+			}
+		}
+
+		id := ""
+		for _, key := range []string{"id", "pci", "pciid", "address"} {
+			if raw, ok := devMap[key]; ok {
+				if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+					id = strings.TrimSpace(s)
+					break
+				}
+			}
+		}
+
+		acc := provider.DiscoveredAccelerator{
+			Kind:   kind,
+			ID:     id,
+			Name:   deviceName,
+			Vendor: "",
+			Bus:    id,
+			Source: "devices",
+		}
+		accelerators = append(accelerators, acc)
+
+		if kind == "npu" {
+			npuEnabled = true
+			appendID(&npuIDs, seenNpuID, id)
+		} else {
+			gpuEnabled = true
+			appendID(&gpuIDs, seenGpuID, id)
+		}
+	}
+
+	return gpuEnabled, strings.Join(gpuIDs, ","), npuEnabled, strings.Join(npuIDs, ","), accelerators
+}

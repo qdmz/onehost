@@ -1,0 +1,133 @@
+// English (US) Language Pack - Modular Structure
+// 公共模块
+import common from './en-US/common.js'
+import navbar from './en-US/navbar.js'
+import validation from './en-US/validation.js'
+import message from './en-US/message.js'
+import errors from './en-US/errors.js'
+
+// 认证模块  
+import login from './en-US/auth/login.js'
+import adminLogin from './en-US/auth/adminLogin.js'
+import register from './en-US/auth/register.js'
+import forgotPassword from './en-US/auth/forgotPassword.js'
+import resetPassword from './en-US/auth/resetPassword.js'
+import oauth2Callback from './en-US/auth/oauth2Callback.js'
+import init from './en-US/auth/init.js'
+
+// 公共页面模块
+import home from './en-US/public/home.js'
+import sidebar from './en-US/public/sidebar.js'
+import notFound from './en-US/public/notFound.js'
+
+// 用户模块
+import userDashboard from './en-US/user/dashboard.js'
+import userProfile from './en-US/user/profile.js'
+import userInstances from './en-US/user/instances.js'
+import userInstanceDetail from './en-US/user/instanceDetail.js'
+import userTasks from './en-US/user/tasks.js'
+import userTrafficOverview from './en-US/user/trafficOverview.js'
+import userTraffic from './en-US/user/traffic.js'
+import userResources from './en-US/user/resources.js'
+import userApply from './en-US/user/apply.js'
+import userDomain from './en-US/user/domain.js'
+import userKyc from './en-US/user/kyc.js'
+import userCheckin from './en-US/user/checkin.js'
+import userApiTokens from './en-US/user/apiTokens.js'
+import userStore from './en-US/user/store.js'
+import userOrders from './en-US/user/orders.js'
+import userTickets from './en-US/user/tickets.js'
+import userWallet from './en-US/user/wallet.js'
+
+// 管理员模块
+import adminDashboard from './en-US/admin/dashboard.js'
+import adminUsers from './en-US/admin/users.js'
+import adminProviders from './en-US/admin/providers.js'
+import adminConfig from './en-US/admin/config.js'
+import adminAnnouncements from './en-US/admin/announcements.js'
+import adminInviteCodes from './en-US/admin/inviteCodes.js'
+import adminRedemptionCodes from './en-US/admin/redemptionCodes.js'
+import adminSystemImages from './en-US/admin/systemImages.js'
+import adminInstances from './en-US/admin/instances.js'
+import adminTasks from './en-US/admin/tasks.js'
+import adminTraffic from './en-US/admin/traffic.js'
+import adminPortMapping from './en-US/admin/portMapping.js'
+import adminOauth2 from './en-US/admin/oauth2.js'
+import adminPerformance from './en-US/admin/performance.js'
+import adminLogs from './en-US/admin/logs.js'
+import adminBlockRules from './en-US/admin/blockRules.js'
+import adminDomain from './en-US/admin/domain.js'
+import adminKyc from './en-US/admin/kyc.js'
+import adminGroup from './en-US/admin/group.js'
+import adminApiTokens from './en-US/admin/apiTokens.js'
+import adminSnapshots from './en-US/admin/snapshots.js'
+import adminProducts from './en-US/admin/products.js'
+import adminOrders from './en-US/admin/orders.js'
+import adminTickets from './en-US/admin/tickets.js'
+import adminSiteConfig from './en-US/admin/siteConfig.js'
+import adminYipayConfig from './en-US/admin/yipayConfig.js'
+
+export default {
+  common,
+  navbar,
+  login,
+  adminLogin,
+  register,
+  forgotPassword,
+  resetPassword,
+  oauth2Callback,
+  init,
+  home,
+  sidebar,
+  user: {
+    dashboard: userDashboard,
+    profile: userProfile,
+    instances: userInstances,
+    instanceDetail: userInstanceDetail,
+    tasks: userTasks,
+    trafficOverview: userTrafficOverview,
+    traffic: userTraffic,
+    resources: userResources,
+    apply: userApply,
+    domain: userDomain,
+    kyc: userKyc,
+    checkin: userCheckin,
+    apiTokens: userApiTokens,
+    store: userStore,
+    orders: userOrders,
+    tickets: userTickets,
+    wallet: userWallet
+  },
+  admin: {
+    dashboard: adminDashboard,
+    users: adminUsers,
+    providers: adminProviders,
+    config: adminConfig,
+    announcements: adminAnnouncements,
+    inviteCodes: adminInviteCodes,
+    redemptionCodes: adminRedemptionCodes,
+    systemImages: adminSystemImages,
+    instances: adminInstances,
+    tasks: adminTasks,
+    traffic: adminTraffic,
+    portMapping: adminPortMapping,
+    oauth2: adminOauth2,
+    performance: adminPerformance,
+    logs: adminLogs,
+    blockRules: adminBlockRules,
+    domain: adminDomain,
+    kyc: adminKyc,
+    group: adminGroup,
+    apiTokens: adminApiTokens,
+    snapshots: adminSnapshots,
+    products: adminProducts,
+    orders: adminOrders,
+    tickets: adminTickets,
+    siteConfig: adminSiteConfig,
+    yipayConfig: adminYipayConfig
+  },
+  validation,
+  message,
+  errors,
+  notFound
+}

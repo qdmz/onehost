@@ -1,0 +1,382 @@
+package task
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"oneclickvirt/constant"
+	"oneclickvirt/global"
+	adminModel "oneclickvirt/model/admin"
+	providerModel "oneclickvirt/model/provider"
+	systemModel "oneclickvirt/model/system"
+	traffic_monitor "oneclickvirt/service/admin/traffic_monitor"
+	agentLifecycle "oneclickvirt/service/agent"
+	"oneclickvirt/service/database"
+	domainService "oneclickvirt/service/domain"
+	"oneclickvirt/service/firewall"
+	provider2 "oneclickvirt/service/provider"
+	"oneclickvirt/service/resources"
+	"oneclickvirt/service/traffic"
+	"time"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+)
+
+// executeDeleteInstanceTask 执行删除实例任务
+func (s *TaskService) executeDeleteInstanceTask(ctx context.Context, task *adminModel.Task) error {
+	// 初始化进度 (5%)
+	s.updateTaskProgress(task.ID, 5, "step.parseTaskData")
+
+	// 解析任务数据
+	var taskReq adminModel.DeleteInstanceTaskRequest
+	if err := json.Unmarshal([]byte(task.TaskData), &taskReq); err != nil {
+		return fmt.Errorf("解析任务数据失败: %v", err)
+	}
+
+	// 更新进度 (10%)
+	s.updateTaskProgress(task.ID, 10, "step.getInstanceInfo")
+
+	// 获取实例信息
+	var instance providerModel.Instance
+	if err := global.APP_DB.First(&instance, taskReq.InstanceId).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 实例已不存在，标记任务完成
+			stateManager := GetTaskStateManager()
+			if err := stateManager.CompleteMainTask(task.ID, true, "实例已不存在，删除任务完成", nil); err != nil {
+				global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", task.ID), zap.Error(err))
+			}
+			return nil
+		}
+		return fmt.Errorf("获取实例信息失败: %v", err)
+	}
+
+	// 验证实例所有权 - 管理员操作跳过权限验证
+	if !taskReq.AdminOperation && instance.UserID != task.UserID {
+		return fmt.Errorf("无权限删除此实例")
+	}
+
+	// 更新进度 (15%)
+	s.updateTaskProgress(task.ID, 15, "step.getProviderConfig")
+
+	// 获取Provider配置
+	var provider providerModel.Provider
+	if err := global.APP_DB.First(&provider, instance.ProviderID).Error; err != nil {
+		return fmt.Errorf("获取Provider配置失败: %v", err)
+	}
+
+	// 复制副本避免共享状态，立即创建Provider字段的本地副本
+	localProviderID := provider.ID
+	localProviderName := provider.Name
+
+	// 更新进度 (20%)
+	s.updateTaskProgress(task.ID, 20, "step.syncTrafficData")
+
+	// 删除前进行最后一次流量同步
+	syncTrigger := traffic.NewSyncTriggerService()
+	syncTrigger.TriggerInstanceTrafficSync(instance.ID, "实例删除前最终同步")
+
+	// 使用可取消的等待
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return fmt.Errorf("任务已取消")
+	}
+
+	// 更新进度 (25%)
+	s.updateTaskProgress(task.ID, 25, "step.deletingInstance")
+
+	// 调用Provider删除实例，重试机制
+	providerApiService := &provider2.ProviderApiService{}
+	maxRetries := global.GetAppConfig().Task.DeleteRetryCount
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	retryDelay := time.Duration(global.GetAppConfig().Task.DeleteRetryDelay) * time.Second
+	if retryDelay <= 0 {
+		retryDelay = 2 * time.Second
+	}
+	var lastErr error
+
+	providerDeleteSuccess := false
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			// 每次重试增加进度 (25% -> 40% -> 55% -> 70%)
+			progressIncrement := 25 + (attempt-1)*15
+			if progressIncrement > 70 {
+				progressIncrement = 70
+			}
+			s.updateTaskProgress(task.ID, progressIncrement, fmt.Sprintf("step.deletingInstanceRetry:%d", attempt))
+		}
+
+		providerInstanceID := providerInstanceIdentifier(instance)
+		if err := providerApiService.DeleteInstanceByProviderID(ctx, localProviderID, providerInstanceID); err != nil {
+			lastErr = err
+			global.APP_LOG.Warn("Provider删除实例失败，准备重试",
+				zap.Uint("taskId", task.ID),
+				zap.String("instanceName", instance.Name),
+				zap.String("providerInstanceId", providerInstanceID),
+				zap.String("provider", localProviderName),
+				zap.Int("attempt", attempt),
+				zap.Int("maxRetries", maxRetries),
+				zap.Error(err))
+
+			if attempt < maxRetries {
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
+				retryDelay *= 2 // 指数退避
+			}
+		} else {
+			providerDeleteSuccess = true
+			global.APP_LOG.Info("Provider删除实例成功",
+				zap.Uint("taskId", task.ID),
+				zap.String("instanceName", instance.Name),
+				zap.String("provider", localProviderName),
+				zap.Int("attempt", attempt))
+			break
+		}
+	}
+
+	if !providerDeleteSuccess {
+		global.APP_LOG.Error("Provider删除实例最终失败，已重试最大次数",
+			zap.Uint("taskId", task.ID),
+			zap.String("instanceName", instance.Name),
+			zap.String("provider", localProviderName),
+			zap.Int("maxRetries", maxRetries),
+			zap.Error(lastErr))
+	}
+
+	// 更新进度 (80%)
+	s.updateTaskProgress(task.ID, 80, "step.cleaningMonitorData")
+
+	// 第一步：事务外清理pmacct（可能包含SSH操作）
+	trafficMonitorManager := traffic_monitor.GetManager()
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer deleteCancel()
+	if err := trafficMonitorManager.DetachMonitor(deleteCtx, instance.ID); err != nil {
+		global.APP_LOG.Warn("清理实例pmacct数据失败",
+			zap.Uint("instanceId", instance.ID),
+			zap.Error(err))
+	}
+
+	// 清理Agent监控（不删除Agent上的数据，仅移除DB映射）
+	agentCtx, agentCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	agentLifecycle.OnInstanceDeleted(agentCtx, global.APP_DB, instance.ID)
+	agentCancel()
+
+	// 清理实例关联的封禁规则应用并重新同步Agent规则
+	firewall.CleanupInstanceApplications(instance.ID)
+
+	// 更新进度 (90%)
+	s.updateTaskProgress(task.ID, 90, "step.cleaningDatabaseRecords")
+
+	// 第三步：在短事务中批量处理数据库操作
+	dbService := database.GetDatabaseService()
+	quotaService := resources.NewQuotaService()
+
+	// 在事务前保存需要使用的字段
+	instanceID := instance.ID
+	instanceCPU := instance.CPU
+	instanceMemory := instance.Memory
+	instanceDisk := instance.Disk
+	instanceBandwidth := instance.Bandwidth
+	instanceProviderID := instance.ProviderID
+	instanceType := instance.InstanceType
+	instanceUserID := instance.UserID
+	domainSvc := &domainService.Service{}
+	instanceDomains, domainErr := domainSvc.GetInstanceDomains(instanceID)
+	if domainErr != nil {
+		global.APP_LOG.Warn("查询实例域名绑定失败，继续删除实例",
+			zap.Uint("taskId", task.ID),
+			zap.Uint("instanceId", instanceID),
+			zap.Error(domainErr))
+	}
+
+	// 分离事务操作
+	err := dbService.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+		// 事务内重新读取实例最新状态（消除 TOCTOU：事务外读到的 instance.Status 可能已过时）
+		var freshStatus struct{ Status string }
+		if err := tx.Model(&providerModel.Instance{}).Unscoped().
+			Select("status").Where("id = ?", instanceID).
+			Scan(&freshStatus).Error; err == nil && freshStatus.Status != "" {
+			instance.Status = freshStatus.Status
+		}
+
+		// 1. 删除端口映射（在独立的事务中）
+		portMappingService := resources.PortMappingService{}
+		if err := portMappingService.DeleteInstancePortMappingsInTx(tx, instanceID); err != nil {
+			global.APP_LOG.Warn("删除实例端口映射失败",
+				zap.Uint("taskId", task.ID),
+				zap.Uint("instanceId", instanceID),
+				zap.Error(err))
+			// 端口映射删除失败不阻止整个流程
+		}
+
+		// 2. 释放Provider资源。创建失败的实例已在创建回滚路径释放过资源，
+		// 删除任务只负责清理残留远端/数据库记录，避免二次扣减节点计数。
+		if instance.Status != "failed" && instance.Status != "deleted" {
+			resourceService := &resources.ResourceService{}
+			if err := resourceService.ReleaseResourcesInTx(tx, instanceProviderID, instanceType,
+				instanceCPU, instanceMemory, instanceDisk); err != nil {
+				global.APP_LOG.Warn("释放Provider资源失败",
+					zap.Uint("taskId", task.ID),
+					zap.Uint("instanceId", instanceID),
+					zap.Error(err))
+				// Provider资源释放失败不阻止整个流程
+			}
+		} else {
+			global.APP_LOG.Debug("跳过失败/已删除实例的Provider资源释放，避免重复回收",
+				zap.Uint("taskId", task.ID),
+				zap.Uint("instanceId", instanceID),
+				zap.String("status", instance.Status))
+		}
+
+		// 3. 释放用户配额（根据实例状态决定释放哪种配额）
+		// 如果实例处于过渡状态(creating/resetting)，释放 pending_quota
+		// 稳定状态（running/stopped/error等）释放 used_quota
+		// 终止状态(deleting/deleted/failed)不释放配额（已被移除）
+		resourceUsage := resources.ResourceUsage{
+			CPU:       instanceCPU,
+			Memory:    instanceMemory,
+			Disk:      instanceDisk,
+			Bandwidth: instanceBandwidth,
+		}
+
+		isPendingState := constant.IsTransitionalStatus(instance.Status)
+		isTerminalState := constant.IsTerminalStatus(instance.Status)
+		if instanceUserID == 0 {
+			global.APP_LOG.Debug("实例无用户归属，跳过用户配额释放",
+				zap.Uint("taskId", task.ID),
+				zap.Uint("instanceId", instanceID))
+		} else if isPendingState {
+			if err := quotaService.ReleasePendingQuota(tx, instanceUserID, resourceUsage); err != nil {
+				global.APP_LOG.Warn("释放待确认配额失败",
+					zap.Uint("taskId", task.ID),
+					zap.Uint("instanceId", instanceID),
+					zap.String("status", instance.Status),
+					zap.Error(err))
+				// 配额释放失败不阻止整个流程
+			}
+		} else if isTerminalState {
+			global.APP_LOG.Debug("跳过终止状态实例的直接配额扣减，后续重算兜底",
+				zap.Uint("taskId", task.ID),
+				zap.Uint("instanceId", instanceID),
+				zap.String("status", instance.Status))
+		} else {
+			if err := quotaService.ReleaseUsedQuota(tx, instanceUserID, resourceUsage); err != nil {
+				global.APP_LOG.Warn("释放已使用配额失败",
+					zap.Uint("taskId", task.ID),
+					zap.Uint("instanceId", instanceID),
+					zap.String("status", instance.Status),
+					zap.Error(err))
+				// 配额释放失败不阻止整个流程
+			}
+		}
+
+		// 4. 删除绑定的兑换码（未被使用的，即 pending_use 状态）
+		// 实例被删除后兑换码无效，需要一并清理避免残留
+		if err := tx.Unscoped().
+			Where("instance_id = ? AND status != ?", instanceID, systemModel.RedemptionStatusUsed).
+			Delete(&systemModel.RedemptionCode{}).Error; err != nil {
+			global.APP_LOG.Warn("清理实例绑定的兔换码失败",
+				zap.Uint("taskId", task.ID),
+				zap.Uint("instanceId", instanceID),
+				zap.Error(err))
+			// 兔换码清理失败不阻止整个流程
+		}
+
+		// 5. 删除实例域名绑定记录，避免实例删除后留下孤儿域名
+		if err := domainSvc.DeleteInstanceDomainsInTx(tx, instanceID); err != nil {
+			return fmt.Errorf("删除实例域名绑定失败: %v", err)
+		}
+
+		// 6. 软删除当前实例记录（保留流量数据以供统计）- 这是最关键的操作
+		if err := tx.Delete(&instance).Error; err != nil {
+			return fmt.Errorf("删除实例记录失败: %v", err)
+		}
+
+		if instanceUserID > 0 {
+			if err := quotaService.RecalculateUserQuotaInTx(tx, instanceUserID); err != nil {
+				global.APP_LOG.Warn("删除实例后重算用户配额失败",
+					zap.Uint("taskId", task.ID),
+					zap.Uint("instanceId", instanceID),
+					zap.Uint("userId", instanceUserID),
+					zap.Error(err))
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		// 即使删除失败，也尝试恢复实例状态
+		global.APP_LOG.Error("数据库清理失败，尝试恢复实例状态",
+			zap.Uint("taskId", task.ID),
+			zap.Uint("instanceId", instanceID),
+			zap.Error(err))
+
+		// 恢复实例状态为stopped，避免卡在deleting状态
+		if recoverErr := global.APP_DB.Model(&providerModel.Instance{}).
+			Where("id = ?", instanceID).
+			Update("status", "stopped").Error; recoverErr != nil {
+			global.APP_LOG.Error("恢复实例状态失败",
+				zap.Uint("instanceId", instanceID),
+				zap.Error(recoverErr))
+		}
+
+		return err
+	}
+
+	domainSvc.RemoveDomainProxies(instanceDomains)
+
+	// 事务提交成功后，释放IPv4池地址（事务外执行，避免事务回滚时误释放）
+	if provider.NetworkType == "dedicated_ipv4" || provider.NetworkType == "dedicated_ipv4_ipv6" {
+		releaseErr := global.APP_DB.Model(&providerModel.ProviderIPv4Pool{}).
+			Where("instance_id = ?", instanceID).
+			Updates(map[string]interface{}{"is_allocated": false, "instance_id": nil}).Error
+		if releaseErr != nil {
+			global.APP_LOG.Warn("释放IPv4池地址失败（可能未配置池）",
+				zap.Uint("taskId", task.ID),
+				zap.Uint("instanceId", instanceID),
+				zap.Error(releaseErr))
+		} else {
+			global.APP_LOG.Info("释放IPv4池地址成功",
+				zap.Uint("taskId", task.ID),
+				zap.Uint("instanceId", instanceID))
+		}
+	}
+
+	// 标记任务完成
+	operationType := "用户"
+	if taskReq.AdminOperation {
+		operationType = "管理员"
+	}
+	completionMessage := fmt.Sprintf("实例删除成功（%s操作）", operationType)
+	if !providerDeleteSuccess {
+		completionMessage = fmt.Sprintf("实例删除完成（%s操作），Provider删除可能失败但数据已清理", operationType)
+	}
+	stateManager := GetTaskStateManager()
+	if err := stateManager.CompleteMainTask(task.ID, true, completionMessage, nil); err != nil {
+		global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", task.ID), zap.Error(err))
+	}
+
+	global.APP_LOG.Info("实例删除成功",
+		zap.Uint("taskId", task.ID),
+		zap.Uint("instanceId", instance.ID),
+		zap.String("instanceName", instance.Name),
+		zap.Uint("userId", instance.UserID),
+		zap.String("operationType", operationType),
+		zap.Bool("adminOperation", taskReq.AdminOperation),
+		zap.Bool("providerDeleteSuccess", providerDeleteSuccess))
+
+	return nil
+}

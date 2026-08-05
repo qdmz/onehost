@@ -1,0 +1,211 @@
+<template>
+  <div class="level-limits-container">
+    <div style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+      <el-text
+        type="info"
+        size="small"
+      >
+        {{ $t('admin.providers.levelLimitsTip') }}
+      </el-text>
+      <div class="toolbar-actions">
+        <el-button
+          type="primary"
+          size="small"
+          @click="addLevel"
+        >
+          {{ $t('admin.providers.addLevel') }}
+        </el-button>
+        <el-button
+          type="primary"
+          size="small"
+          @click="emit('reset-defaults')"
+        >
+          {{ $t('admin.providers.resetToDefault') }}
+        </el-button>
+      </div>
+    </div>
+
+    <!-- 等级配置循环 -->
+    <div
+      v-for="level in levelKeys"
+      :key="level"
+      class="level-config-card"
+    >
+      <div class="level-header">
+        <div class="level-title-row">
+          <el-tag
+            :type="getLevelTagType(level)"
+            size="large"
+          >
+            {{ $t('admin.providers.level') }} {{ level }}
+          </el-tag>
+          <el-button
+            size="small"
+            type="danger"
+            text
+            :disabled="levelKeys.length <= 1"
+            @click="removeLevel(level)"
+          >
+            {{ $t('common.delete') }}
+          </el-button>
+        </div>
+      </div>
+
+      <el-form
+        :model="modelValue.levelLimits[level]"
+        label-width="120px"
+        class="level-form"
+      >
+        <el-row :gutter="20">
+          <el-col :span="12">
+            <el-form-item :label="$t('admin.providers.maxInstances')">
+              <el-input-number
+                v-model="modelValue.levelLimits[level].maxInstances"
+                :min="0"
+                :max="1000"
+                :controls="false"
+                style="width: 100%;"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item :label="$t('admin.providers.maxTrafficMB')">
+              <el-input-number
+                v-model="modelValue.levelLimits[level].maxTraffic"
+                :min="0"
+                :max="1048576000"
+                :step="1024"
+                :controls="false"
+                style="width: 100%;"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-row :gutter="20">
+          <el-col :span="12">
+            <el-form-item :label="$t('admin.providers.maxCPU')">
+              <el-input-number
+                v-model="modelValue.levelLimits[level].maxResources.cpu"
+                :min="1"
+                :max="10240"
+                :controls="false"
+                style="width: 100%;"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item :label="$t('admin.providers.maxMemoryMB')">
+              <el-input-number
+                v-model="modelValue.levelLimits[level].maxResources.memory"
+                :min="128"
+                :max="10485760"
+                :step="128"
+                :controls="false"
+                style="width: 100%;"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-row :gutter="20">
+          <el-col :span="12">
+            <el-form-item :label="$t('admin.providers.maxDiskMB')">
+              <el-input-number
+                v-model="modelValue.levelLimits[level].maxResources.disk"
+                :min="1024"
+                :max="1024000000"
+                :step="1024"
+                :controls="false"
+                style="width: 100%;"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item :label="$t('admin.providers.maxBandwidthMbps')">
+              <el-input-number
+                v-model="modelValue.levelLimits[level].maxResources.bandwidth"
+                :min="10"
+                :max="1000000"
+                :step="10"
+                :controls="false"
+                style="width: 100%;"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { buildDefaultLevelLimit, getLevelTagType, getSortedLevelKeys } from '@/utils/levels'
+const { t } = useI18n()
+
+const props = defineProps({
+  modelValue: {
+    type: Object,
+    required: true
+  }
+})
+
+const emit = defineEmits(['reset-defaults'])
+
+const levelKeys = computed(() => getSortedLevelKeys(props.modelValue.levelLimits))
+
+const addLevel = () => {
+  const nextLevel = (levelKeys.value.at(-1) || 0) + 1
+  const previousLevel = levelKeys.value.at(-1)
+  props.modelValue.levelLimits[nextLevel] = buildDefaultLevelLimit(nextLevel, props.modelValue.levelLimits[previousLevel])
+}
+
+const removeLevel = (level) => {
+  if (levelKeys.value.length <= 1) return
+  delete props.modelValue.levelLimits[level]
+}
+</script>
+
+<style scoped>
+.level-limits-container {
+  max-height: 500px;
+  overflow-y: auto;
+  padding-right: 10px;
+}
+
+.level-config-card {
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  padding: 15px;
+  margin-bottom: 15px;
+  background-color: var(--subtle-bg);
+  transition: all 0.3s;
+}
+
+.level-config-card:hover {
+  border-color: #16a34a;
+  box-shadow: 0 2px 12px 0 rgba(22, 163, 74, 0.12);
+}
+
+.level-header {
+  margin-bottom: 15px;
+  text-align: center;
+}
+
+.toolbar-actions,
+.level-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.level-title-row {
+  justify-content: center;
+}
+
+.level-form {
+  margin-top: 10px;
+}
+</style>

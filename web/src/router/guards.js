@@ -1,0 +1,280 @@
+import { useUserStore } from '@/pinia/modules/user'
+import { checkSystemInit } from '@/api/init'
+import { ElMessage } from 'element-plus'
+import i18n from '@/i18n'
+import NProgress from 'nprogress'
+import 'nprogress/nprogress.css'
+
+NProgress.configure({ showSpinner: false })
+
+// Cache init status to avoid checking on every navigation
+let initStatusChecked = false
+let needsInit = false
+const INIT_CHECK_INTERVAL = 5 * 60 * 1000 // Re-check every 5 minutes
+let lastInitCheck = 0
+
+// resetInitCache 供初始化成功后的页面调用，强制下次路由守卫重新查询初始化状态
+export function resetInitCache() {
+  initStatusChecked = false
+  needsInit = false
+  lastInitCheck = 0
+}
+
+async function checkInitStatus() {
+  const now = Date.now()
+  if (initStatusChecked && (now - lastInitCheck) < INIT_CHECK_INTERVAL) {
+    return needsInit
+  }
+  try {
+    const response = await checkSystemInit()
+    if (response && (response.code === 200) && response.data) {
+      needsInit = response.data.needInit === true
+      initStatusChecked = true
+      lastInitCheck = now
+    }
+  } catch (error) {
+    console.warn('Init status check failed, using cached result')
+    // On error, keep using cached value (default false)
+  }
+  return needsInit
+}
+
+export function setupRouterGuards(router) {
+  router.onError((error) => {
+    NProgress.done()
+    console.error('路由加载失败:', error)
+    ElMessage.error(i18n.global.t('common.loadFailed'))
+  })
+
+  // 定义白名单（放在最前面，供所有逻辑使用）
+  const whiteList = ['/home', '/login', '/register', '/forgot-password', '/oauth2/callback', '/init', '/admin/login']
+  
+  router.beforeEach(async (to, from, next) => {
+    NProgress.start()
+    
+    const userStore = useUserStore()
+    const isPublicShareRoute = to.path.startsWith('/share/instances/')
+    
+    // 检查URL参数中是否有OAuth2 token（避免跨域localStorage隔离问题）
+    const urlParams = new URLSearchParams(window.location.search)
+    const oauth2Token = urlParams.get('oauth2_token')
+    const oauth2Username = urlParams.get('username')
+    
+    if (oauth2Token) {
+      // 保存token到sessionStorage（不使用localStorage避免XSS token泄露）
+      sessionStorage.setItem('token', oauth2Token)
+      userStore.setToken(oauth2Token)
+      
+      if (oauth2Username) {
+        localStorage.setItem('username', oauth2Username)
+      }
+      
+      // 清理URL参数（避免token暴露在URL中）
+      const cleanURL = window.location.pathname + window.location.hash
+      window.history.replaceState({}, document.title, cleanURL)
+      
+      // 获取用户信息
+      try {
+        await userStore.fetchUserInfo()
+        
+        // 根据用户类型和视图模式跳转到相应页面
+        const userType = userStore.userType
+        const viewMode = userStore.viewMode || userType
+        
+        // 只有管理员可以访问管理员界面，且只有管理员可以切换视图
+        if ((userType === 'admin' || userType === 'normal_admin') && (viewMode === 'admin' || viewMode === 'normal_admin')) {
+          next('/admin/dashboard')
+          return
+        } else {
+          // 普通用户只能访问用户界面
+          next('/user/dashboard')
+          return
+        }
+      } catch (error) {
+        console.error('OAuth2登录后获取用户信息失败:', error)
+        // 清理无效token
+        localStorage.removeItem('token')
+        sessionStorage.removeItem('token')
+        userStore.logout()
+        next('/home')
+        return
+      }
+    }
+    
+    // OAuth2登录后token处理：如果sessionStorage有token但userStore没有，则同步
+    if (!userStore.token && sessionStorage.getItem('token')) {
+      const storedToken = sessionStorage.getItem('token')
+      userStore.setToken(storedToken)
+      
+      // 获取用户信息
+      try {
+        await userStore.fetchUserInfo()
+        
+        // 清理OAuth2回调相关的localStorage
+        localStorage.removeItem('username')
+        
+        // 如果在首页且已登录，根据用户类型和视图模式跳转
+        if (to.path === '/' || to.path === '/home') {
+          const userType = userStore.userType
+          const viewMode = userStore.viewMode || userType
+          
+          if ((userType === 'admin' || userType === 'normal_admin') && (viewMode === 'admin' || viewMode === 'normal_admin')) {
+            next('/admin/dashboard')
+            return
+          } else {
+            next('/user/dashboard')
+            return
+          }
+        }
+        // 如果不是首页，继续正常流程，不要return
+      } catch (error) {
+        console.error('sessionStorage token失效，获取用户信息失败:', error)
+        // 清理无效token
+        userStore.clearUserData()
+        
+        // 如果当前在需要认证的页面，重定向到首页
+        if (to.meta.requiresAuth || (!whiteList.includes(to.path) && to.path !== '/home' && !isPublicShareRoute)) {
+          next('/home')
+          return
+        }
+      }
+    }
+    
+    // 重新获取token（OAuth2同步后）
+    const token = userStore.token || sessionStorage.getItem('token')
+    
+    // 检查系统初始化状态（使用缓存，避免每次导航都请求API）
+    if (to.name !== 'SystemInit') {
+      const systemNeedsInit = await checkInitStatus()
+      if (systemNeedsInit) {
+        next({ path: '/init' })
+        return
+      }
+    } else {
+      // 如果已经在初始化页面，强制重新检查
+      initStatusChecked = false
+      const systemNeedsInit = await checkInitStatus()
+      if (!systemNeedsInit) {
+        next({ path: '/home' })
+        return
+      }
+    }
+    
+    // whiteList 已在函数开头定义，这里不需要重复定义
+    
+    if (whiteList.includes(to.path) || isPublicShareRoute) {
+      next()
+      return
+    }
+    
+    if (to.meta.requiresAuth || !whiteList.includes(to.path)) {
+      if (!token) {
+        next('/home')
+        return
+      }
+      
+      // 检查用户信息和状态
+      if (!userStore.user) {
+        try {
+          await userStore.fetchUserInfo()
+        } catch (error) {
+          console.error('获取用户信息失败:', error)
+          userStore.logout()
+          next('/home')
+          return
+        }
+      } else {
+        // 对于敏感操作页面，重新验证用户状态
+        const sensitivePages = ['/admin/', '/user/settings', '/user/security']
+        const isSensitivePage = sensitivePages.some(page => to.path.startsWith(page))
+        
+        if (isSensitivePage) {
+          try {
+            const isValid = await userStore.checkUserStatus()
+            if (!isValid) {
+              next('/home')
+              return
+            }
+          } catch (error) {
+            console.error('用户状态验证失败:', error)
+            userStore.logout()
+            next('/home')
+            return
+          }
+        }
+      }
+      
+      // 严格检查：普通用户不能访问管理员路由（normal_admin可以）
+      if (to.path.startsWith('/admin/') && userStore.userType !== 'admin' && userStore.userType !== 'normal_admin') {
+        ElMessage.warning(i18n.global.t('navbar.noPermission'))
+        next('/user/dashboard')
+        return
+      }
+      
+      // 超级管理员专属页面：normal_admin 不能访问
+      const superAdminOnlyPaths = ['/admin/users', '/admin/config', '/admin/performance', '/admin/logs', '/admin/oauth2-providers', '/admin/invite-codes', '/admin/announcements', '/admin/kyc']
+      if (userStore.userType === 'normal_admin' && superAdminOnlyPaths.some(p => to.path.startsWith(p))) {
+        ElMessage.warning(i18n.global.t('navbar.noPermission'))
+        next('/admin/dashboard')
+        return
+      }
+      
+      if (to.meta.roles && to.meta.roles.length > 0) {
+        const userRole = userStore.userType
+        // 管理员和普通管理员可以访问所有页面（包括用户页面）
+        // 用户只能访问标记为 'user' 角色的页面
+        const hasAccess = userRole === 'admin' || userRole === 'normal_admin' || to.meta.roles.includes(userRole)
+        
+        if (!hasAccess) {
+          // 根据用户类型跳转到相应的首页
+          if (userRole === 'admin') {
+            next('/admin/dashboard')
+          } else if (userRole === 'user') {
+            next('/user/dashboard')
+          } else {
+            next('/home')
+          }
+          return
+        }
+      }
+    }
+    
+    if (to.path === '/' && token) {
+      // 根据用户类型和视图模式跳转
+      const userType = userStore.userType
+      const viewMode = userStore.viewMode || userType
+      
+      // 只有管理员可以访问管理员界面
+      if ((userType === 'admin' || userType === 'normal_admin') && (viewMode === 'admin' || viewMode === 'normal_admin')) {
+        next('/admin/dashboard')
+        return
+      } else {
+        // 普通用户或管理员切换到用户视图时，进入用户界面
+        next('/user/dashboard')
+        return
+      }
+    } else if (to.path === '/' && !token) {
+      next('/home')
+      return
+    }
+    
+    next()
+  })
+  
+  router.afterEach((to, from) => {
+    NProgress.done()
+    const t = i18n.global.t
+    const title = to.meta.title ? t(to.meta.title) : ''
+    document.title = title ? `${title} - OneClickVirt` : 'OneClickVirt'
+    
+    // 对于用户页面，确保每次导航都触发组件刷新
+    if (to.path.startsWith('/user/') && from.path !== to.path) {
+      // 延迟触发，确保组件已经挂载
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('force-page-refresh', { 
+          detail: { path: to.path, from: from.path } 
+        }))
+      }, 50)
+    }
+  })
+}

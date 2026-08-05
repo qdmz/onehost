@@ -1,0 +1,363 @@
+// Provider CRUD业务操作逻辑
+import { ref } from 'vue'
+import { ElMessage, ElMessageBox, ElLoading } from 'element-plus'
+import { 
+  getProviderList, 
+  createProvider, 
+  updateProvider, 
+  deleteProvider,
+  freezeProvider,
+  unfreezeProvider,
+  queueProviderHealthCheck,
+  autoConfigureProvider,
+  getConfigurationTaskDetail
+} from '@/api/admin'
+import { useI18n } from 'vue-i18n'
+
+export function useProviderOperations() {
+  const { t } = useI18n()
+  
+  const loading = ref(false)
+  const providers = ref([])
+  const selectedProviders = ref([])
+  const total = ref(0)
+
+  const requireTypedConfirmation = async ({ title, message, expected, confirmButtonText, type = 'warning' }) => {
+    await ElMessageBox.prompt(
+      `${message}<br><br>${t('admin.providers.typeToConfirm', { expected })}`,
+      title,
+      {
+        confirmButtonText: confirmButtonText || t('common.confirm'),
+        cancelButtonText: t('common.cancel'),
+        inputPlaceholder: expected,
+        inputValidator: (value) =>
+          String(value || '').trim() === String(expected).trim() ||
+          t('admin.providers.confirmTextMismatch', { expected }),
+        type,
+        dangerouslyUseHTMLString: true
+      }
+    )
+  }
+
+  // 加载Provider列表
+  const loadProviders = async (params) => {
+    loading.value = true
+    try {
+      const response = await getProviderList(params)
+      providers.value = response.data.list || []
+      total.value = response.data.total || 0
+      return response
+    } catch (error) {
+      ElMessage.error(t('admin.providers.loadProvidersFailed'))
+      throw error
+    } finally {
+      loading.value = false
+    }
+  }
+
+  // 创建Provider
+  const createProviderHandler = async (providerData) => {
+    try {
+      const response = await createProvider(providerData)
+      ElMessage.success(t('admin.providers.serverCreated'))
+      return response
+    } catch (error) {
+      const errorMsg = error?.response?.data?.msg || error?.message || t('admin.providers.serverCreateFailed')
+      ElMessage.error(errorMsg)
+      throw error
+    }
+  }
+
+  // 更新Provider
+  const updateProviderHandler = async (id, providerData) => {
+    try {
+      const response = await updateProvider(id, providerData)
+      ElMessage.success(t('admin.providers.serverUpdated'))
+      return response
+    } catch (error) {
+      const errorMsg = error?.response?.data?.msg || error?.message || t('admin.providers.serverUpdateFailed')
+      ElMessage.error(errorMsg)
+      throw error
+    }
+  }
+
+  // 删除Provider
+  const deleteProviderHandler = async (id) => {
+    try {
+      await ElMessageBox.confirm(
+        t('admin.providers.singleDeleteConfirm'),
+        t('common.warning'),
+        {
+          confirmButtonText: t('common.confirm'),
+          cancelButtonText: t('common.cancel'),
+          type: 'warning'
+        }
+      )
+      const providerName = providers.value.find(p => p.id === id)?.name || String(id)
+      await requireTypedConfirmation({
+        title: t('admin.providers.cascadeDeleteTitle'),
+        message: t('admin.providers.singleDeleteConfirm'),
+        expected: providerName,
+        confirmButtonText: t('common.confirm'),
+        type: 'warning'
+      })
+
+      await deleteProvider(id)
+      ElMessage.success(t('admin.providers.providerDeleteTaskQueued'))
+      return true
+    } catch (error) {
+      if (error !== 'cancel') {
+        const errorMsg = error?.response?.data?.msg || error?.message || t('admin.providers.serverDeleteFailed')
+        ElMessage.error(errorMsg)
+      }
+      return false
+    }
+  }
+
+  // 批量删除
+  const batchDeleteProviders = async (providers) => {
+    if (!providers || providers.length === 0) {
+      ElMessage.warning(t('admin.providers.pleaseSelectProviders'))
+      return { success: false }
+    }
+
+    try {
+      await ElMessageBox.confirm(
+        t('admin.providers.batchDeleteConfirm', { count: providers.length }),
+        t('common.warning'),
+        {
+          confirmButtonText: t('common.confirm'),
+          cancelButtonText: t('common.cancel'),
+          type: 'warning',
+          dangerouslyUseHTMLString: true
+        }
+      )
+      await requireTypedConfirmation({
+        title: t('admin.providers.cascadeDeleteTitle'),
+        message: t('admin.providers.batchCascadeDeleteConfirm', { count: providers.length }),
+        expected: t('admin.providers.batchCascadeConfirmText'),
+        confirmButtonText: t('common.confirm'),
+        type: 'warning'
+      })
+
+      const loadingInstance = ElLoading.service({
+        lock: true,
+        text: t('admin.providers.batchDeleting'),
+        background: 'rgba(0, 0, 0, 0.7)'
+      })
+
+      let successCount = 0
+      let failCount = 0
+      const errors = []
+
+      for (const provider of providers) {
+        try {
+          await deleteProvider(provider.id)
+          successCount++
+        } catch (error) {
+          failCount++
+          errors.push(`${provider.name}: ${error?.response?.data?.msg || error?.message || t('common.failed')}`)
+        }
+      }
+
+      loadingInstance.close()
+
+      if (failCount === 0) {
+        ElMessage.success(t('admin.providers.batchDeleteTasksQueued', { count: successCount }))
+      } else {
+        ElMessageBox.alert(
+          `${t('admin.providers.batchDeleteTaskPartial', { success: successCount, fail: failCount })}<br><br>${errors.join('<br>')}`,
+          t('admin.providers.batchOperationResult'),
+          {
+            dangerouslyUseHTMLString: true,
+            type: failCount === providers.length ? 'error' : 'warning'
+          }
+        )
+      }
+
+      return { success: true, successCount, failCount, errors }
+    } catch (error) {
+      if (error !== 'cancel') {
+        ElMessage.error(t('admin.providers.batchDeleteFailed'))
+      }
+      return { success: false }
+    }
+  }
+
+  // 批量冻结
+  const batchFreezeProviders = async (providers) => {
+    if (!providers || providers.length === 0) {
+      ElMessage.warning(t('admin.providers.pleaseSelectProviders'))
+      return { success: false }
+    }
+
+    try {
+      await ElMessageBox.confirm(
+        t('admin.providers.batchFreezeConfirm', { count: providers.length }),
+        t('common.warning'),
+        {
+          confirmButtonText: t('common.confirm'),
+          cancelButtonText: t('common.cancel'),
+          type: 'warning'
+        }
+      )
+
+      const loadingInstance = ElLoading.service({
+        lock: true,
+        text: t('admin.providers.batchFreezing'),
+        background: 'rgba(0, 0, 0, 0.7)'
+      })
+
+      let successCount = 0
+      let failCount = 0
+      const errors = []
+
+      for (const provider of providers) {
+        try {
+          await freezeProvider(provider.id)
+          successCount++
+        } catch (error) {
+          failCount++
+          errors.push(`${provider.name}: ${error?.response?.data?.msg || error?.message || t('common.failed')}`)
+        }
+      }
+
+      loadingInstance.close()
+
+      if (failCount === 0) {
+        ElMessage.success(t('admin.providers.batchFreezeSuccess', { count: successCount }))
+      } else {
+        ElMessageBox.alert(
+          `${t('admin.providers.batchFreezePartialSuccess', { success: successCount, fail: failCount })}<br><br>${errors.join('<br>')}`,
+          t('admin.providers.batchOperationResult'),
+          {
+            dangerouslyUseHTMLString: true,
+            type: 'warning'
+          }
+        )
+      }
+
+      return { success: true, successCount, failCount, errors }
+    } catch (error) {
+      if (error !== 'cancel') {
+        ElMessage.error(t('admin.providers.batchFreezeFailed'))
+      }
+      return { success: false }
+    }
+  }
+
+  // 冻结Provider
+  const freezeProviderHandler = async (id) => {
+    try {
+      await ElMessageBox.confirm(
+        t('admin.providers.singleFreezeConfirm'),
+        t('admin.providers.confirmFreeze'),
+        {
+          confirmButtonText: t('common.confirm'),
+          cancelButtonText: t('common.cancel'),
+          type: 'warning'
+        }
+      )
+
+      await freezeProvider(id)
+      ElMessage.success(t('admin.providers.serverFrozen'))
+      return true
+    } catch (error) {
+      if (error !== 'cancel') {
+        ElMessage.error(t('admin.providers.serverFreezeFailed'))
+      }
+      return false
+    }
+  }
+
+  // 解冻Provider
+  const unfreezeProviderHandler = async (server) => {
+    try {
+      const { value: expiresAt } = await ElMessageBox.prompt(
+        t('admin.providers.unfreezeExpiryPrompt'),
+        t('admin.providers.unfreezeServer'),
+        {
+          confirmButtonText: t('common.confirm'),
+          cancelButtonText: t('common.cancel'),
+          inputPattern: /^(\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?)?$/,
+          inputErrorMessage: t('admin.providers.validation.dateFormatError'),
+          inputPlaceholder: t('admin.providers.unfreezeExpiryPlaceholder')
+        }
+      )
+
+      await unfreezeProvider(server.id, expiresAt || '')
+      ElMessage.success(t('admin.providers.serverUnfrozen'))
+      return true
+    } catch (error) {
+      if (error !== 'cancel') {
+        ElMessage.error(t('admin.providers.serverUnfreezeFailed'))
+      }
+      return false
+    }
+  }
+
+  // 健康检查
+  const checkHealth = async (providerId) => {
+    try {
+      const response = await queueProviderHealthCheck(providerId)
+      ElMessage.success(t('admin.providers.healthCheckTaskQueued'))
+      return response
+    } catch (error) {
+      const errorMsg = error?.response?.data?.msg || error?.message || t('admin.providers.healthCheckFailed')
+      ElMessage.error(errorMsg)
+      throw error
+    }
+  }
+
+  // 自动配置API
+  const autoConfigureAPIHandler = async (provider, force = false) => {
+    try {
+      const checkResponse = await autoConfigureProvider({
+        providerId: provider.id,
+        checkOnly: true
+      })
+
+      return checkResponse
+    } catch (error) {
+      const errorMsg = error?.response?.data?.msg || error?.message || t('admin.providers.autoConfigureFailed')
+      ElMessage.error(errorMsg)
+      throw error
+    }
+  }
+
+  // 获取配置任务详情
+  const getTaskDetail = async (taskId) => {
+    try {
+      const response = await getConfigurationTaskDetail(taskId)
+      return response
+    } catch (error) {
+      const errorMsg = error?.response?.data?.msg || error?.message || t('admin.providers.getTaskDetailFailed')
+      ElMessage.error(errorMsg)
+      throw error
+    }
+  }
+
+  // 选择变更处理
+  const handleSelectionChange = (selection) => {
+    selectedProviders.value = selection
+  }
+
+  return {
+    loading,
+    providers,
+    selectedProviders,
+    total,
+    loadProviders,
+    createProviderHandler,
+    updateProviderHandler,
+    deleteProviderHandler,
+    batchDeleteProviders,
+    batchFreezeProviders,
+    freezeProviderHandler,
+    unfreezeProviderHandler,
+    checkHealth,
+    autoConfigureAPIHandler,
+    getTaskDetail,
+    handleSelectionChange
+  }
+}

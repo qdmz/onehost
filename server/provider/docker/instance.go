@@ -1,0 +1,798 @@
+package docker
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"oneclickvirt/global"
+	providerModel "oneclickvirt/model/provider"
+	"oneclickvirt/provider"
+	"oneclickvirt/utils"
+
+	"go.uber.org/zap"
+)
+
+// sshListInstances 列出所有实例
+func (d *DockerProvider) sshListInstances(ctx context.Context) ([]provider.Instance, error) {
+	output, err := d.sshClient.ExecuteWithLogging(d.runtime.CLI+" ps -a --format 'table {{.Names}}\\t{{.Status}}\\t{{.Image}}\\t{{.ID}}\\t{{.CreatedAt}}'", "DOCKER_LIST")
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) <= 1 {
+		return []provider.Instance{}, nil
+	}
+
+	var instances []provider.Instance
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		status := "unknown"
+		statusField := strings.ToLower(fields[1])
+		if strings.Contains(statusField, "up") {
+			status = "running"
+		} else if strings.Contains(statusField, "exited") {
+			status = "stopped"
+		}
+
+		instance := provider.Instance{
+			ID:     fields[3],
+			Name:   fields[0],
+			Status: status,
+			Image:  fields[2],
+		}
+		instances = append(instances, instance)
+	}
+
+	// 获取每个实例的网络信息（IP地址和网络接口）
+	d.enrichInstancesWithNetworkInfo(&instances)
+
+	global.APP_LOG.Info("获取容器实例列表成功", zap.Int("count", len(instances)))
+	return instances, nil
+}
+
+// enrichInstancesWithNetworkInfo 补充获取实例的网络信息（IP地址和网络接口）
+func (d *DockerProvider) enrichInstancesWithNetworkInfo(instances *[]provider.Instance) {
+	for idx := range *instances {
+		instance := &(*instances)[idx]
+		// 只处理正在运行的实例
+		if instance.Status != "running" {
+			continue
+		}
+
+		// 1. 获取容器的内网IP地址
+		cmd := fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{$config.IPAddress}}{{end}}'", d.runtime.CLI, shellSingleQuote(instance.Name))
+		output, err := d.sshClient.Execute(cmd)
+		if err == nil {
+			ipAddress := utils.CleanCommandOutput(output)
+			if ipAddress != "" && ipAddress != "<no value>" {
+				instance.PrivateIP = ipAddress
+				instance.IP = ipAddress // 保持向后兼容
+				global.APP_LOG.Debug("获取到容器内网IP地址",
+					zap.String("instance", instance.Name),
+					zap.String("privateIP", ipAddress))
+			}
+		}
+
+		// 2. 获取容器对应的宿主机veth接口
+		vethCmd := fmt.Sprintf(`
+CONTAINER_NAME=%s
+CONTAINER_PID=$(%s inspect -f '{{.State.Pid}}' "$CONTAINER_NAME" 2>/dev/null)
+if [ -z "$CONTAINER_PID" ] || [ "$CONTAINER_PID" = "0" ]; then
+    exit 1
+fi
+HOST_VETH_IFINDEX=$(nsenter -t $CONTAINER_PID -n ip link show eth0 2>/dev/null | head -n1 | sed -n 's/.*@if\([0-9]\+\).*/\1/p')
+if [ -z "$HOST_VETH_IFINDEX" ]; then
+    exit 1
+fi
+VETH_NAME=$(ip -o link show 2>/dev/null | awk -v idx="$HOST_VETH_IFINDEX" -F': ' '$1 == idx {print $2}' | cut -d'@' -f1)
+if [ -n "$VETH_NAME" ]; then
+    echo "$VETH_NAME"
+fi
+`, shellSingleQuote(instance.Name), d.runtime.CLI)
+
+		vethOutput, err := d.sshClient.Execute(vethCmd)
+		if err == nil {
+			vethInterface := utils.CleanCommandOutput(vethOutput)
+			if vethInterface != "" {
+				if instance.Metadata == nil {
+					instance.Metadata = make(map[string]string)
+				}
+				instance.Metadata["network_interface"] = vethInterface
+				global.APP_LOG.Debug("获取到容器veth接口",
+					zap.String("instance", instance.Name),
+					zap.String("veth", vethInterface))
+			}
+		}
+
+		// 如果没有获取到PrivateIP，尝试使用旧方法获取
+		if instance.PrivateIP == "" {
+			cmd := fmt.Sprintf("%s inspect %s --format '{{.NetworkSettings.IPAddress}}'", d.runtime.CLI, shellSingleQuote(instance.Name))
+			output, err := d.sshClient.Execute(cmd)
+			if err == nil {
+				ipAddress := strings.TrimSpace(output)
+				if ipAddress != "" && ipAddress != "<no value>" {
+					instance.PrivateIP = ipAddress
+					instance.IP = ipAddress
+					global.APP_LOG.Debug("通过默认网络获取到容器IP地址",
+						zap.String("instance", instance.Name),
+						zap.String("privateIP", ipAddress))
+				}
+			}
+		}
+
+		// 3. 检查容器是否连接到 IPv6 网络
+		checkIPv6Cmd := fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{$net}}{{println}}{{end}}'", d.runtime.CLI, shellSingleQuote(instance.Name))
+		networksOutput, err := d.sshClient.Execute(checkIPv6Cmd)
+		if err == nil && strings.Contains(networksOutput, d.runtime.IPv6Network) {
+			// 容器连接到了 IPv6 网络，获取IPv6地址
+			cmd = fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{if $config.GlobalIPv6Address}}{{$config.GlobalIPv6Address}}{{end}}{{end}}'", d.runtime.CLI, shellSingleQuote(instance.Name))
+			output, err = d.sshClient.Execute(cmd)
+			if err == nil {
+				ipv6Address := strings.TrimSpace(output)
+				if ipv6Address != "" && ipv6Address != "<no value>" {
+					instance.IPv6Address = ipv6Address
+					global.APP_LOG.Debug("获取到容器IPv6地址",
+						zap.String("instance", instance.Name),
+						zap.String("ipv6", ipv6Address))
+				}
+			}
+		}
+	}
+}
+
+// sshCreateInstance 创建实例
+func (d *DockerProvider) sshCreateInstance(ctx context.Context, config provider.InstanceConfig) error {
+	return d.sshCreateInstanceWithProgress(ctx, config, nil)
+}
+
+// sshCreateInstanceWithProgress 创建实例并报告进度
+func (d *DockerProvider) sshCreateInstanceWithProgress(ctx context.Context, config provider.InstanceConfig, progressCallback provider.ProgressCallback) error {
+	// 进度更新辅助函数
+	updateProgress := func(percentage int, message string) {
+		if progressCallback != nil {
+			progressCallback(percentage, message)
+		}
+		global.APP_LOG.Debug("Docker实例创建进度",
+			zap.String("instance", config.Name),
+			zap.Int("percentage", percentage),
+			zap.String("message", message))
+	}
+
+	updateProgress(10, "开始创建Docker实例...")
+
+	// 预检：确保容器运行时 CLI 可用，避免后续命令以 127 失败且错误不明确
+	if _, err := d.sshClient.Execute(fmt.Sprintf("command -v %s >/dev/null 2>&1", d.runtime.CLI)); err != nil {
+		return fmt.Errorf("%s 命令不可用，请确认 provider 节点已安装并在 PATH 中: %w", d.runtime.CLI, err)
+	}
+
+	global.APP_LOG.Debug("开始创建Docker实例",
+		zap.String("instance", config.Name),
+		zap.String("image", config.Image),
+		zap.String("providerHost", d.config.Host))
+
+	if handled, err := d.sshCreateSpecialRuntimeInstance(ctx, config, updateProgress); handled {
+		return err
+	}
+
+	// 确保SSH脚本文件可用（非致命错误，SSH脚本仅用于后续密码配置）
+	updateProgress(15, "确保SSH脚本可用...")
+	global.APP_LOG.Debug("准备调用ensureSSHScriptsAvailable",
+		zap.String("instance", config.Name),
+		zap.String("country", d.config.Country))
+
+	if err := d.ensureSSHScriptsAvailable(d.config.Country); err != nil {
+		global.APP_LOG.Warn("确保SSH脚本可用失败，但继续创建实例",
+			zap.String("name", utils.TruncateString(config.Name, 32)),
+			zap.Error(err))
+	}
+
+	global.APP_LOG.Debug("ensureSSHScriptsAvailable调用完成",
+		zap.String("instance", config.Name))
+
+	updateProgress(20, "处理Docker镜像...")
+	// 为导入镜像添加本地前缀；provider image 列表可能已经返回该前缀。
+	imageNameWithPrefix := dockerManagedImageName(config.Image)
+	// 标记是否使用了 registry 回退拉取（原始镜像无持久进程，需附加 keep-alive 命令）
+	registryFallback := false
+
+	global.APP_LOG.Debug("准备检查镜像是否存在",
+		zap.String("instance", config.Name),
+		zap.String("imageNameWithPrefix", imageNameWithPrefix))
+
+	if config.CopyMode && config.CopySourceName != "" {
+		if !utils.IsValidContainerRuntimeName(config.CopySourceName) {
+			return fmt.Errorf("源容器名称格式无效: %s", config.CopySourceName)
+		}
+		updateProgress(25, "从源容器创建临时镜像...")
+		if _, err := d.sshClient.Execute(fmt.Sprintf("%s inspect %s >/dev/null 2>&1", d.runtime.CLI, shellSingleQuote(config.CopySourceName))); err != nil {
+			return fmt.Errorf("源容器 %s 不存在或不可访问: %w", config.CopySourceName, err)
+		}
+		copyImageName := "oneclickvirt_copy_" + strings.ToLower(strings.NewReplacer("_", "-", ".", "-", "/", "-").Replace(config.Name))
+		commitCmd := fmt.Sprintf("%s commit %s %s", d.runtime.CLI, shellSingleQuote(config.CopySourceName), shellSingleQuote(copyImageName))
+		if out, err := d.sshClient.ExecuteWithTimeout(commitCmd, 10*time.Minute); err != nil {
+			return fmt.Errorf("从源容器创建临时镜像失败: %w; output: %s", err, utils.TruncateString(out, 300))
+		}
+		imageNameWithPrefix = copyImageName
+		defer d.sshClient.Execute(fmt.Sprintf("%s rmi -f %s >/dev/null 2>&1 || true", d.runtime.CLI, shellSingleQuote(copyImageName)))
+	} else {
+		// 首先检查镜像是否存在
+		imageExistsResult := d.imageExists(imageNameWithPrefix)
+		global.APP_LOG.Debug("imageExists调用完成",
+			zap.String("instance", config.Name),
+			zap.String("imageNameWithPrefix", imageNameWithPrefix),
+			zap.Bool("exists", imageExistsResult))
+
+		if !imageExistsResult {
+			// 如果镜像不存在且有镜像URL，先在远程服务器下载镜像
+			if config.ImageURL != "" {
+				// 使用 singleflight 确保同一镜像只有一个协程执行下载+加载，
+				// 其余协程阻塞等待结果，避免并发下载和 docker load 冲突。
+				imageURL := config.ImageURL
+				imageName := config.Image
+				useCDN := config.UseCDN
+				_, sfErr, _ := d.imageImportGroup.Do(imageNameWithPrefix, func() (interface{}, error) {
+					// 等待期间镜像可能已由其他协程加载完毕，再次检查
+					if d.imageExists(imageNameWithPrefix) {
+						global.APP_LOG.Debug("Docker镜像已由并发协程完成加载，跳过",
+							zap.String("image", utils.TruncateString(imageNameWithPrefix, 64)))
+						return nil, nil
+					}
+
+					updateProgress(30, "下载镜像到远程服务器...")
+					remotePath, err := d.downloadImageToRemote(imageURL, imageName, d.config.Country, d.config.Architecture, useCDN)
+					if err != nil {
+						return nil, fmt.Errorf("下载镜像失败: %w", err)
+					}
+
+					updateProgress(50, "加载镜像到Docker...")
+					if err := d.loadImageToDocker(remotePath, imageNameWithPrefix); err != nil {
+						global.APP_LOG.Warn("Docker镜像加载失败，尝试重新下载",
+							zap.String("image", utils.TruncateString(imageNameWithPrefix, 64)),
+							zap.Error(err))
+
+						// 清理损坏的镜像文件和Docker镜像
+						d.cleanupRemoteImage(imageName, imageURL, d.config.Architecture)
+						d.cleanupDockerImage(imageNameWithPrefix)
+
+						updateProgress(40, "重新下载镜像...")
+						remotePath, err = d.downloadImageToRemote(imageURL, imageName, d.config.Country, d.config.Architecture, useCDN)
+						if err != nil {
+							return nil, fmt.Errorf("重新下载镜像失败: %w", err)
+						}
+
+						updateProgress(55, "重新加载镜像到Docker...")
+						if err := d.loadImageToDocker(remotePath, imageNameWithPrefix); err != nil {
+							return nil, fmt.Errorf("重新加载镜像失败: %w", err)
+						}
+					}
+
+					updateProgress(60, "清理临时文件...")
+					d.cleanupRemoteImage(imageName, imageURL, d.config.Architecture)
+					return nil, nil
+				})
+				if sfErr != nil {
+					return sfErr
+				}
+			} else {
+				// 镜像不存在且没有下载URL，尝试从 registry（Docker Hub 等）拉取原始镜像，
+				// 然后打标为 oneclickvirt_ 前缀。适用于 admin 直连创建等没有预设镜像URL的场景。
+				updateProgress(25, "从 registry 拉取原始镜像作为回退...")
+				global.APP_LOG.Info("Docker镜像不存在且无下载URL，尝试从 registry 拉取原始镜像",
+					zap.String("rawImage", utils.TruncateString(config.Image, 64)),
+					zap.String("targetImage", utils.TruncateString(imageNameWithPrefix, 64)))
+
+				pullErr := d.sshPullImage(ctx, config.Image)
+				if pullErr != nil {
+					global.APP_LOG.Error("从 registry 拉取镜像也失败",
+						zap.String("rawImage", utils.TruncateString(config.Image, 64)),
+						zap.Error(pullErr))
+					return fmt.Errorf("镜像 %s 不存在，且没有提供下载URL；从 registry 拉取也失败: %w", imageNameWithPrefix, pullErr)
+				}
+
+				// 打标为 oneclickvirt_ 前缀以匹配后续流程
+				tagCmd := fmt.Sprintf("%s tag %s %s", d.runtime.CLI, shellSingleQuote(config.Image), shellSingleQuote(imageNameWithPrefix))
+				if _, tagErr := d.sshClient.Execute(tagCmd); tagErr != nil {
+					global.APP_LOG.Warn("镜像打标失败，后续流程可能使用原始镜像名",
+						zap.String("rawImage", utils.TruncateString(config.Image, 64)),
+						zap.String("targetImage", utils.TruncateString(imageNameWithPrefix, 64)),
+						zap.Error(tagErr))
+				}
+				registryFallback = true // 原始镜像无持久进程，后续 docker run 需附加 keep-alive
+				updateProgress(55, "原始镜像拉取并打标完成")
+			}
+		} else {
+			updateProgress(60, "Docker镜像已存在，跳过下载...")
+			global.APP_LOG.Debug("Docker镜像已存在，跳过下载",
+				zap.String("image", utils.TruncateString(imageNameWithPrefix, 64)))
+		}
+	}
+
+	updateProgress(70, "清理同名残留容器...")
+	// 预先清理任何同名的残留容器（包括停止、失败或创建失败的容器）
+	// 这可以避免端口冲突和容器名称冲突
+	cleanupCmd := fmt.Sprintf("%s ps -a --filter %s -q | xargs -r %s rm -f", d.runtime.CLI, containerNameFilter(config.Name), d.runtime.CLI)
+	global.APP_LOG.Debug("创建前清理同名容器",
+		zap.String("instance", utils.TruncateString(config.Name, 32)),
+		zap.String("command", cleanupCmd))
+
+	cleanupOutput, cleanupErr := d.sshClient.Execute(cleanupCmd)
+	if cleanupErr != nil {
+		global.APP_LOG.Debug("清理同名容器失败（可忽略）",
+			zap.String("instance", utils.TruncateString(config.Name, 32)),
+			zap.String("output", utils.TruncateString(cleanupOutput, 200)),
+			zap.Error(cleanupErr))
+	} else if cleanupOutput != "" {
+		global.APP_LOG.Debug("已清理同名残留容器",
+			zap.String("instance", utils.TruncateString(config.Name, 32)),
+			zap.String("cleanedContainers", utils.TruncateString(cleanupOutput, 200)))
+	}
+
+	updateProgress(72, "构建Docker run命令...")
+	// 构建 run 命令
+	cmd := fmt.Sprintf("%s run -d --name %s", d.runtime.CLI, shellSingleQuote(config.Name))
+
+	// 检查是否启用IPv6网络（支持标准的网络类型值）
+	networkType := d.config.NetworkType
+	// 优先从实例Metadata中读取网络类型配置
+	if config.Metadata != nil {
+		if metaNetworkType, ok := config.Metadata["network_type"]; ok {
+			networkType = metaNetworkType
+			global.APP_LOG.Debug("使用实例级别的网络类型配置",
+				zap.String("instance", config.Name),
+				zap.String("networkType", networkType))
+		}
+	}
+
+	hasIPv6 := networkType == "nat_ipv4_ipv6" || networkType == "dedicated_ipv4_ipv6" || networkType == "ipv6_only"
+	if hasIPv6 && d.checkIPv6NetworkAvailable() {
+		cmd += fmt.Sprintf(" --network=%s", shellSingleQuote(d.runtime.IPv6Network))
+		global.APP_LOG.Debug("启用IPv6网络",
+			zap.String("name", utils.TruncateString(config.Name, 32)),
+			zap.String("provider", d.config.Name))
+	} else {
+		if hasIPv6 {
+			global.APP_LOG.Warn("Provider配置启用IPv6但 IPv6 网络不可用",
+				zap.String("name", utils.TruncateString(config.Name, 32)),
+				zap.String("provider", d.config.Name))
+		}
+		// 如果运行时指定了 IPv4 网络（如 podman-net / containerd-net），显式指定
+		if d.runtime.IPv4Network != "" {
+			cmd += fmt.Sprintf(" --network=%s", shellSingleQuote(d.runtime.IPv4Network))
+		}
+	}
+
+	// 对于独立IPv4模式，预先检查并确保该IPv4地址已绑定到宿主机网络接口
+	if networkType == "dedicated_ipv4" || networkType == "dedicated_ipv4_ipv6" {
+		if config.Metadata != nil {
+			if staticIPv4, ok := config.Metadata["static_ipv4"]; ok && staticIPv4 != "" {
+				if err := d.ensureIPv4OnHostInterface(staticIPv4); err != nil {
+					global.APP_LOG.Warn("独立IPv4宿主机接口绑定检查失败，继续执行",
+						zap.String("instance", config.Name),
+						zap.String("ipv4", staticIPv4),
+						zap.Error(err))
+				}
+			}
+		}
+	}
+
+	// 始终应用CPU限制参数（资源限制配置只影响Provider层面的资源预算计算）
+	if config.CPU != "" {
+		cmd += fmt.Sprintf(" --cpus=%s", config.CPU)
+	}
+
+	// 始终应用内存限制参数（资源限制配置只影响Provider层面的资源预算计算）
+	if config.Memory != "" {
+		// Docker --memory parameter supports the following units (as per official documentation):
+		// - b, k, m, g (with optional 'B' suffix): 1024-based binary units
+		// - Examples: 512m, 1g, 2048m, 1GB, 1024MB
+		// Reference: https://docs.docker.com/config/containers/resource_constraints/#limit-a-containers-access-to-memory
+		// Note: Docker accepts both binary and decimal units, but typically uses 1024-based calculations
+		cmd += fmt.Sprintf(" --memory=%s", config.Memory)
+	}
+
+	updateProgress(75, "配置存储限制...")
+	// 始终检查并应用硬盘限制（资源限制配置只影响Provider层面的资源预算计算）
+	if config.Disk != "" && config.Disk != "0" {
+		// 检查存储驱动是否支持硬盘大小限制
+		supportsDiskLimit, storageDriver, err := d.checkStorageDriver()
+		if err != nil {
+			global.APP_LOG.Warn("检查存储驱动失败，跳过硬盘大小限制",
+				zap.String("name", utils.TruncateString(config.Name, 32)),
+				zap.String("disk", config.Disk),
+				zap.Error(err))
+		} else if supportsDiskLimit {
+			// 处理磁盘大小单位转换
+			// config.Disk格式可能是："1024MB", "2GB", "512" 等
+			diskSize := strings.ToLower(config.Disk)
+			var finalDiskSize string
+
+			if strings.HasSuffix(diskSize, "mb") || strings.HasSuffix(diskSize, "m") {
+				// 如果是MB单位，需要转换为GB（Docker storage-opt一般使用GB）
+				mbValue := strings.TrimSuffix(strings.TrimSuffix(diskSize, "mb"), "m")
+				if mb, err := strconv.Atoi(mbValue); err == nil {
+					// 转换MB到GB，向上取整
+					gb := (mb + 1023) / 1024 // 向上取整
+					if gb < 1 {
+						gb = 1 // 最小1GB
+					}
+					finalDiskSize = fmt.Sprintf("%dG", gb)
+				} else {
+					finalDiskSize = "1G" // 解析失败，默认1GB
+				}
+			} else if strings.HasSuffix(diskSize, "gb") || strings.HasSuffix(diskSize, "g") {
+				// 已经是GB单位，直接使用
+				finalDiskSize = config.Disk
+				if !strings.HasSuffix(diskSize, "g") {
+					finalDiskSize = strings.TrimSuffix(config.Disk, "b") // 移除"b"，保留"g"
+				}
+			} else {
+				// 没有单位，假设是MB
+				if mb, err := strconv.Atoi(config.Disk); err == nil {
+					gb := (mb + 1023) / 1024 // 向上取整
+					if gb < 1 {
+						gb = 1
+					}
+					finalDiskSize = fmt.Sprintf("%dG", gb)
+				} else {
+					finalDiskSize = "1G"
+				}
+			}
+
+			cmd += fmt.Sprintf(" --storage-opt size=%s", finalDiskSize)
+			global.APP_LOG.Debug("已启用硬盘大小限制",
+				zap.String("name", utils.TruncateString(config.Name, 32)),
+				zap.String("original_disk", config.Disk),
+				zap.String("final_disk_size", finalDiskSize),
+				zap.String("storage_driver", storageDriver))
+		} else {
+			global.APP_LOG.Warn("当前存储驱动不支持硬盘大小限制，忽略硬盘参数",
+				zap.String("name", utils.TruncateString(config.Name, 32)),
+				zap.String("storage_driver", storageDriver),
+				zap.String("disk", config.Disk))
+		}
+	}
+
+	updateProgress(80, "配置端口映射...")
+	// 端口映射参数 - 只映射IPv4端口
+	for _, port := range config.Ports {
+		// 保留完整的端口映射格式（包括协议）
+		portMapping := port
+
+		// 检查端口映射格式，确保只映射IPv4
+		if strings.HasPrefix(portMapping, "0.0.0.0:") {
+			// 已经是IPv4格式（可能包含/tcp或/udp协议）
+			// 检查是否包含 /both 协议，Docker不支持both，需要拆分
+			if strings.HasSuffix(portMapping, "/both") {
+				baseMapping := strings.TrimSuffix(portMapping, "/both")
+				cmd += fmt.Sprintf(" -p %s", shellSingleQuote(baseMapping+"/tcp"))
+				cmd += fmt.Sprintf(" -p %s", shellSingleQuote(baseMapping+"/udp"))
+			} else {
+				cmd += fmt.Sprintf(" -p %s", shellSingleQuote(portMapping))
+			}
+		} else if strings.Contains(portMapping, ":") {
+			// 如果端口映射中包含冒号但没有IPv4前缀，强制使用0.0.0.0绑定
+			// 需要保留协议部分（如果有）
+			protocol := ""
+			baseMapping := portMapping
+			if strings.Contains(portMapping, "/") {
+				parts := strings.Split(portMapping, "/")
+				baseMapping = parts[0]
+				if len(parts) > 1 {
+					protocol = "/" + parts[1]
+				}
+			}
+
+			portParts := strings.Split(baseMapping, ":")
+			if len(portParts) >= 2 {
+				// 重新构建为IPv4-only格式，处理协议
+				hostPort := portParts[len(portParts)-2]
+				guestPort := portParts[len(portParts)-1]
+
+				// 如果协议是both，需要创建两个端口映射（tcp和udp）
+				if protocol == "/both" {
+					cmd += fmt.Sprintf(" -p %s", shellSingleQuote(fmt.Sprintf("0.0.0.0:%s:%s/tcp", hostPort, guestPort)))
+					cmd += fmt.Sprintf(" -p %s", shellSingleQuote(fmt.Sprintf("0.0.0.0:%s:%s/udp", hostPort, guestPort)))
+				} else {
+					cmd += fmt.Sprintf(" -p %s", shellSingleQuote(fmt.Sprintf("0.0.0.0:%s:%s%s", hostPort, guestPort, protocol)))
+				}
+			}
+		} else {
+			// 如果是简单的端口映射格式（如"8080"），假设内外端口相同，添加IPv4前缀
+			cmd += fmt.Sprintf(" -p %s", shellSingleQuote(fmt.Sprintf("0.0.0.0:%s:%s", portMapping, portMapping)))
+		}
+	}
+
+	updateProgress(85, "配置LXCFS卷挂载...")
+	// 检查并添加LXCFS卷挂载
+	lxcfsAvailable, lxcfsVolumes, lxcfsReason, err := d.checkLXCFS()
+	if err != nil {
+		global.APP_LOG.Warn("检查LXCFS状态失败",
+			zap.String("name", utils.TruncateString(config.Name, 32)),
+			zap.Error(err))
+	} else if lxcfsAvailable && len(lxcfsVolumes) > 0 {
+		// 检测到的LXCFS卷挂载
+		for _, volume := range lxcfsVolumes {
+			cmd += " " + volume
+		}
+		global.APP_LOG.Debug("已启用LXCFS卷挂载，提供真实的容器内资源视图",
+			zap.String("name", utils.TruncateString(config.Name, 32)),
+			zap.String("reason", lxcfsReason),
+			zap.Int("mount_count", len(lxcfsVolumes)))
+	} else {
+		global.APP_LOG.Debug("LXCFS不可用，跳过卷挂载",
+			zap.String("name", utils.TruncateString(config.Name, 32)),
+			zap.String("reason", lxcfsReason))
+	}
+
+	updateProgress(90, "配置容器能力和环境变量...")
+	gpuOptStr := ""
+	if config.GpuEnabled {
+		if strings.TrimSpace(config.GpuDeviceIds) != "" {
+			gpuOptStr = fmt.Sprintf(" --gpus %s", shellSingleQuote("device="+strings.TrimSpace(config.GpuDeviceIds)))
+		} else {
+			gpuOptStr = " --gpus all"
+		}
+		cmd += gpuOptStr
+	}
+	// 必要的能力
+	cmd += " --cap-add=MKNOD"
+	// Podman需要NET_ADMIN和NET_RAW才能正确配置iptables转发规则（Docker由daemon管理，不需要）
+	if d.runtime.ProviderType == "podman" {
+		cmd += " --cap-add=NET_ADMIN --cap-add=NET_RAW"
+	}
+
+	for key, value := range config.Env {
+		cmd += fmt.Sprintf(" -e %s", shellSingleQuote(key+"="+value))
+	}
+
+	cmd += fmt.Sprintf(" %s", shellSingleQuote(imageNameWithPrefix))
+
+	// 若使用 registry 回退拉取的原始镜像（无持久进程），追加 keep-alive 命令
+	// 防止容器因 CMD 退出而立即 stopped（例如 debian:12 的 bash 在无 TTY 时退出）
+	if registryFallback {
+		cmd += " sh -c 'trap : TERM INT; tail -f /dev/null & wait'"
+		global.APP_LOG.Debug("使用 registry 回退镜像，附加 keep-alive 命令",
+			zap.String("name", utils.TruncateString(config.Name, 32)))
+	}
+
+	updateProgress(95, "执行Docker创建命令...")
+	global.APP_LOG.Debug("开始执行Docker创建命令",
+		zap.String("name", utils.TruncateString(config.Name, 32)),
+		zap.String("image", utils.TruncateString(imageNameWithPrefix, 64)),
+		zap.String("command", utils.TruncateString(cmd, 200)))
+
+	effectiveCmd := cmd
+	output, err := d.sshClient.Execute(effectiveCmd)
+	if err != nil && gpuOptStr != "" {
+		global.APP_LOG.Warn("Docker GPU参数创建失败，自动回退为无GPU创建",
+			zap.String("name", utils.TruncateString(config.Name, 32)),
+			zap.String("output", utils.TruncateString(output, 300)),
+			zap.Error(err))
+		_, _ = d.sshClient.Execute(fmt.Sprintf("%s rm -f %s 2>/dev/null || true", d.runtime.CLI, shellSingleQuote(config.Name)))
+		cmdNoGPU := strings.Replace(cmd, gpuOptStr, "", 1)
+		effectiveCmd = cmdNoGPU
+		output, err = d.sshClient.Execute(effectiveCmd)
+	}
+	if err != nil {
+		diagnostics := d.collectCreateDiagnostics(config.Name)
+		global.APP_LOG.Error("Docker创建容器失败",
+			zap.String("name", utils.TruncateString(config.Name, 32)),
+			zap.String("command", utils.TruncateString(effectiveCmd, 200)),
+			zap.String("output", utils.TruncateString(output, 2000)),
+			zap.String("diagnostics", utils.TruncateString(diagnostics, 4000)),
+			zap.Error(err))
+		if strings.Contains(output, "iptables") && (strings.Contains(output, "No chain") || strings.Contains(output, "no chain")) {
+			// Auto-repair: restart the container runtime to recreate iptables chains
+			if repairErr := d.repairIptablesChains(config.Name); repairErr != nil {
+				global.APP_LOG.Error("iptables自动确认失败",
+					zap.String("name", utils.TruncateString(config.Name, 32)),
+					zap.Error(repairErr))
+				return fmt.Errorf("Docker iptables chains missing and auto-repair failed: %w; output: %s; diagnostics: %s", err, utils.TruncateString(strings.TrimSpace(output), 8000), utils.TruncateString(strings.TrimSpace(diagnostics), 8000))
+			}
+			// Retry container creation after repair
+			global.APP_LOG.Info("iptables确认完成，重试创建容器",
+				zap.String("name", utils.TruncateString(config.Name, 32)))
+			output, err = d.sshClient.Execute(effectiveCmd)
+			if err != nil {
+				diagnostics = d.collectCreateDiagnostics(config.Name)
+				global.APP_LOG.Error("iptables确认后创建容器仍然失败",
+					zap.String("name", utils.TruncateString(config.Name, 32)),
+					zap.String("output", utils.TruncateString(output, 2000)),
+					zap.String("diagnostics", utils.TruncateString(diagnostics, 4000)),
+					zap.Error(err))
+				return fmt.Errorf("failed to create container after iptables repair: %w; output: %s; diagnostics: %s", err, utils.TruncateString(strings.TrimSpace(output), 8000), utils.TruncateString(strings.TrimSpace(diagnostics), 8000))
+			}
+		} else {
+			return fmt.Errorf("failed to create container: %w; output: %s; diagnostics: %s", err, utils.TruncateString(strings.TrimSpace(output), 8000), utils.TruncateString(strings.TrimSpace(diagnostics), 8000))
+		}
+	}
+
+	// 等待容器完全启动并验证状态
+	updateProgress(96, "等待容器完全启动...")
+
+	maxWaitTime := 30 * time.Second
+	checkInterval := 6 * time.Second
+	startTime := time.Now()
+	isRunning := false
+
+	for {
+		if time.Since(startTime) > maxWaitTime {
+			global.APP_LOG.Warn("等待容器启动超时，但继续执行",
+				zap.String("name", utils.TruncateString(config.Name, 32)))
+			break
+		}
+
+		time.Sleep(checkInterval)
+
+		// 检查容器状态
+		statusOutput, err := d.sshClient.Execute(fmt.Sprintf("%s inspect %s --format '{{.State.Status}}'", d.runtime.CLI, shellSingleQuote(config.Name)))
+		if err == nil {
+			status := strings.ToLower(strings.TrimSpace(statusOutput))
+			if status == "running" {
+				isRunning = true
+				global.APP_LOG.Debug("Docker容器已确认运行",
+					zap.String("name", utils.TruncateString(config.Name, 32)),
+					zap.Duration("wait_time", time.Since(startTime)))
+				break
+			}
+		}
+
+		global.APP_LOG.Debug("等待容器启动",
+			zap.String("name", config.Name),
+			zap.Duration("elapsed", time.Since(startTime)))
+	}
+
+	if !isRunning {
+		global.APP_LOG.Warn("无法确认容器运行状态，继续执行后续操作",
+			zap.String("name", utils.TruncateString(config.Name, 32)))
+	}
+
+	// 对于podman/containerd，确保宿主机iptables路由规则存在（使容器网络可以正常访问外网）
+	if d.runtime.IPv4Subnet != "" {
+		d.ensureContainerNetworkRouting()
+	}
+
+	// 配置SSH密码
+	updateProgress(97, "配置SSH密码...")
+	if err := d.configureInstanceSSHPassword(ctx, config); err != nil {
+		// SSH密码设置失败也不应该阻止实例创建，记录错误即可
+		global.APP_LOG.Warn("配置SSH密码失败", zap.Error(err))
+	}
+
+	// 获取并更新实例的PrivateIP（确保pmacct配置使用正确的内网IP）
+	updateProgress(97, "获取实例内网IP...")
+	if privateIP, err := d.getContainerPrivateIP(config.Name); err == nil && privateIP != "" {
+		// 更新数据库中的PrivateIP
+		var instance providerModel.Instance
+		if err := global.APP_DB.Where("name = ? AND provider_id = ?", config.Name, d.config.ID).First(&instance).Error; err == nil {
+			if err := global.APP_DB.Model(&instance).Update("private_ip", privateIP).Error; err == nil {
+				global.APP_LOG.Debug("已更新Docker实例内网IP",
+					zap.String("instanceName", config.Name),
+					zap.String("privateIP", privateIP))
+			}
+		}
+	} else {
+		global.APP_LOG.Warn("获取Docker实例内网IP失败，pmacct可能使用公网IP",
+			zap.String("instanceName", config.Name),
+			zap.Error(err))
+	}
+
+	// 初始化流量监控
+	updateProgress(98, "初始化流量监控...")
+	if err := d.initializePmacctMonitoring(ctx, config); err != nil {
+		// pmacct监控初始化失败也不应该阻止实例创建，记录错误即可
+		global.APP_LOG.Warn("初始化流量监控失败", zap.Error(err))
+	}
+
+	updateProgress(100, "Docker实例创建完成")
+	global.APP_LOG.Info("容器实例创建成功", zap.String("name", utils.TruncateString(config.Name, 32)))
+	return nil
+}
+
+func dockerManagedImageName(image string) string {
+	image = strings.TrimSpace(image)
+	if strings.HasPrefix(image, "oneclickvirt_") || strings.Contains(image, "/oneclickvirt_") {
+		return image
+	}
+	return "oneclickvirt_" + image
+}
+
+func (d *DockerProvider) collectCreateDiagnostics(name string) string {
+	commands := []struct {
+		label string
+		cmd   string
+	}{
+		{"containers", fmt.Sprintf("%s ps -a --filter %s --no-trunc", d.runtime.CLI, shellSingleQuote("name=^"+name+"$"))},
+		{"logs", fmt.Sprintf("%s logs --tail 80 %s 2>&1", d.runtime.CLI, shellSingleQuote(name))},
+		{"inspect", fmt.Sprintf("%s inspect %s 2>&1", d.runtime.CLI, shellSingleQuote(name))},
+		{"runtime info", fmt.Sprintf("%s info 2>&1 | sed -n '1,120p'", d.runtime.CLI)},
+		{"docker journal", "journalctl -u docker -n 80 --no-pager 2>/dev/null"},
+	}
+	var parts []string
+	for _, command := range commands {
+		output, err := d.sshClient.Execute(command.cmd)
+		if trimmed := strings.TrimSpace(output); trimmed != "" {
+			parts = append(parts, fmt.Sprintf("[%s]\n%s", command.label, trimmed))
+		}
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("[%s error]\n%v", command.label, err))
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// repairIptablesChains restarts the container runtime service to recreate iptables/nftables chains.
+// It first removes any failed container, then restarts only the specific daemon service.
+func (d *DockerProvider) repairIptablesChains(containerName string) error {
+	// Remove the partially-created container first (if any)
+	if containerName != "" {
+		rmCmd := fmt.Sprintf("%s rm -f %s 2>/dev/null || true", d.runtime.CLI, shellSingleQuote(containerName))
+		_, _ = d.sshClient.Execute(rmCmd)
+	}
+
+	// Map provider type to systemd service name
+	serviceName := ""
+	switch d.runtime.ProviderType {
+	case "docker", "orbstack":
+		serviceName = "docker"
+	case "podman":
+		serviceName = "podman"
+	case "containerd":
+		serviceName = "containerd"
+	default:
+		serviceName = d.runtime.ProviderType
+	}
+
+	global.APP_LOG.Info("正在重启容器运行时以确认iptables chains",
+		zap.String("service", serviceName),
+		zap.String("provider_type", d.runtime.ProviderType))
+
+	restartCmd := fmt.Sprintf("systemctl restart %s", serviceName)
+	output, err := d.sshClient.Execute(restartCmd)
+	if err != nil {
+		return fmt.Errorf("restart %s failed: %s: %w", serviceName, output, err)
+	}
+
+	// Wait for the service to be ready
+	time.Sleep(5 * time.Second)
+
+	// Verify the service is running
+	checkCmd := fmt.Sprintf("systemctl is-active %s", serviceName)
+	status, err := d.sshClient.Execute(checkCmd)
+	if err != nil || !strings.Contains(strings.TrimSpace(status), "active") {
+		return fmt.Errorf("%s service not active after restart: %s", serviceName, strings.TrimSpace(status))
+	}
+
+	global.APP_LOG.Info("容器运行时重启完成",
+		zap.String("service", serviceName))
+	return nil
+}
+
+// ensureContainerNetworkRouting 确保宿主机上的iptables路由规则存在
+// 用于podman/containerd等不自动配置内核转发规则的容器运行时
+func (d *DockerProvider) ensureContainerNetworkRouting() {
+	subnet := d.runtime.IPv4Subnet
+	if subnet == "" {
+		return
+	}
+	rules := []string{
+		fmt.Sprintf("iptables -t nat -C POSTROUTING -s %s ! -d %s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s %s ! -d %s -j MASQUERADE", subnet, subnet, subnet, subnet),
+		fmt.Sprintf("iptables -C FORWARD -s %s -j ACCEPT 2>/dev/null || iptables -A FORWARD -s %s -j ACCEPT", subnet, subnet),
+		fmt.Sprintf("iptables -C FORWARD -d %s -j ACCEPT 2>/dev/null || iptables -A FORWARD -d %s -j ACCEPT", subnet, subnet),
+	}
+	for _, rule := range rules {
+		if _, err := d.sshClient.Execute(rule); err != nil {
+			global.APP_LOG.Warn("iptables路由规则设置失败（非致命）",
+				zap.String("subnet", subnet),
+				zap.Error(err))
+		}
+	}
+}

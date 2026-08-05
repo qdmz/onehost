@@ -1,0 +1,175 @@
+import axios from 'axios'
+import { useUserStore } from '@/pinia/modules/user'
+import i18n from '@/i18n'
+import { errorHandler } from './errorHandler'
+
+/**
+ * 创建长时间请求的axios实例
+ * @param {number} timeout 超时时间（毫秒）
+ * @param {object} options 额外配置选项
+ * @returns {object} axios实例
+ */
+export const createLongTimeoutRequest = (timeout = 60000, options = {}) => {
+  const service = axios.create({
+    baseURL: import.meta.env.VITE_BASE_API,
+    timeout,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    },
+    ...options
+  })
+
+  // 请求拦截器
+  service.interceptors.request.use(
+    config => {
+      const userStore = useUserStore()
+      
+      if (userStore.token) {
+        config.headers.Authorization = `Bearer ${userStore.token}`
+      }
+      
+      config.headers['X-Request-ID'] = generateRequestId(options.requestPrefix || 'long')
+      
+      if (config.method === 'get') {
+        config.params = {
+          ...config.params,
+          _t: Date.now()
+        }
+      }
+      
+      return config
+    },
+    error => {
+      console.error('长时间请求拦截器错误:', error)
+      return Promise.reject(error)
+    }
+  )
+
+  // 响应拦截器
+  service.interceptors.response.use(
+    response => {
+      const res = response.data
+      
+      if (response.headers['content-type']?.includes('application/octet-stream')) {
+        return response
+      }
+      
+      if (res.code !== undefined) {
+        if (res.code === 200) {
+          return res
+        } else {
+          const errorInfo = errorHandler.handleApiError({
+            response: {
+              ...response,
+              status: response.status === 200 ? res.code : (response.status || res.code),
+              data: res
+            }
+          }, {
+            showMessage: false,
+            autoRedirect: false
+          })
+          return Promise.reject(createNormalizedError(errorInfo, {
+            ...response,
+            status: response.status === 200 ? res.code : (response.status || res.code),
+            data: res
+          }, response))
+        }
+      }
+      
+      return response
+    },
+    async error => {
+      error = await parseBlobErrorResponse(error)
+      // 处理401认证过期 - 与主请求工具保持一致
+      if (error.response?.status === 401) {
+        const userStore = useUserStore()
+        userStore.clearUserData()
+        window.location.href = '/login'
+        return Promise.reject(error)
+      }
+      const errorInfo = errorHandler.handleApiError(error, {
+        showMessage: false,
+        autoRedirect: false
+      })
+      return Promise.reject(createNormalizedError(errorInfo, error.response, error))
+    }
+  )
+
+  return service
+}
+
+/**
+ * 生成请求ID
+ * @param {string} prefix 前缀
+ * @returns {string} 请求ID
+ */
+function generateRequestId(prefix = 'req') {
+  return prefix + '_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+}
+
+function createNormalizedError(errorInfo, response, originalError) {
+  const displayMessage = errorInfo.details || errorInfo.message
+  const normalizedError = new Error(displayMessage || i18n.global.t('common.requestFailed'))
+  normalizedError.code = errorInfo.code
+  normalizedError.status = response?.status
+  normalizedError.details = errorInfo.details
+  normalizedError.serverMessage = errorInfo.message
+  normalizedError.userMessage = displayMessage
+  normalizedError.response = response
+  normalizedError.originalError = originalError
+  return normalizedError
+}
+
+async function parseBlobErrorResponse(error) {
+  const data = error?.response?.data
+  if (!data || typeof data.text !== 'function') return error
+
+  const contentType = String(error.response?.headers?.['content-type'] || data.type || '').toLowerCase()
+  if (!contentType.includes('json') && !contentType.includes('text')) return error
+
+  try {
+    const text = await data.text()
+    if (!text) return error
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      parsed = {
+        code: error.response?.status,
+        message: text,
+        details: text
+      }
+    }
+    error.response = {
+      ...error.response,
+      data: parsed
+    }
+  } catch (parseError) {
+    console.warn('解析下载错误响应失败:', parseError)
+  }
+  return error
+}
+
+/**
+ * 健康检查专用请求实例（60秒超时）
+ */
+export const healthCheckRequest = createLongTimeoutRequest(60000, {
+  requestPrefix: 'health'
+})
+
+/**
+ * 文件上传专用请求实例（120秒超时）
+ */
+export const fileUploadRequest = createLongTimeoutRequest(120000, {
+  requestPrefix: 'upload'
+})
+
+/**
+ * 导出操作专用请求实例（180秒超时）
+ */
+export const exportRequest = createLongTimeoutRequest(180000, {
+  requestPrefix: 'export'
+})
+
+export default createLongTimeoutRequest

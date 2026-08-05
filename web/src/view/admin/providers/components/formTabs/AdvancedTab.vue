@@ -1,0 +1,577 @@
+<template>
+  <el-form
+    :model="modelValue"
+    label-width="120px"
+    class="server-form"
+  >
+    <!-- 并发控制设置 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.concurrencyControl') }}</span>
+    </el-divider>
+    
+    <el-form-item
+      :label="$t('admin.providers.allowConcurrentTasks')"
+      prop="allowConcurrentTasks"
+    >
+      <el-switch
+        v-model="modelValue.allowConcurrentTasks"
+        :active-text="$t('common.yes')"
+        :inactive-text="$t('common.no')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.allowConcurrentTasksTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      v-if="modelValue.allowConcurrentTasks"
+      :label="$t('admin.providers.maxConcurrentTasks')"
+      prop="maxConcurrentTasks"
+    >
+      <el-input-number
+        v-model="modelValue.maxConcurrentTasks"
+        :min="1"
+        :max="10"
+        :step="1"
+        :controls="false"
+        placeholder="1"
+        style="width: 200px"
+      />
+    </el-form-item>
+    <div
+      v-if="modelValue.allowConcurrentTasks"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.maxConcurrentTasksTip') }}
+      </el-text>
+    </div>
+
+    <!-- 任务轮询设置 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.taskPollingSettings') }}</span>
+    </el-divider>
+    
+    <el-form-item
+      :label="$t('admin.providers.enableTaskPolling')"
+      prop="enableTaskPolling"
+    >
+      <el-switch
+        v-model="modelValue.enableTaskPolling"
+        :active-text="$t('common.yes')"
+        :inactive-text="$t('common.no')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.enableTaskPollingTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      v-if="modelValue.enableTaskPolling"
+      :label="$t('admin.providers.taskPollInterval')"
+      prop="taskPollInterval"
+    >
+      <el-input-number
+        v-model="modelValue.taskPollInterval"
+        :min="5"
+        :max="300"
+        :step="5"
+        :controls="false"
+        placeholder="60"
+        style="width: 200px"
+      />
+      <span style="margin-left: 10px; color: #666;">{{ $t('common.seconds') }}</span>
+    </el-form-item>
+    <div
+      v-if="modelValue.enableTaskPolling"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.taskPollIntervalTip') }}
+      </el-text>
+    </div>
+
+    <!-- 操作执行规则设置 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.executionRules') }}</span>
+    </el-divider>
+    
+    <el-form-item
+      :label="$t('admin.providers.executionRule')"
+      prop="executionRule"
+    >
+      <el-select
+        v-model="modelValue.executionRule"
+        :placeholder="$t('admin.providers.executionRulePlaceholder')"
+        style="width: 200px"
+      >
+        <el-option
+          :label="$t('admin.providers.executionRuleAuto')"
+          value="auto"
+        >
+          <span>{{ $t('admin.providers.executionRuleAuto') }}</span>
+          <span style="float: right; color: #8492a6; font-size: 12px;">{{ $t('admin.providers.executionRuleAutoTip') }}</span>
+        </el-option>
+        <el-option
+          :label="$t('admin.providers.executionRuleAPIOnly')"
+          value="api_only"
+        >
+          <span>{{ $t('admin.providers.executionRuleAPIOnly') }}</span>
+          <span style="float: right; color: #8492a6; font-size: 12px;">{{ $t('admin.providers.executionRuleAPIOnlyTip') }}</span>
+        </el-option>
+        <el-option
+          :label="$t('admin.providers.executionRuleSSHOnly')"
+          value="ssh_only"
+        >
+          <span>{{ $t('admin.providers.executionRuleSSHOnly') }}</span>
+          <span style="float: right; color: #8492a6; font-size: 12px;">{{ $t('admin.providers.executionRuleSSHOnlyTip') }}</span>
+        </el-option>
+      </el-select>
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.executionRuleTip') }}
+      </el-text>
+    </div>
+
+    <!-- 申请领取控制 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.applicationControl') }}</span>
+    </el-divider>
+
+    <el-form-item
+      :label="$t('admin.providers.redeemCodeOnly')"
+      prop="redeemCodeOnly"
+    >
+      <el-switch
+        v-model="modelValue.redeemCodeOnly"
+        :active-text="$t('common.yes')"
+        :inactive-text="$t('common.no')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.redeemCodeOnlyTip') }}
+      </el-text>
+    </div>
+
+    <!-- 硬件监控 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.hardwareMonitoring') }}</span>
+    </el-divider>
+
+    <el-form-item
+      :label="$t('admin.providers.enableResourceMonitoring')"
+      prop="enableResourceMonitoring"
+    >
+      <el-switch
+        v-model="modelValue.enableResourceMonitoring"
+        :active-text="$t('admin.providers.enabled')"
+        :inactive-text="$t('admin.providers.disabled')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.enableResourceMonitoringTip') }}
+      </el-text>
+    </div>
+
+    <!-- 生命周期与流量处置策略 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.lifecyclePolicy') }}</span>
+    </el-divider>
+
+    <el-form-item
+      :label="$t('admin.providers.trafficOverLimitAction')"
+      prop="trafficOverLimitAction"
+    >
+      <el-select
+        v-model="modelValue.trafficOverLimitAction"
+        :placeholder="$t('admin.providers.trafficOverLimitActionPlaceholder')"
+        style="width: 260px"
+      >
+        <el-option
+          :label="$t('admin.providers.trafficActionStop')"
+          value="stop"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficActionSpeedLimit')"
+          value="speed_limit"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficActionFreeze')"
+          value="freeze"
+        />
+        <el-option
+          :label="$t('admin.providers.trafficActionMarkOnly')"
+          value="mark_only"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.trafficOverLimitActionTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      v-if="modelValue.trafficOverLimitAction === 'speed_limit'"
+      :label="$t('admin.providers.trafficSpeedLimitKbps')"
+      prop="trafficSpeedLimitKbps"
+    >
+      <el-input-number
+        v-model="modelValue.trafficSpeedLimitKbps"
+        :min="1"
+        :max="1048576"
+        :step="128"
+        :controls="false"
+        style="width: 200px"
+      />
+      <span style="margin-left: 10px; color: #666;">Kbps</span>
+    </el-form-item>
+
+    <el-form-item
+      :label="$t('admin.providers.trafficQuotaVisible')"
+      prop="trafficQuotaVisible"
+    >
+      <el-switch
+        v-model="modelValue.trafficQuotaVisible"
+        :active-text="$t('common.yes')"
+        :inactive-text="$t('common.no')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.trafficQuotaVisibleTip') }}
+      </el-text>
+    </div>
+
+    <!-- WebVNC 设置 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.webVncSettings') }}</span>
+    </el-divider>
+
+    <el-form-item
+      :label="$t('admin.providers.enableVNC')"
+      prop="enableVNC"
+    >
+      <el-switch
+        v-model="modelValue.enableVNC"
+        :active-text="$t('common.yes')"
+        :inactive-text="$t('common.no')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.enableVNCTip') }}
+      </el-text>
+    </div>
+
+    <template v-if="modelValue.enableVNC">
+      <el-form-item
+        :label="$t('admin.providers.vncBasePort')"
+        prop="vncBasePort"
+      >
+        <el-input-number
+          v-model="modelValue.vncBasePort"
+          :min="1"
+          :max="65535"
+          :step="1"
+          :controls="false"
+          placeholder="5900"
+          style="width: 200px"
+        />
+      </el-form-item>
+      <div
+        class="form-tip"
+        style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+      >
+        <el-text
+          size="small"
+          type="info"
+        >
+          {{ $t('admin.providers.vncBasePortTip') }}
+        </el-text>
+      </div>
+
+      <el-form-item
+        :label="$t('admin.providers.vncHost')"
+        prop="vncHost"
+      >
+        <el-input
+          v-model="modelValue.vncHost"
+          :placeholder="$t('admin.providers.vncHostPlaceholder')"
+          clearable
+          style="width: 400px"
+        />
+      </el-form-item>
+      <div
+        class="form-tip"
+        style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+      >
+        <el-text
+          size="small"
+          type="info"
+        >
+          {{ $t('admin.providers.vncHostTip') }}
+        </el-text>
+      </div>
+    </template>
+
+    <!-- 域名反向代理设置 -->
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.domainProxy') }}</span>
+    </el-divider>
+
+    <el-form-item
+      :label="$t('admin.providers.enableDomainBinding')"
+      prop="enableDomainBinding"
+    >
+      <el-switch
+        v-model="modelValue.enableDomainBinding"
+        :active-text="$t('admin.providers.enabled')"
+        :inactive-text="$t('admin.providers.disabled')"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.enableDomainBindingTip') }}
+      </el-text>
+    </div>
+
+    <template v-if="modelValue.enableDomainBinding">
+      <el-form-item
+        :label="$t('admin.providers.proxyEnableHTTP')"
+        prop="proxyEnableHttp"
+      >
+        <el-switch
+          v-model="modelValue.proxyEnableHttp"
+          :active-text="$t('common.yes')"
+          :inactive-text="$t('common.no')"
+        />
+      </el-form-item>
+      <div
+        class="form-tip"
+        style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+      >
+        <el-text
+          size="small"
+          type="info"
+        >
+          {{ $t('admin.providers.proxyEnableHTTPTip') }}
+        </el-text>
+      </div>
+
+      <el-form-item
+        v-if="modelValue.proxyEnableHttp"
+        :label="$t('admin.providers.proxyHTTPPort')"
+        prop="proxyHttpPort"
+      >
+        <el-input-number
+          v-model="modelValue.proxyHttpPort"
+          :min="1"
+          :max="65535"
+          :step="1"
+          :controls="false"
+          placeholder="80"
+          style="width: 200px"
+        />
+      </el-form-item>
+      <div
+        v-if="modelValue.proxyEnableHttp"
+        class="form-tip"
+        style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+      >
+        <el-text
+          size="small"
+          type="info"
+        >
+          {{ $t('admin.providers.proxyHTTPPortTip') }}
+        </el-text>
+      </div>
+
+      <el-form-item
+        :label="$t('admin.providers.proxyEnableHTTPS')"
+        prop="proxyEnableHttps"
+      >
+        <el-switch
+          v-model="modelValue.proxyEnableHttps"
+          :active-text="$t('common.yes')"
+          :inactive-text="$t('common.no')"
+        />
+      </el-form-item>
+      <div
+        class="form-tip"
+        style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+      >
+        <el-text
+          size="small"
+          type="info"
+        >
+          {{ $t('admin.providers.proxyEnableHTTPSTip') }}
+        </el-text>
+      </div>
+
+      <template v-if="modelValue.proxyEnableHttps">
+        <el-form-item
+          :label="$t('admin.providers.proxyHTTPSPort')"
+          prop="proxyHttpsPort"
+        >
+          <el-input-number
+            v-model="modelValue.proxyHttpsPort"
+            :min="1"
+            :max="65535"
+            :step="1"
+            :controls="false"
+            placeholder="443"
+            style="width: 200px"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.proxyHTTPSPortTip') }}
+          </el-text>
+        </div>
+
+        <el-form-item
+          :label="$t('admin.providers.proxyTLSCertPath')"
+          prop="proxyTlsCertPath"
+        >
+          <el-input
+            v-model="modelValue.proxyTlsCertPath"
+            :placeholder="$t('admin.providers.proxyTLSCertPathPlaceholder')"
+            clearable
+            style="width: 400px"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.proxyTLSCertPathTip') }}
+          </el-text>
+        </div>
+
+        <el-form-item
+          :label="$t('admin.providers.proxyTLSKeyPath')"
+          prop="proxyTlsKeyPath"
+        >
+          <el-input
+            v-model="modelValue.proxyTlsKeyPath"
+            :placeholder="$t('admin.providers.proxyTLSKeyPathPlaceholder')"
+            clearable
+            style="width: 400px"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.proxyTLSKeyPathTip') }}
+          </el-text>
+        </div>
+      </template>
+    </template>
+  </el-form>
+</template>
+
+<script setup>
+defineProps({
+  modelValue: {
+    type: Object,
+    required: true
+  }
+})
+</script>
+
+<style scoped>
+.server-form {
+  max-height: 500px;
+  overflow-y: auto;
+  padding-right: 10px;
+}
+
+.form-tip {
+  margin-top: 5px;
+}
+</style>

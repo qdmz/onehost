@@ -1,0 +1,819 @@
+package proxmox
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+
+	"oneclickvirt/global"
+	"oneclickvirt/provider"
+	"oneclickvirt/provider/health"
+	"oneclickvirt/utils"
+
+	"go.uber.org/zap"
+)
+
+// Proxmox VMID分配常量
+// VMID和内网IP解耦设计：VMID使用Proxmox标准范围，IP使用完整网段
+const (
+	// MinVMID 最小VMID，Proxmox标准要求≥100
+	MinVMID = 100
+	// MaxVMID 最大VMID，支持更大规模部署
+	MaxVMID = 999
+	// MaxInstances 最大实例数量（100-999共900个，但受限于IP地址池253个）
+	MaxInstances = 900
+
+	// InternalIPPrefix 内网IP前缀
+	InternalIPPrefix = "172.16.1"
+	// InternalGateway 内网网关（172.16.1.1）
+	InternalGateway = "172.16.1.1"
+	// MinInternalIPLastOctet 内网IP最后一个八位组的最小值（保留.1给网关）
+	MinInternalIPLastOctet = 2
+	// MaxInternalIPLastOctet 内网IP最后一个八位组的最大值（保留.255给广播）
+	MaxInternalIPLastOctet = 254
+	// MaxIPAddresses 最大可用IP地址数（2-254共253个）
+	MaxIPAddresses = 253
+)
+
+// VMIDToInternalIP 将VMID转换为内网IP地址
+// 使用循环映射算法，充分利用2-254的IP地址空间
+// 例如：VMID 100 -> 172.16.1.2, VMID 101 -> 172.16.1.3, ..., VMID 352 -> 172.16.1.254, VMID 353 -> 172.16.1.2
+func VMIDToInternalIP(vmid int) string {
+	if vmid < MinVMID || vmid > MaxVMID {
+		return ""
+	}
+	// 计算IP最后一个八位组：((VMID - 100) % 253) + 2
+	lastOctet := ((vmid-MinVMID)%MaxIPAddresses + MinInternalIPLastOctet)
+	return fmt.Sprintf("%s.%d", InternalIPPrefix, lastOctet)
+}
+
+// InternalIPToVMIDCandidates 将内网IP转换为可能的VMID列表
+// 由于使用循环映射，一个IP可能对应多个VMID，需要通过实际查询确认
+func InternalIPToVMIDCandidates(ip string) []int {
+	// 解析IP地址最后一个八位组
+	var lastOctet int
+	if _, err := fmt.Sscanf(ip, InternalIPPrefix+".%d", &lastOctet); err != nil {
+		return nil
+	}
+
+	if lastOctet < MinInternalIPLastOctet || lastOctet > MaxInternalIPLastOctet {
+		return nil
+	}
+
+	// 计算所有可能的VMID：base + n * 253，其中 n = 0, 1, 2, ...
+	candidates := make([]int, 0, 4) // 预分配，最多4个循环
+	base := MinVMID + (lastOctet - MinInternalIPLastOctet)
+	for vmid := base; vmid <= MaxVMID; vmid += MaxIPAddresses {
+		candidates = append(candidates, vmid)
+	}
+	return candidates
+}
+
+type ProxmoxProvider struct {
+	config           provider.NodeConfig
+	sshClient        *utils.SafeShellExecutor // 永不为nil，所有方法安全调用
+	apiClient        *http.Client
+	transport        *http.Transport
+	providerID       uint // 存储providerID用于清理
+	connected        bool
+	node             string // Proxmox 节点名
+	providerUUID     string // Provider UUID，用于查询数据库中的配置
+	healthChecker    health.HealthChecker
+	version          string             // Proxmox VE 版本，用于兼容性判断
+	mu               sync.RWMutex       // 保护并发访问
+	pendingVMIDs     map[int]bool       // 已分配但尚未创建完成的VMID集合，防止并发重复分配
+	imageImportGroup singleflight.Group // 防止同一镜像并发下载
+	kvmUnavailable   bool               // KVM硬件加速不可用时为true（软件模拟qemu64），此时所有等待时间翻倍
+	// 缓存的网桥名称（从NodeConfig加载，避免重复查询数据库）
+	bridgeNAT         string // NAT网桥名（脚本安装=vmbr1，第三方安装=配置值）
+	bridgeDedicatedV4 string // 独立IPv4网桥名（脚本安装=vmbr0，第三方安装=配置值）
+	bridgeDedicatedV6 string // 独立IPv6网桥名（脚本安装=vmbr2，第三方安装=配置值，可为空）
+	internalIPPrefix  string // NAT内网IP前缀（如 172.16.1）——第三方安装对应 NATSubnet，其他为包常量 InternalIPPrefix
+	internalGateway   string // NAT内网网关（如 172.16.1.1）——第三方安装对应 NATSubnet+1，其他为 InternalGateway
+}
+
+// waitScale 根据KVM可用性返回调整后的等待时间。
+// KVM不可用（软件模拟）时返回2倍时间，否则返回原始时间。
+func (p *ProxmoxProvider) waitScale(d time.Duration) time.Duration {
+	if p.kvmUnavailable {
+		return 2 * d
+	}
+	return d
+}
+
+func NewProxmoxProvider() provider.Provider {
+	// 创建独立的 Transport，不使用 sync.Pool
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	// 注册到清理管理器（自动去重）
+	provider.GetTransportCleanupManager().RegisterTransport(transport)
+	return &ProxmoxProvider{
+		sshClient: utils.NewSafeShellExecutor(nil),
+		transport: transport,
+		apiClient: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: transport,
+		},
+		pendingVMIDs: make(map[int]bool),
+	}
+}
+
+func (p *ProxmoxProvider) GetType() string {
+	return "proxmox"
+}
+
+func (p *ProxmoxProvider) GetName() string {
+	return p.config.Name
+}
+
+func (p *ProxmoxProvider) GetSupportedInstanceTypes() []string {
+	return []string{"container", "vm"}
+}
+
+func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfig) error {
+	p.config = config
+	p.providerUUID = config.UUID // 存储Provider UUID
+	p.providerID = config.ID     // 存储providerID
+	p.normalizeTokenConfig()
+	if err := p.configureAPITLS(p.config); err != nil {
+		return err
+	}
+
+	// 初始化网桥名称缓存（从NodeConfig中读取，避免重复查询数据库）
+	p.initBridgeNames(config)
+
+	// 注册transport并关联providerID
+	if p.transport != nil && p.providerID > 0 {
+		provider.GetTransportCleanupManager().RegisterTransportWithProvider(p.transport, p.providerID)
+	}
+
+	// 如果有本地存储的 Token 文件，尝试从文件加载 Token 信息
+	if err := p.loadTokenFromFiles(); err != nil {
+		global.APP_LOG.Warn("从本地文件加载token失败，使用配置值", zap.Error(err))
+	}
+	p.normalizeTokenConfig()
+
+	// 如果本地文件没有 Token，尝试从 NodeConfig 的扩展配置中解析
+	if !p.hasAPIAccess() {
+		if err := p.loadTokenFromConfig(); err != nil {
+			global.APP_LOG.Warn("从配置加载token失败，将仅使用SSH", zap.Error(err))
+		}
+	}
+
+	// 设置SSH超时配置
+	sshConnectTimeout := config.SSHConnectTimeout
+	sshExecuteTimeout := config.SSHExecuteTimeout
+	if sshConnectTimeout <= 0 {
+		sshConnectTimeout = 30 // 默认30秒
+	}
+	if sshExecuteTimeout <= 0 {
+		sshExecuteTimeout = 300 // 默认300秒
+	}
+
+	// 尝试 SSH 连接
+	sshConfig := utils.SSHConfig{
+		Host:           config.Host,
+		Port:           config.Port,
+		Username:       config.Username,
+		Password:       config.Password,
+		PrivateKey:     config.PrivateKey,
+		ConnectTimeout: time.Duration(sshConnectTimeout) * time.Second,
+		ExecuteTimeout: time.Duration(sshExecuteTimeout) * time.Second,
+	}
+
+	client, err := utils.NewSSHClient(sshConfig)
+	if err != nil {
+		return fmt.Errorf("failed to connect via SSH: %w", err)
+	}
+
+	p.sshClient.SetExecutor(client)
+	p.connected = true
+	if config.NodeInstallType != "third_party" {
+		p.detectScriptNATSubnet()
+	}
+
+	// 获取节点名：优先使用配置中的HostName（数据库存储的），否则动态获取
+	if config.HostName != "" {
+		p.node = config.HostName
+		global.APP_LOG.Debug("使用数据库配置的Proxmox主机名",
+			zap.String("hostName", p.node),
+			zap.String("provider", config.Name),
+			zap.String("host", utils.TruncateString(config.Host, 32)))
+	} else {
+		// 动态获取节点名
+		if err := p.getNodeName(ctx); err != nil {
+			global.APP_LOG.Warn("获取主机名失败，使用默认值",
+				zap.Error(err),
+				zap.String("host", utils.TruncateString(config.Host, 32)))
+			p.node = "pve" // 默认节点名
+		} else {
+			global.APP_LOG.Debug("动态获取Proxmox主机名成功",
+				zap.String("hostName", p.node),
+				zap.String("provider", config.Name),
+				zap.String("host", utils.TruncateString(config.Host, 32)))
+		}
+	}
+
+	// 初始化健康检查器，使用Provider的SSH连接，避免创建独立连接导致节点混淆
+	healthConfig := health.HealthConfig{
+		Host:          p.config.Host,
+		Port:          p.config.Port,
+		Username:      p.config.Username,
+		Password:      p.config.Password,
+		PrivateKey:    p.config.PrivateKey,
+		APIEnabled:    p.hasAPIAccess(),
+		APIPort:       8006,
+		APIScheme:     "https",
+		SSHEnabled:    true,
+		SkipTLSVerify: p.config.CACertPath == "",
+		CACertPath:    p.config.CACertPath,
+		Timeout:       30 * time.Second,
+		ServiceChecks: []string{"pvestatd", "pvedaemon", "pveproxy"},
+		Token:         p.config.Token,
+		TokenID:       p.config.TokenID,
+	}
+
+	zapLogger, _ := zap.NewProduction()
+	// 使用Provider的SSH连接创建健康检查器，确保在正确的节点上执行命令
+	p.healthChecker = health.NewProxmoxHealthCheckerWithSSH(healthConfig, zapLogger, client.GetUnderlyingClient())
+
+	// 获取 Proxmox 版本信息
+	if err := p.getProxmoxVersion(); err != nil {
+		global.APP_LOG.Warn("获取 Proxmox 版本失败，将使用保守的兼容性设置",
+			zap.Error(err))
+	}
+
+	global.APP_LOG.Info("Proxmox provider SSH连接成功",
+		zap.String("host", utils.TruncateString(config.Host, 32)),
+		zap.Int("port", config.Port),
+		zap.String("node", utils.TruncateString(p.node, 32)),
+		zap.String("version", p.version),
+		zap.Bool("supportsFstrim", p.supportsCloneFstrim()),
+		zap.Bool("hasToken", p.hasAPIAccess()))
+
+	return nil
+}
+
+func (p *ProxmoxProvider) ConnectAgent(executor utils.ShellExecutor, config provider.NodeConfig) error {
+	p.config = config
+	p.providerUUID = config.UUID
+	p.providerID = config.ID
+	p.normalizeTokenConfig()
+	if err := p.configureAPITLS(p.config); err != nil {
+		return err
+	}
+	p.sshClient.SetExecutor(executor)
+	p.connected = true
+	p.healthChecker = nil
+
+	p.initBridgeNames(config)
+
+	// 使用配置中的 HostName 作为节点名默认值，避免阻塞
+	p.node = config.HostName
+	if p.node == "" {
+		p.node = "pve"
+	}
+
+	// Agent 模式下 getNodeName 和 getProxmoxVersion 改为异步，
+	// 避免因 Agent 尚未建立 WebSocket 连接而阻塞 Provider 加载
+	if config.NodeInstallType != "third_party" {
+		go p.detectScriptNATSubnet()
+	}
+
+	go func() {
+		if err := p.getNodeName(context.Background()); err != nil {
+			global.APP_LOG.Warn("Agent模式下Proxmox节点名获取失败", zap.Error(err))
+		} else {
+			global.APP_LOG.Debug("Agent模式下Proxmox节点名获取成功",
+				zap.String("node", p.node))
+		}
+	}()
+
+	go func() {
+		if err := p.getProxmoxVersion(); err != nil {
+			global.APP_LOG.Warn("Agent模式下Proxmox版本获取失败", zap.Error(err))
+		}
+	}()
+
+	global.APP_LOG.Info("Proxmox provider (Agent模式) 加载完成",
+		zap.String("name", config.Name),
+		zap.String("type", config.Type),
+		zap.String("node", utils.TruncateString(p.node, 32)))
+	return nil
+}
+
+func (p *ProxmoxProvider) configureAPITLS(config provider.NodeConfig) error {
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	caPath := strings.TrimSpace(config.CACertPath)
+	if caPath == "" {
+		// A stock PVE node uses a self-signed certificate. Keep compatibility
+		// only when the administrator has not supplied trust material.
+		tlsConfig.InsecureSkipVerify = true // #nosec G402
+	} else {
+		caPEM, err := os.ReadFile(caPath)
+		if err != nil {
+			return fmt.Errorf("读取Proxmox API CA证书失败: %w", err)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(caPEM) {
+			return fmt.Errorf("Proxmox API CA证书不包含有效PEM证书")
+		}
+		tlsConfig.RootCAs = roots
+	}
+	p.transport.TLSClientConfig = tlsConfig
+	return nil
+}
+
+func (p *ProxmoxProvider) Disconnect(ctx context.Context) error {
+	p.mu.Lock()
+	p.sshClient.Close() // SafeShellExecutor.Close 内部清理executor，无需置nil
+	p.mu.Unlock()
+
+	// 按providerID清理transport
+	if p.providerID > 0 {
+		provider.GetTransportCleanupManager().CleanupProvider(p.providerID)
+	} else if p.transport != nil {
+		// fallback: 如果providerID未设置，使用原来的方法
+		p.transport.CloseIdleConnections()
+		provider.GetTransportCleanupManager().UnregisterTransport(p.transport)
+	}
+	p.transport = nil
+
+	p.connected = false
+	return nil
+}
+
+func (p *ProxmoxProvider) IsConnected() bool {
+	return p.connected && p.sshClient.HasExecutor() && p.sshClient.IsHealthy()
+}
+
+// EnsureConnection 确保SSH连接可用，如果连接不健康则尝试重连
+func (p *ProxmoxProvider) EnsureConnection() error {
+	if !p.sshClient.HasExecutor() {
+		return fmt.Errorf("SSH client not initialized")
+	}
+
+	if !p.sshClient.IsHealthy() {
+		global.APP_LOG.Warn("Proxmox Provider SSH连接不健康，尝试重连",
+			zap.String("host", utils.TruncateString(p.config.Host, 32)),
+			zap.Int("port", p.config.Port))
+
+		if err := p.sshClient.Reconnect(); err != nil {
+			p.connected = false
+			return fmt.Errorf("failed to reconnect SSH: %w", err)
+		}
+		if !p.sshClient.IsHealthy() {
+			p.connected = false
+			return fmt.Errorf("connection remains unhealthy after reconnect")
+		}
+
+		global.APP_LOG.Info("Proxmox Provider SSH连接重建成功",
+			zap.String("host", utils.TruncateString(p.config.Host, 32)),
+			zap.Int("port", p.config.Port))
+	}
+
+	return nil
+}
+
+func (p *ProxmoxProvider) HealthCheck(ctx context.Context) (*health.HealthResult, error) {
+	if p.healthChecker == nil {
+		if !p.sshClient.HasExecutor() {
+			return nil, fmt.Errorf("health checker not initialized")
+		}
+		status := health.HealthStatusUnhealthy
+		sshStatus := "offline"
+		if p.sshClient.IsHealthy() {
+			status = health.HealthStatusHealthy
+			sshStatus = "online"
+		}
+		return &health.HealthResult{
+			Status:        status,
+			Timestamp:     time.Now(),
+			SSHStatus:     sshStatus,
+			APIStatus:     "unknown",
+			ServiceStatus: "unknown",
+			HostName:      p.config.HostName,
+		}, nil
+	}
+	return p.healthChecker.CheckHealth(ctx)
+}
+
+func (p *ProxmoxProvider) GetHealthChecker() health.HealthChecker {
+	return p.healthChecker
+}
+
+func (p *ProxmoxProvider) GetVersion() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.version
+}
+
+// initBridgeNames 从 NodeConfig 初始化网桥名称缓存
+// 脚本安装(script)时使用固定的 vmbr0/vmbr1/vmbr2；
+// 第三方安装(third_party)时使用配置值，若配置为空则回退到默认值。
+func (p *ProxmoxProvider) initBridgeNames(config provider.NodeConfig) {
+	p.internalIPPrefix = ""
+	p.internalGateway = ""
+	if config.NodeInstallType == "third_party" {
+		p.bridgeNAT = config.BridgeNAT
+		if p.bridgeNAT == "" {
+			p.bridgeNAT = "vmbr1"
+		}
+		p.bridgeDedicatedV4 = config.BridgeDedicatedV4
+		if p.bridgeDedicatedV4 == "" {
+			p.bridgeDedicatedV4 = "vmbr0"
+		}
+		p.bridgeDedicatedV6 = config.BridgeDedicatedV6 // 可以为空（表示无独立IPv6桥）
+
+	} else {
+		// 脚本安装或未指定：使用标准 vmbr 命名
+		p.bridgeNAT = "vmbr1"
+		p.bridgeDedicatedV4 = "vmbr0"
+		p.bridgeDedicatedV6 = "vmbr2"
+	}
+	if config.NodeInstallType == "third_party" && config.NATSubnet != "" && !p.applyNATSubnet(config.NATSubnet) {
+		global.APP_LOG.Warn("忽略无效的Proxmox NAT网段",
+			zap.String("natSubnet", config.NATSubnet))
+	}
+	// 回退到包级常量（未配置或脚本安装时）
+	if p.internalIPPrefix == "" {
+		p.internalIPPrefix = InternalIPPrefix
+	}
+	if p.internalGateway == "" {
+		p.internalGateway = InternalGateway
+	}
+	global.APP_LOG.Debug("初始化Proxmox网桥配置",
+		zap.String("nodeInstallType", config.NodeInstallType),
+		zap.String("bridgeNAT", p.bridgeNAT),
+		zap.String("bridgeDedicatedV4", p.bridgeDedicatedV4),
+		zap.String("bridgeDedicatedV6", p.bridgeDedicatedV6),
+		zap.String("internalIPPrefix", p.internalIPPrefix),
+		zap.String("internalGateway", p.internalGateway))
+}
+
+// applyNATSubnet updates the cached guest prefix. Proxmox guest allocation is
+// currently /24-based, so reject wider/narrower networks instead of silently
+// producing addresses outside the configured subnet.
+func (p *ProxmoxProvider) applyNATSubnet(cidr string) bool {
+	ip, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil || ip.To4() == nil {
+		return false
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 || ones != 24 || !ip.Equal(network.IP) {
+		return false
+	}
+	octets := network.IP.To4()
+	p.internalIPPrefix = fmt.Sprintf("%d.%d.%d", octets[0], octets[1], octets[2])
+	p.internalGateway = p.internalIPPrefix + ".1"
+	return true
+}
+
+func (p *ProxmoxProvider) detectScriptNATSubnet() {
+	output, err := p.sshClient.Execute("cat /usr/local/bin/pve_nat_subnet 2>/dev/null")
+	if err != nil {
+		return
+	}
+	cidr := strings.TrimSpace(output)
+	if p.applyNATSubnet(cidr) {
+		global.APP_LOG.Info("检测到脚本安装的Proxmox NAT网段", zap.String("natSubnet", cidr))
+	} else if cidr != "" {
+		global.APP_LOG.Warn("远端Proxmox NAT网段文件无效", zap.String("natSubnet", cidr))
+	}
+}
+
+// getBridgeName 返回指定类型的网桥名称
+// bridgeType: "nat" → NAT网桥(vmbr1), "dedicated_v4" → 独立IPv4网桥(vmbr0), "dedicated_v6" → 独立IPv6网桥(vmbr2)
+func (p *ProxmoxProvider) getBridgeName(bridgeType string) string {
+	switch bridgeType {
+	case "nat":
+		return p.bridgeNAT
+	case "dedicated_v4":
+		return p.bridgeDedicatedV4
+	case "dedicated_v6":
+		return p.bridgeDedicatedV6
+	}
+	return p.bridgeNAT // 默认返回NAT网桥
+}
+
+// vmidToInternalIP 将 VMID 转换为内网IP地址，使用实例缓存的 internalIPPrefix
+func (p *ProxmoxProvider) vmidToInternalIP(vmid int) string {
+	if vmid < MinVMID || vmid > MaxVMID {
+		return ""
+	}
+	prefix := p.internalIPPrefix
+	if prefix == "" {
+		prefix = InternalIPPrefix
+	}
+	lastOctet := ((vmid-MinVMID)%MaxIPAddresses + MinInternalIPLastOctet)
+	return fmt.Sprintf("%s.%d", prefix, lastOctet)
+}
+
+// getInternalGateway 返回NAT内网网关地址
+func (p *ProxmoxProvider) getInternalGateway() string {
+	if p.internalGateway != "" {
+		return p.internalGateway
+	}
+	return InternalGateway
+}
+
+// 获取节点名
+func (p *ProxmoxProvider) getNodeName(ctx context.Context) error {
+	if !p.sshClient.HasExecutor() {
+		return fmt.Errorf("SSH client不可用")
+	}
+	output, err := p.sshClient.Execute("hostname")
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.node = utils.CleanCommandOutput(output)
+	p.mu.Unlock()
+	return nil
+}
+
+// ExecuteSSHCommand 执行SSH命令
+func (p *ProxmoxProvider) ExecuteSSHCommand(ctx context.Context, command string) (string, error) {
+	if !p.connected || !p.sshClient.HasExecutor() {
+		return "", fmt.Errorf("Proxmox provider not connected")
+	}
+
+	global.APP_LOG.Debug("执行SSH命令",
+		zap.String("command", utils.RedactSensitiveCommand(command, 200)))
+
+	output, err := p.sshClient.Execute(command)
+	if err != nil {
+		global.APP_LOG.Error("SSH命令执行失败",
+			zap.String("command", utils.RedactSensitiveCommand(command, 200)),
+			zap.String("output", utils.TruncateString(output, 500)),
+			zap.Error(err))
+		return output, fmt.Errorf("SSH command execution failed: %w; output: %s", err, utils.TruncateString(output, 2000))
+	}
+
+	return output, nil
+}
+
+// 检查是否有 API 访问权限
+func (p *ProxmoxProvider) hasAPIAccess() bool {
+	// 检查是否配置了 API Token ID 和 Token Secret
+	return p.config.TokenID != "" && p.config.Token != ""
+}
+
+// shouldUseAPI 根据执行规则判断是否应该使用API
+func (p *ProxmoxProvider) shouldUseAPI() bool {
+	switch p.config.ExecutionRule {
+	case "api_only":
+		return p.hasAPIAccess()
+	case "ssh_only":
+		return false
+	case "auto":
+		fallthrough
+	default:
+		return p.hasAPIAccess()
+	}
+}
+
+// shouldUseSSH 根据执行规则判断是否应该使用SSH
+func (p *ProxmoxProvider) shouldUseSSH() bool {
+	p.mu.RLock()
+	client := p.sshClient
+	p.mu.RUnlock()
+	switch p.config.ExecutionRule {
+	case "api_only":
+		return false
+	case "ssh_only":
+		return client != nil && p.connected
+	case "auto":
+		fallthrough
+	default:
+		return client != nil && p.connected
+	}
+}
+
+// GetIPv6NetworkInterface 获取实例对应的宿主机IPv6网络接口名称
+// 对于Proxmox，根据实例类型和ID识别：
+// - LXC容器：veth<ctid>i0 或 veth<ctid>i1（如果有多个网络接口）
+// - KVM虚拟机：tap<vmid>i0 或 tap<vmid>i1（如果有多个网络接口）
+func (p *ProxmoxProvider) GetIPv6NetworkInterface(ctx context.Context, instanceName string) (string, error) {
+	// 从数据库查询实例信息，检查是否有公网IPv6地址
+	var instance struct {
+		PublicIPv6 string
+	}
+	query := `SELECT public_ipv6 FROM instances WHERE name = ? AND provider_id = ?`
+	err := global.APP_DB.Raw(query, instanceName, p.providerID).Scan(&instance).Error
+	if err != nil || instance.PublicIPv6 == "" {
+		global.APP_LOG.Debug("实例没有公网IPv6地址，跳过IPv6网络接口检测",
+			zap.String("instanceName", instanceName),
+			zap.String("publicIPv6", instance.PublicIPv6),
+			zap.Error(err))
+		return "", fmt.Errorf("no public IPv6 address for instance %s", instanceName)
+	}
+
+	// 从实例名称中提取VMID/CTID和实例类型
+	vmid, instanceType, err := p.parseInstanceInfo(ctx, instanceName)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse instance info: %w", err)
+	}
+
+	// 根据实例类型构建可能的接口名称
+	var interfacePrefix string
+	if instanceType == "container" {
+		interfacePrefix = "veth"
+	} else {
+		interfacePrefix = "tap"
+	}
+
+	// 实例的宏机侧接口（tap/veth）是网桥端口，本身没有IPv6地址，
+	// IPv6地址配置在容器/虚拟机内部的eth1接口上。
+	// 因此不能通过读取的IPv6地址来判断接口类型，只能通过接口是否存在来判断：
+	// - i1 存在 → 实例配置了第二张网卡（net1），用于IPv6
+	// - 只有 i0 → 单网卡，允许回退到 i0
+	for _, ifIndex := range []string{"i1", "i0"} {
+		interfaceName := fmt.Sprintf("%s%s%s", interfacePrefix, vmid, ifIndex)
+		checkCmd := fmt.Sprintf("ip link show %s 2>/dev/null", interfaceName)
+		output, err := p.sshClient.Execute(checkCmd)
+		if err == nil && strings.TrimSpace(output) != "" {
+			global.APP_LOG.Debug("检测到Proxmox实例的IPv6网络接口",
+				zap.String("instanceName", instanceName),
+				zap.String("vmid", vmid),
+				zap.String("type", instanceType),
+				zap.String("interface", interfaceName))
+			return interfaceName, nil
+		}
+	}
+
+	return "", fmt.Errorf("no IPv6 network interface found for instance %s", instanceName)
+}
+
+// parseInstanceInfo 从实例名称解析VMID和实例类型
+func (p *ProxmoxProvider) parseInstanceInfo(ctx context.Context, instanceName string) (string, string, error) {
+	// 首先尝试从数据库中查找实例
+	var instance struct {
+		ProviderVMID string
+		InstanceType string
+	}
+
+	query := `SELECT provider_vm_id, instance_type FROM instances WHERE name = ? AND provider_id = ?`
+	err := global.APP_DB.Raw(query, instanceName, p.providerID).Scan(&instance).Error
+	if err == nil && instance.ProviderVMID != "" {
+		return instance.ProviderVMID, instance.InstanceType, nil
+	}
+
+	// 如果数据库查询失败，尝试通过SSH命令查询
+	// 先检查是否是容器
+	checkContainerCmd := fmt.Sprintf("pct list | grep -w '%s' | awk '{print $1}'", instanceName)
+	output, err := p.sshClient.Execute(checkContainerCmd)
+	if err == nil && strings.TrimSpace(output) != "" {
+		return strings.TrimSpace(output), "container", nil
+	}
+
+	// 再检查是否是虚拟机
+	checkVMCmd := fmt.Sprintf("qm list | grep -w '%s' | awk '{print $1}'", instanceName)
+	output, err = p.sshClient.Execute(checkVMCmd)
+	if err == nil && strings.TrimSpace(output) != "" {
+		return strings.TrimSpace(output), "vm", nil
+	}
+
+	return "", "", fmt.Errorf("instance %s not found", instanceName)
+}
+
+// shouldFallbackToSSH 根据执行规则判断 API失败时是否可以回退到SSH
+func (p *ProxmoxProvider) shouldFallbackToSSH() bool {
+	switch p.config.ExecutionRule {
+	case "api_only":
+		return false
+	case "ssh_only":
+		return false
+	case "auto":
+		fallthrough
+	default:
+		return true
+	}
+}
+
+// ensureSSHBeforeFallback 在回退到SSH前检查SSH连接健康状态
+func (p *ProxmoxProvider) ensureSSHBeforeFallback(apiErr error, operation string) error {
+	if !p.shouldFallbackToSSH() {
+		return fmt.Errorf("API调用失败且不允许回退到SSH: %w", apiErr)
+	}
+
+	global.APP_LOG.Warn("Proxmox API失败，准备回退到SSH",
+		zap.String("operation", operation),
+		zap.Error(apiErr))
+
+	if err := p.EnsureConnection(); err != nil {
+		global.APP_LOG.Error("Proxmox回退SSH前连接检查失败",
+			zap.String("operation", operation),
+			zap.Error(err))
+		return fmt.Errorf("API失败且SSH连接不可用: API错误=%v, SSH错误=%v", apiErr, err)
+	}
+
+	global.APP_LOG.Info(fmt.Sprintf("Proxmox回退到SSH方式 - %s", operation))
+	return nil
+}
+
+// setAPIAuth 为 HTTP 请求设置 API 认证头
+func (p *ProxmoxProvider) setAPIAuth(req *http.Request) {
+	if p.config.TokenID != "" && p.config.Token != "" {
+		// 清理Token ID和Token中的不可见字符（换行符、回车符、制表符等）
+		cleanTokenID := strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(p.config.TokenID), "\n", ""), "\r", "")
+		cleanToken := strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(p.config.Token), "\n", ""), "\r", "")
+
+		// 使用 API Token 认证，格式: PVEAPIToken=USER@REALM!TOKENID=SECRET
+		authHeader := fmt.Sprintf("PVEAPIToken=%s=%s", cleanTokenID, cleanToken)
+		req.Header.Set("Authorization", authHeader)
+	}
+}
+
+// getProxmoxVersion 获取 Proxmox VE 版本
+func (p *ProxmoxProvider) getProxmoxVersion() error {
+	if !p.sshClient.HasExecutor() {
+		return fmt.Errorf("SSH client not connected")
+	}
+
+	// 尝试通过 pveversion 命令获取版本
+	output, err := p.sshClient.Execute("pveversion")
+	if err != nil {
+		global.APP_LOG.Warn("获取 Proxmox 版本失败，假设为较新版本",
+			zap.Error(err))
+		p.mu.Lock()
+		p.version = "unknown"
+		p.mu.Unlock()
+		return err
+	}
+
+	// 解析版本号，输出格式类似: pve-manager/8.1.3/b46aac3b8bb4enji (running kernel: 6.5.11-7-pve)
+	// 或: pve-manager/7.4-16/2346e0b0 (running kernel: 5.15.107-2-pve)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "pve-manager/") {
+			parts := strings.Split(line, "/")
+			if len(parts) >= 2 {
+				versionStr := parts[1]
+				p.mu.Lock()
+				p.version = versionStr
+				p.mu.Unlock()
+				global.APP_LOG.Debug("获取 Proxmox 版本成功",
+					zap.String("version", p.version),
+					zap.String("node", p.node))
+				return nil
+			}
+		}
+	}
+
+	global.APP_LOG.Warn("无法解析 Proxmox 版本信息，假设为较新版本",
+		zap.String("output", output))
+	p.mu.Lock()
+	p.version = "unknown"
+	p.mu.Unlock()
+	return fmt.Errorf("无法解析版本信息")
+}
+
+// supportsCloneFstrim 检查是否支持 fstrim_cloned_disks 参数（PVE 8.0+）
+func (p *ProxmoxProvider) supportsCloneFstrim() bool {
+	if p.version == "" || p.version == "unknown" {
+		// 如果版本未知，为了兼容性，不使用该参数
+		return false
+	}
+
+	// 解析主版本号
+	parts := strings.Split(p.version, ".")
+	if len(parts) == 0 {
+		return false
+	}
+
+	// 提取主版本号（可能包含 -beta 等后缀）
+	majorStr := strings.Split(parts[0], "-")[0]
+	var major int
+	if _, err := fmt.Sscanf(majorStr, "%d", &major); err != nil {
+		global.APP_LOG.Warn("无法解析 Proxmox 主版本号，不使用 fstrim_cloned_disks",
+			zap.String("version", p.version),
+			zap.Error(err))
+		return false
+	}
+
+	// PVE 8.0 及以上支持 fstrim_cloned_disks
+	return major >= 8
+}
+
+func init() {
+	provider.RegisterProvider("proxmox", NewProxmoxProvider)
+	provider.RegisterProvider("proxmoxve", NewProxmoxProvider)
+}

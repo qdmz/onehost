@@ -1,0 +1,513 @@
+package provider
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"oneclickvirt/constant"
+	"oneclickvirt/global"
+	adminModel "oneclickvirt/model/admin"
+	providerModel "oneclickvirt/model/provider"
+	resourceModel "oneclickvirt/model/resource"
+	systemModel "oneclickvirt/model/system"
+	userModel "oneclickvirt/model/user"
+	"oneclickvirt/service/cache"
+	"oneclickvirt/service/database"
+	"oneclickvirt/service/resources"
+	"oneclickvirt/service/taskgate"
+	"oneclickvirt/service/userquota"
+	"oneclickvirt/utils"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// GetAvailableProviders 获取可用节点列表
+// GetSystemImages 获取系统镜像列表
+// GetInstanceConfig 获取实例配置选项 - 根据用户配额和节点限制动态过滤
+// GetFilteredSystemImages 根据Provider和实例类型获取过滤后的系统镜像列表
+// CreateUserInstance 创建用户实例 - 异步处理版本
+func (s *Service) CreateUserInstance(userID uint, req userModel.CreateInstanceRequest) (*adminModel.Task, error) {
+	global.APP_LOG.Info("开始创建用户实例",
+		zap.Uint("userID", userID),
+		zap.Uint("providerId", req.ProviderId),
+		zap.Uint("imageId", req.ImageId),
+		zap.String("cpuId", req.CPUId),
+		zap.String("memoryId", req.MemoryId),
+		zap.String("diskId", req.DiskId),
+		zap.String("bandwidthId", req.BandwidthId),
+		zap.String("description", req.Description))
+
+	if err := taskgate.EnsureAccepting(); err != nil {
+		return nil, err
+	}
+
+	// 快速验证基本参数
+	var provider providerModel.Provider
+	if err := global.APP_DB.First(&provider, req.ProviderId).Error; err != nil {
+		global.APP_LOG.Error("节点不存在", zap.Uint("providerId", req.ProviderId), zap.Error(err))
+		return nil, errors.New("节点不存在")
+	}
+
+	providerAvailable := (provider.ConnectionType == "agent" && provider.AgentStatus == "online") ||
+		(provider.ConnectionType != "agent" && (provider.Status == "active" || provider.Status == "partial"))
+	if !providerAvailable {
+		global.APP_LOG.Error("服务器不可用",
+			zap.Uint("providerId", req.ProviderId),
+			zap.String("status", provider.Status),
+			zap.String("connectionType", provider.ConnectionType),
+			zap.String("agentStatus", provider.AgentStatus))
+		return nil, errors.New("服务器不可用")
+	}
+
+	if !provider.AllowClaim || provider.IsFrozen {
+		global.APP_LOG.Error("服务器不可用",
+			zap.Uint("providerId", req.ProviderId),
+			zap.Bool("allowClaim", provider.AllowClaim),
+			zap.Bool("isFrozen", provider.IsFrozen))
+		return nil, errors.New("服务器不可用")
+	}
+
+	if provider.ExpiresAt != nil && provider.ExpiresAt.Before(time.Now()) {
+		global.APP_LOG.Error("服务器已过期",
+			zap.Uint("providerId", req.ProviderId),
+			zap.Time("expiresAt", *provider.ExpiresAt))
+		return nil, errors.New("服务器已过期")
+	}
+
+	if provider.RedeemCodeOnly {
+		global.APP_LOG.Info("节点仅支持兑换码领取，拒绝用户自行创建实例",
+			zap.Uint("userID", userID),
+			zap.Uint("providerId", req.ProviderId),
+			zap.String("providerName", provider.Name))
+		return nil, errors.New("该服务器仅支持兑换码领取，请使用兑换码区域领取实例")
+	}
+
+	// 检查Provider是否因流量超限被限制
+	if provider.TrafficLimited {
+		global.APP_LOG.Error("Provider因流量超限被限制，禁止申请新实例",
+			zap.Uint("providerId", req.ProviderId),
+			zap.String("providerName", provider.Name),
+			zap.Bool("trafficLimited", provider.TrafficLimited))
+		return nil, errors.New("该服务器因流量超限暂时不可用，请选择其他服务器或联系管理员")
+	}
+
+	var currentUser userModel.User
+	if err := global.APP_DB.Select("id", "traffic_limited").First(&currentUser, userID).Error; err != nil {
+		return nil, fmt.Errorf("获取用户信息失败: %w", err)
+	}
+	if currentUser.TrafficLimited {
+		global.APP_LOG.Error("用户因流量超限被限制，禁止申请新实例",
+			zap.Uint("userID", userID))
+		return nil, errors.New("当前账号当前流量周期总流量已超限，普通用户禁止申请新实例，请等待节点流量重置日自动重置或联系管理员")
+	}
+
+	var systemImage systemModel.SystemImage
+	if err := global.APP_DB.Where("id = ?", req.ImageId).First(&systemImage).Error; err != nil {
+		global.APP_LOG.Error("无效的镜像ID", zap.Uint("imageId", req.ImageId), zap.Error(err))
+		return nil, errors.New("无效的镜像ID")
+	}
+
+	if systemImage.Status != "active" {
+		global.APP_LOG.Error("所选镜像不可用",
+			zap.Uint("imageId", req.ImageId),
+			zap.String("imageStatus", systemImage.Status))
+		return nil, errors.New("所选镜像不可用")
+	}
+
+	// 验证Provider和Image的匹配性
+	if err := s.validateProviderImageCompatibility(&provider, &systemImage); err != nil {
+		global.APP_LOG.Error("Provider和镜像不匹配",
+			zap.Uint("providerId", req.ProviderId),
+			zap.Uint("imageId", req.ImageId),
+			zap.String("providerType", provider.Type),
+			zap.String("imageProviderType", systemImage.ProviderType),
+			zap.String("providerArch", provider.Architecture),
+			zap.String("imageArch", systemImage.Architecture),
+			zap.Error(err))
+		return nil, err
+	}
+
+	// 验证规格ID并获取规格信息，同时验证用户权限
+	global.APP_LOG.Debug("开始验证规格ID",
+		zap.String("cpuId", req.CPUId),
+		zap.String("memoryId", req.MemoryId),
+		zap.String("diskId", req.DiskId),
+		zap.String("bandwidthId", req.BandwidthId))
+
+	cpuSpec, err := constant.GetCPUSpecByID(req.CPUId)
+	if err != nil {
+		global.APP_LOG.Error("无效的CPU规格ID", zap.String("cpuId", req.CPUId), zap.Error(err))
+		return nil, fmt.Errorf("无效的CPU规格ID: %v", err)
+	}
+	global.APP_LOG.Debug("CPU规格验证成功", zap.String("cpuId", req.CPUId), zap.Int("cores", cpuSpec.Cores), zap.String("name", cpuSpec.Name))
+
+	memorySpec, err := constant.GetMemorySpecByID(req.MemoryId)
+	if err != nil {
+		global.APP_LOG.Error("无效的内存规格ID", zap.String("memoryId", req.MemoryId), zap.Error(err))
+		return nil, fmt.Errorf("无效的内存规格ID: %v", err)
+	}
+	global.APP_LOG.Debug("内存规格验证成功", zap.String("memoryId", req.MemoryId), zap.Int("sizeMB", memorySpec.SizeMB), zap.String("name", memorySpec.Name))
+
+	diskSpec, err := constant.GetDiskSpecByID(req.DiskId)
+	if err != nil {
+		global.APP_LOG.Error("无效的磁盘规格ID", zap.String("diskId", req.DiskId), zap.Error(err))
+		return nil, fmt.Errorf("无效的磁盘规格ID: %v", err)
+	}
+	global.APP_LOG.Debug("磁盘规格验证成功", zap.String("diskId", req.DiskId), zap.Int("sizeMB", diskSpec.SizeMB), zap.String("name", diskSpec.Name))
+
+	bandwidthSpec, err := constant.GetBandwidthSpecByID(req.BandwidthId)
+	if err != nil {
+		global.APP_LOG.Error("无效的带宽规格ID", zap.String("bandwidthId", req.BandwidthId), zap.Error(err))
+		return nil, fmt.Errorf("无效的带宽规格ID: %v", err)
+	}
+	global.APP_LOG.Debug("带宽规格验证成功", zap.String("bandwidthId", req.BandwidthId), zap.Int("speedMbps", bandwidthSpec.SpeedMbps), zap.String("name", bandwidthSpec.Name))
+
+	// 验证用户等级限制和资源规格权限
+	// 包含：全局等级限制 + Provider节点等级限制（取最小值）
+	// 验证：CPU、内存、磁盘、带宽规格是否超过限制
+	// 实例数量限制在事务内验证（防止并发问题）
+	if err := s.validateUserSpecPermissions(userID, req.ProviderId, cpuSpec, memorySpec, diskSpec, bandwidthSpec, req.OrderID); err != nil {
+		global.APP_LOG.Error("用户等级限制验证失败",
+			zap.Uint("userID", userID),
+			zap.Uint("providerId", req.ProviderId),
+			zap.String("cpuId", req.CPUId),
+			zap.String("memoryId", req.MemoryId),
+			zap.String("diskId", req.DiskId),
+			zap.String("bandwidthId", req.BandwidthId),
+			zap.Error(err))
+		return nil, err
+	}
+
+	// 验证实例的最低硬件要求（统一验证虚拟机和容器）
+	if err := s.validateInstanceMinimumRequirements(&systemImage, memorySpec, diskSpec, &provider); err != nil {
+		global.APP_LOG.Error("实例最低硬件要求验证失败",
+			zap.Uint("imageId", req.ImageId),
+			zap.String("imageName", systemImage.Name),
+			zap.String("instanceType", systemImage.InstanceType),
+			zap.String("providerType", provider.Type),
+			zap.Int("memoryMB", memorySpec.SizeMB),
+			zap.Int("diskMB", diskSpec.SizeMB),
+			zap.Error(err))
+		return nil, err
+	}
+
+	// 验证 GPU 直通配置（LXD/Incus 原生设备配置，Docker 家族 best-effort）
+	if req.GpuEnabled {
+		if !provider.GpuEnabled {
+			return nil, fmt.Errorf("该节点未启用GPU直通")
+		}
+		if !utils.SupportsContainerGPUProvider(provider.Type, systemImage.InstanceType) {
+			return nil, fmt.Errorf("GPU 直通仅支持 LXD/Incus/Docker/Podman/Containerd/Orbstack 的容器实例")
+		}
+		// 验证 GPU 设备 ID 格式
+		if err := validateGPUDeviceIDs(req.GpuDeviceIds); err != nil {
+			return nil, err
+		}
+	} else {
+		req.GpuDeviceIds = ""
+	}
+
+	global.APP_LOG.Debug("所有验证通过，开始创建实例",
+		zap.Uint("userID", userID),
+		zap.Uint("providerId", req.ProviderId),
+		zap.Uint("imageId", req.ImageId))
+
+	// 生成会话ID
+	sessionID := resources.GenerateSessionID()
+
+	// 使用原子化创建流程（最小化事务范围）
+	return s.createInstanceWithMinimalTransaction(userID, &req, sessionID, &systemImage, cpuSpec, memorySpec, diskSpec, bandwidthSpec)
+}
+
+// createInstanceWithMinimalTransaction 原子化实例创建流程
+// 只在真正需要原子性的操作中持有事务和行锁，最小化锁持有时间
+// 资源规格限制（CPU、内存、磁盘、带宽）已在事务外的 validateUserSpecPermissions 中验证
+// 这里只需验证并发敏感的实例数量限制
+func (s *Service) createInstanceWithMinimalTransaction(userID uint, req *userModel.CreateInstanceRequest, sessionID string, systemImage *systemModel.SystemImage, cpuSpec *constant.CPUSpec, memorySpec *constant.MemorySpec, diskSpec *constant.DiskSpec, bandwidthSpec *constant.BandwidthSpec) (*adminModel.Task, error) {
+	// 使用事务确保原子性，但只在关键操作中持有锁
+	var task *adminModel.Task
+	createTimeout := utils.GetCreateTaskTimeoutForImage("", systemImage.InstanceType, systemImage.OSType, systemImage.URL)
+	err := database.GetDatabaseService().ExecuteTransaction(context.Background(), func(tx *gorm.DB) error {
+		if err := taskgate.EnsureAcceptingInTx(tx); err != nil {
+			return err
+		}
+
+		// 在事务中验证实例数量限制（防止并发超配）
+		// 使用行锁保护，确保原子性
+		quotaService := resources.NewQuotaService()
+
+		// 1. 获取用户记录并加锁（FOR UPDATE）
+		var currentUser userModel.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&currentUser, userID).Error; err != nil {
+			return fmt.Errorf("获取用户信息失败: %v", err)
+		}
+
+		// 快速检查用户状态
+		if currentUser.Status != 1 {
+			return fmt.Errorf("用户账户已被禁用")
+		}
+
+		// 2. 验证用户全局实例数量限制（产品订单创建跳过等级配额）
+		if req.OrderID == 0 {
+			levelLimits, err := userquota.ResolveLevelLimit(currentUser.Level)
+			if err != nil {
+				return err
+			}
+
+			currentInstances, _, err := quotaService.GetCurrentResourceUsageInTx(tx, userID)
+			if err != nil {
+				return fmt.Errorf("获取当前实例数量失败: %v", err)
+			}
+
+			if currentInstances >= levelLimits.MaxInstances {
+				return fmt.Errorf("实例数量已达上限：当前 %d/%d", currentInstances, levelLimits.MaxInstances)
+			}
+
+			quotaReq := resources.ResourceRequest{
+				UserID:       userID,
+				ProviderID:   req.ProviderId,
+				CPU:          cpuSpec.Cores,
+				Memory:       int64(memorySpec.SizeMB),
+				Disk:         int64(diskSpec.SizeMB),
+				Bandwidth:    bandwidthSpec.SpeedMbps,
+				InstanceType: systemImage.InstanceType,
+			}
+			quotaResult, err := quotaService.ValidateInTransaction(tx, quotaReq)
+			if err != nil {
+				return fmt.Errorf("用户配额验证失败: %v", err)
+			}
+			if !quotaResult.Allowed {
+				return fmt.Errorf("用户配额不足: %s", quotaResult.Reason)
+			}
+		} else {
+			global.APP_LOG.Info("产品订单实例创建，跳过事务内等级配额验证",
+				zap.Uint("userID", userID),
+				zap.Uint("orderID", req.OrderID))
+		}
+
+		resourceService := &resources.ResourceService{}
+		resourceResult, err := resourceService.CheckProviderResourcesWithTx(tx, resourceModel.ResourceCheckRequest{
+			ProviderID:   req.ProviderId,
+			InstanceType: systemImage.InstanceType,
+			CPU:          cpuSpec.Cores,
+			Memory:       int64(memorySpec.SizeMB),
+			Disk:         int64(diskSpec.SizeMB),
+		})
+		if err != nil {
+			return fmt.Errorf("Provider资源检查失败: %v", err)
+		}
+		if !resourceResult.Allowed {
+			return fmt.Errorf("Provider资源不足: %s", resourceResult.Reason)
+		}
+
+		// 3. 验证Provider节点级别的实例数量限制
+		if req.ProviderId > 0 {
+			// 获取Provider并加锁（防止并发超配）
+			var provider providerModel.Provider
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&provider, req.ProviderId).Error; err != nil {
+				return fmt.Errorf("获取节点信息失败: %v", err)
+			}
+			createTimeout = utils.GetCreateTaskTimeoutForImage(provider.Type, systemImage.InstanceType, systemImage.OSType, systemImage.URL)
+
+			providerAvailable := (provider.ConnectionType == "agent" && provider.AgentStatus == "online") ||
+				(provider.ConnectionType != "agent" && (provider.Status == "active" || provider.Status == "partial"))
+			if !providerAvailable {
+				return fmt.Errorf("服务器不存在或不可用")
+			}
+			if !provider.AllowClaim {
+				return fmt.Errorf("该节点不允许申领")
+			}
+			if provider.IsFrozen {
+				return fmt.Errorf("服务器已被冻结")
+			}
+			if provider.ExpiresAt != nil && provider.ExpiresAt.Before(time.Now()) {
+				return fmt.Errorf("服务器已过期")
+			}
+
+			// 3.1 检查节点容器/虚拟机总数限制
+			// 使用缓存的计数值（如果缓存有效），否则进行实时查询
+			containerCount := provider.ContainerCount
+			vmCount := provider.VMCount
+
+			// 检查缓存是否过期
+			if provider.CountCacheExpiry == nil || time.Now().After(*provider.CountCacheExpiry) {
+				// 缓存过期，需要重新查询（排除终态，创建中/重置中仍会占用或即将占用名额）
+				var freshContainerCount, freshVMCount int64
+				if err := tx.Model(&providerModel.Instance{}).
+					Where("provider_id = ? AND instance_type = ? AND deleted_at IS NULL AND status NOT IN (?)",
+						provider.ID, "container", constant.GetTerminalStatuses()).
+					Count(&freshContainerCount).Error; err != nil {
+					return fmt.Errorf("统计节点容器数量失败: %v", err)
+				}
+				if err := tx.Model(&providerModel.Instance{}).
+					Where("provider_id = ? AND instance_type = ? AND deleted_at IS NULL AND status NOT IN (?)",
+						provider.ID, "vm", constant.GetTerminalStatuses()).
+					Count(&freshVMCount).Error; err != nil {
+					return fmt.Errorf("统计节点虚拟机数量失败: %v", err)
+				}
+
+				containerCount = int(freshContainerCount)
+				vmCount = int(freshVMCount)
+
+				global.APP_LOG.Debug("使用实时查询的实例数量（缓存已过期）",
+					zap.Uint("providerID", provider.ID),
+					zap.Int("containerCount", containerCount),
+					zap.Int("vmCount", vmCount))
+
+				// 已持有 FOR UPDATE 行锁，直接回写缓存，避免下次过期时重复 COUNT
+				newExpiry := time.Now().Add(5 * time.Minute)
+				if wbErr := tx.Model(&providerModel.Provider{}).Where("id = ?", provider.ID).Updates(map[string]interface{}{
+					"container_count":    containerCount,
+					"vm_count":           vmCount,
+					"count_cache_expiry": newExpiry,
+				}).Error; wbErr != nil {
+					global.APP_LOG.Warn("写回Provider实例数量缓存失败",
+						zap.Uint("providerID", provider.ID),
+						zap.Error(wbErr))
+					// 写回失败不阻止创建流程
+				}
+			} else {
+				global.APP_LOG.Debug("使用缓存的实例数量",
+					zap.Uint("providerID", provider.ID),
+					zap.Int("containerCount", containerCount),
+					zap.Int("vmCount", vmCount))
+			}
+
+			var reservedByType struct {
+				ReservedContainers int64
+				ReservedVMs        int64
+			}
+			if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+				Model(&resourceModel.ResourceReservation{}).
+				Select("COALESCE(SUM(CASE WHEN instance_type = 'vm' THEN 0 ELSE 1 END), 0) AS reserved_containers, COALESCE(SUM(CASE WHEN instance_type = 'vm' THEN 1 ELSE 0 END), 0) AS reserved_vms").
+				Where("provider_id = ? AND expires_at > ?", provider.ID, time.Now()).
+				Scan(&reservedByType).Error; err != nil {
+				return fmt.Errorf("统计节点预留资源失败: %v", err)
+			}
+			containerCount += int(reservedByType.ReservedContainers)
+			vmCount += int(reservedByType.ReservedVMs)
+
+			if systemImage.InstanceType == "container" && provider.MaxContainerInstances > 0 {
+				if containerCount >= provider.MaxContainerInstances {
+					return fmt.Errorf("节点容器数量已达上限：%d/%d", containerCount, provider.MaxContainerInstances)
+				}
+			} else if systemImage.InstanceType == "vm" && provider.MaxVMInstances > 0 {
+				if vmCount >= provider.MaxVMInstances {
+					return fmt.Errorf("节点虚拟机数量已达上限：%d/%d", vmCount, provider.MaxVMInstances)
+				}
+			}
+
+			// 3.2 检查该用户在此节点的等级实例数量限制（产品订单跳过等级配额）
+		if req.OrderID == 0 {
+			providerLevelLimits, err := quotaService.GetProviderLevelLimitsInTx(tx, req.ProviderId, currentUser.Level)
+			if err == nil && providerLevelLimits != nil && providerLevelLimits.MaxInstances > 0 {
+				currentProviderInstances, err := quotaService.GetCurrentProviderInstanceCountInTx(tx, userID, req.ProviderId)
+				if err != nil {
+					return fmt.Errorf("获取节点实例数量失败: %v", err)
+				}
+
+				if currentProviderInstances >= providerLevelLimits.MaxInstances {
+					return fmt.Errorf("该节点实例数量已达上限：当前在此节点 %d/%d", currentProviderInstances, providerLevelLimits.MaxInstances)
+				}
+			}
+		} else {
+			global.APP_LOG.Info("产品订单实例创建，跳过节点等级实例数量限制",
+				zap.Uint("userID", userID),
+				zap.Uint("orderID", req.OrderID),
+				zap.Uint("providerId", req.ProviderId))
+		}
+		}
+
+		global.APP_LOG.Debug("事务内实例数量验证通过",
+		zap.Uint("userID", userID),
+		zap.Uint("orderID", req.OrderID))
+
+		// 1. 只预留资源，不立即消费（等待实例创建成功后再消费）
+		reservationService := resources.GetResourceReservationService()
+
+		if err := reservationService.ReserveResourcesInTx(tx, userID, req.ProviderId, sessionID,
+			systemImage.InstanceType, cpuSpec.Cores, int64(memorySpec.SizeMB), int64(diskSpec.SizeMB), bandwidthSpec.SpeedMbps); err != nil {
+			global.APP_LOG.Error("预留资源失败",
+				zap.Uint("userID", userID),
+				zap.Uint("providerId", req.ProviderId),
+				zap.String("sessionId", sessionID),
+				zap.Error(err))
+			return fmt.Errorf("资源分配失败: %v", err)
+		}
+
+		// 2. 创建任务
+		taskData := fmt.Sprintf(`{"providerId":%d,"imageId":%d,"cpuId":"%s","memoryId":"%s","diskId":"%s","bandwidthId":"%s","description":"%s","sessionId":"%s","gpuEnabled":%t,"gpuDeviceIds":"%s"}`,
+			req.ProviderId, req.ImageId, req.CPUId, req.MemoryId, req.DiskId, req.BandwidthId, req.Description, sessionID, req.GpuEnabled, req.GpuDeviceIds)
+
+		// 计算预计执行时长
+		estimatedDuration := 300 // 默认5分钟
+		if systemImage.InstanceType == "vm" {
+			estimatedDuration = 600 // 虚拟机需要更长时间
+		}
+
+		// 在事务中创建任务，包含预分配配置信息
+		newTask := &adminModel.Task{
+			UserID:                userID,
+			ProviderID:            &req.ProviderId,
+			TaskType:              "create",
+			TaskData:              taskData,
+			Status:                "pending",
+			TimeoutDuration:       createTimeout,
+			IsForceStoppable:      true,
+			EstimatedDuration:     estimatedDuration,
+			PreallocatedCPU:       cpuSpec.Cores,
+			PreallocatedMemory:    memorySpec.SizeMB,
+			PreallocatedDisk:      diskSpec.SizeMB,
+			PreallocatedBandwidth: bandwidthSpec.SpeedMbps,
+		}
+
+		if err := tx.Create(newTask).Error; err != nil {
+			return fmt.Errorf("创建任务失败: %v", err)
+		}
+
+		task = newTask
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// 使用户缓存失效（实例创建任务已创建）
+	cacheService := cache.GetUserCacheService()
+	cacheService.InvalidateUserCache(userID)
+
+	global.APP_LOG.Info("原子化实例创建成功",
+		zap.Uint("userID", userID),
+		zap.Uint("taskId", task.ID),
+		zap.String("sessionId", sessionID))
+
+	return task, nil
+}
+
+// validateGPUDeviceIDs 验证 GPU 设备 ID 列表格式
+func validateGPUDeviceIDs(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	for _, part := range strings.Split(raw, ",") {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			return fmt.Errorf("GPU 设备 ID 不能为空")
+		}
+		for _, r := range id {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+				r == '_' || r == '-' || r == '.' || r == ':' {
+				continue
+			}
+			return fmt.Errorf("GPU 设备 ID 包含非法字符")
+		}
+	}
+	return nil
+}

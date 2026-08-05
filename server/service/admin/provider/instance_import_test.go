@@ -1,0 +1,208 @@
+package provider
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	providerModel "oneclickvirt/model/provider"
+	providerCore "oneclickvirt/provider"
+
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+func TestNormalizeImportedInstanceUUIDMatchesDatabaseIdentity(t *testing.T) {
+	if got := normalizeImportedInstanceUUID("  B12DF9C1-18BB-52E4-B509-471524819DF7  "); got != "b12df9c1-18bb-52e4-b509-471524819df7" {
+		t.Fatalf("normalized UUID = %q", got)
+	}
+}
+
+func TestResolveImportedMappingMethodPrefersDiscoveredFirewallBackend(t *testing.T) {
+	if got := resolveImportedMappingMethod("nft", "device_proxy"); got != "iptables" {
+		t.Fatalf("mapping method = %q, want iptables", got)
+	}
+	if got := resolveImportedMappingMethod("", "device_proxy"); got != "device_proxy" {
+		t.Fatalf("fallback mapping method = %q", got)
+	}
+}
+
+func TestDuplicateImportResourceErrorClassification(t *testing.T) {
+	for _, message := range []string{
+		"Error 1062: Duplicate entry '22022' for key 'idx_provider_host_port'",
+		"UNIQUE constraint failed: ports.provider_id, ports.host_port",
+	} {
+		if !isDuplicateImportResourceError(errors.New(message)) {
+			t.Fatalf("duplicate resource error was not classified: %s", message)
+		}
+	}
+	if isDuplicateImportResourceError(errors.New("connection reset")) {
+		t.Fatal("unrelated database error was classified as duplicate")
+	}
+}
+
+func TestSelectDiscoveredInstancesRejectsMissingAndSelectsOneAmbiguousName(t *testing.T) {
+	instances := []providerCore.DiscoveredInstance{
+		{UUID: "uuid-a", ProviderInstanceID: "id-a", Name: "same"},
+		{UUID: "uuid-b", ProviderInstanceID: "id-b", Name: "same"},
+	}
+	if _, err := selectDiscoveredInstances(instances, []string{"missing"}); err == nil {
+		t.Fatal("missing selector was accepted")
+	}
+	byName, err := selectDiscoveredInstances(instances, []string{"same"})
+	if err != nil || len(byName) != 1 || byName[0].ProviderInstanceID != "id-a" {
+		t.Fatalf("ambiguous name must deterministically select one instance: selected=%#v err=%v", byName, err)
+	}
+	selected, err := selectDiscoveredInstances(instances, []string{"uuid-a", "uuid-a"})
+	if err != nil || len(selected) != 1 || selected[0].ProviderInstanceID != "id-a" {
+		t.Fatalf("UUID selection/dedup failed: selected=%#v err=%v", selected, err)
+	}
+}
+
+func TestDeduplicateDiscoveredInstancesKeepsOneForAnyManagedResourceConflict(t *testing.T) {
+	instances := []providerCore.DiscoveredInstance{
+		{UUID: "uuid-b", ProviderInstanceID: "id-b", Name: "beta", PrivateIP: "10.0.0.3", SSHPort: 2200},
+		{UUID: "uuid-a", ProviderInstanceID: "id-a", Name: "alpha", PrivateIP: "10.0.0.2", SSHPort: 2200},
+		{UUID: "uuid-c", ProviderInstanceID: "id-c", Name: "alpha", PrivateIP: "10.0.0.4", SSHPort: 2201},
+		{UUID: "uuid-d", ProviderInstanceID: "id-d", Name: "delta", PrivateIP: "10.0.0.2", SSHPort: 2202},
+	}
+	kept, duplicates := deduplicateDiscoveredInstances(instances)
+	if len(kept) != 2 || kept[0].ProviderInstanceID != "id-a" || kept[1].ProviderInstanceID != "id-c" {
+		t.Fatalf("stable resource winners not kept: %#v", kept)
+	}
+	if len(duplicates) != 2 {
+		t.Fatalf("duplicates=%d, want 2: %#v", len(duplicates), duplicates)
+	}
+}
+
+func TestDeduplicateDiscoveredInstancesKeepsSameNameWithDistinctRemoteIDs(t *testing.T) {
+	instances := []providerCore.DiscoveredInstance{
+		{UUID: "uuid-120", ProviderInstanceID: "120", Name: "duplicated name", InstanceType: "vm"},
+		{UUID: "uuid-121", ProviderInstanceID: "121", Name: "duplicated name", InstanceType: "vm"},
+	}
+	kept, duplicates := deduplicateDiscoveredInstances(instances)
+	if len(kept) != 2 || len(duplicates) != 0 {
+		t.Fatalf("distinct remote resources were collapsed: kept=%#v duplicates=%#v", kept, duplicates)
+	}
+}
+
+func TestPrepareImportedInstanceNamesGeneratesStableSafeAliases(t *testing.T) {
+	original := []providerCore.DiscoveredInstance{
+		{UUID: "uuid-120", ProviderInstanceID: "120", Name: "  bad / name !!  ", InstanceType: "vm"},
+		{UUID: "uuid-121", ProviderInstanceID: "121", Name: "bad---name", InstanceType: "vm"},
+		{UUID: "uuid-122", ProviderInstanceID: "122", Name: "bad / name !!", InstanceType: "vm"},
+	}
+	first := append([]providerCore.DiscoveredInstance(nil), original...)
+	second := append([]providerCore.DiscoveredInstance(nil), original...)
+	existing := []providerModel.Instance{{Name: "bad-name", ProviderVMID: "999"}}
+	prepareImportedInstanceNames("proxmox", first, existing)
+	prepareImportedInstanceNames("proxmox", second, existing)
+
+	seen := map[string]bool{"bad-name": true}
+	for index := range first {
+		if first[index].Name != second[index].Name {
+			t.Fatalf("alias is not stable: first=%q second=%q", first[index].Name, second[index].Name)
+		}
+		if first[index].ProviderInstanceID != original[index].ProviderInstanceID {
+			t.Fatalf("remote operation ID changed: %#v", first[index])
+		}
+		if strings.ContainsAny(first[index].Name, " /!") || len(first[index].Name) > 128 {
+			t.Fatalf("unsafe alias generated: %q", first[index].Name)
+		}
+		key := strings.ToLower(first[index].Name)
+		if seen[key] {
+			t.Fatalf("duplicate alias generated: %q in %#v", first[index].Name, first)
+		}
+		seen[key] = true
+	}
+	if first[0].Name != "bad-name-120" || first[2].Name != "bad-name-122" {
+		t.Fatalf("expected VMID-based aliases, got %#v", first)
+	}
+}
+
+func TestConflictingInstanceNameUsesRemoteIdentity(t *testing.T) {
+	existing := []providerModel.Instance{{Name: "guest", ProviderVMID: "remote-a", UUID: "local-a"}}
+	if !hasConflictingInstanceName("docker", providerCore.DiscoveredInstance{Name: "guest", ProviderInstanceID: "remote-b", UUID: "local-b"}, existing) {
+		t.Fatal("same name with a different remote identity must conflict")
+	}
+	if hasConflictingInstanceName("docker", providerCore.DiscoveredInstance{Name: "guest", ProviderInstanceID: "remote-a", UUID: "local-b"}, existing) {
+		t.Fatal("same remote identity must not be reported as a name conflict")
+	}
+}
+
+func TestConflictingExistingInstanceResourceKeepsManagedWinner(t *testing.T) {
+	existing := []providerModel.Instance{{Name: "managed", PrivateIP: "10.0.0.2", IPv6Address: "2001:db8::1"}}
+	if reason := conflictingExistingInstanceResource(providerCore.DiscoveredInstance{PrivateIP: "10.0.0.2"}, existing); reason == "" {
+		t.Fatal("duplicate private IP was not detected")
+	}
+	if reason := conflictingExistingInstanceResource(providerCore.DiscoveredInstance{IPv6Address: "2001:DB8::1"}, existing); reason == "" {
+		t.Fatal("duplicate IPv6 address was not detected")
+	}
+	if reason := conflictingExistingInstanceResource(providerCore.DiscoveredInstance{PrivateIP: "10.0.0.3"}, existing); reason != "" {
+		t.Fatalf("unique resource rejected: %s", reason)
+	}
+}
+
+func TestHistoricalImportOwnerCanOnlyBeRestoredOnSameProvider(t *testing.T) {
+	deletedAt := time.Now()
+	tests := []struct {
+		name       string
+		owner      providerModel.Instance
+		providerID uint
+		want       bool
+	}{
+		{
+			name:       "same provider tombstone",
+			owner:      providerModel.Instance{ProviderID: 7, DeletedAt: gorm.DeletedAt{Time: deletedAt, Valid: true}},
+			providerID: 7,
+			want:       true,
+		},
+		{
+			name:       "active owner",
+			owner:      providerModel.Instance{ProviderID: 7},
+			providerID: 7,
+			want:       false,
+		},
+		{
+			name:       "different provider tombstone",
+			owner:      providerModel.Instance{ProviderID: 8, DeletedAt: gorm.DeletedAt{Time: deletedAt, Valid: true}},
+			providerID: 7,
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := canRestoreHistoricalImportedInstance(tt.owner, tt.providerID); got != tt.want {
+				t.Fatalf("canRestoreHistoricalImportedInstance() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRestoreHistoricalImportedInstanceClearsTombstoneAtomically(t *testing.T) {
+	db, err := gorm.Open(mysql.New(mysql.Config{
+		DSN:                       "gorm:gorm@tcp(localhost:9910)/gorm?charset=utf8&parseTime=True&loc=Local",
+		SkipInitializeWithVersion: true,
+	}), &gorm.Config{DryRun: true, DisableAutomaticPing: true, SkipDefaultTransaction: true})
+	if err != nil {
+		t.Fatalf("open dry-run database: %v", err)
+	}
+
+	instance := providerModel.Instance{ID: 12, UUID: "provider-scoped-uuid", Name: "restored", ProviderID: 7}
+	result := restoreHistoricalImportedInstance(db, &instance, 12)
+	if result.Error != nil {
+		t.Fatalf("build restore update: %v", result.Error)
+	}
+	statement := result.Statement.SQL.String()
+	if !strings.Contains(statement, "`deleted_at`=") {
+		t.Fatalf("restore update does not clear deleted_at: %s", statement)
+	}
+	if !strings.Contains(statement, "id = ? AND deleted_at IS NOT NULL") {
+		t.Fatalf("restore update is not guarded by the tombstone state: %s", statement)
+	}
+	if strings.Contains(statement, "`created_at`=") || strings.Contains(statement, "`id`=") {
+		t.Fatalf("restore update overwrites immutable identity fields: %s", statement)
+	}
+}

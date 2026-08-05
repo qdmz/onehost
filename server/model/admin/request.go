@@ -1,0 +1,762 @@
+package admin
+
+import (
+	"oneclickvirt/model/common"
+	"time"
+)
+
+type CreateUserRequest struct {
+	Username   string `json:"username" binding:"required"`
+	Password   string `json:"password" binding:"required"`
+	Nickname   string `json:"nickname"`
+	Email      string `json:"email"`
+	Phone      string `json:"phone"`
+	Telegram   string `json:"telegram"`
+	QQ         string `json:"qq"`
+	UserType   string `json:"userType" binding:"required"`
+	Level      int    `json:"level"`
+	TotalQuota int    `json:"totalQuota"`
+	Status     int    `json:"status"`
+	RoleID     uint   `json:"roleId"`
+}
+
+type UpdateUserRequest struct {
+	ID         uint   `json:"id"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	Nickname   string `json:"nickname"`
+	Email      string `json:"email"`
+	Phone      string `json:"phone"`
+	Telegram   string `json:"telegram"`
+	QQ         string `json:"qq"`
+	UserType   string `json:"userType"`
+	Level      int    `json:"level"`
+	TotalQuota int    `json:"totalQuota"`
+	Status     int    `json:"status"`
+	RoleID     uint   `json:"roleId"`
+}
+
+type UserListRequest struct {
+	common.PageInfo
+	Username string `json:"username" form:"username"`
+	Nickname string `json:"nickname" form:"nickname"`
+	UserType string `json:"userType" form:"userType"`
+	Status   *int   `json:"status" form:"status"`
+}
+
+type CreateProviderRequest struct {
+	Name                  string `json:"name" binding:"required"`
+	Description           string `json:"description"`
+	Type                  string `json:"type" binding:"required"`
+	Endpoint              string `json:"endpoint"`
+	PortIP                string `json:"portIP"` // 端口映射使用的公网IP
+	SSHPort               int    `json:"sshPort"`
+	Username              string `json:"username"`
+	Password              string `json:"password"`
+	SSHKey                string `json:"sshKey"` // SSH私钥，优先于密码使用
+	Token                 string `json:"token"`
+	Config                string `json:"config"`
+	Region                string `json:"region"`
+	Country               string `json:"country"`
+	CountryCode           string `json:"countryCode"`
+	City                  string `json:"city"`
+	Architecture          string `json:"architecture"`
+	ContainerEnabled      bool   `json:"container_enabled"`
+	VirtualMachineEnabled bool   `json:"vm_enabled"`
+	TotalQuota            int    `json:"totalQuota"`
+	AllowClaim            bool   `json:"allowClaim"`
+	RedeemCodeOnly        bool   `json:"redeemCodeOnly"` // 是否仅支持兑换码兑换
+	Status                string `json:"status"`
+	ExpiresAt             string `json:"expiresAt"`             // 过期时间，格式: "2006-01-02 15:04:05"
+	MaxContainerInstances int    `json:"maxContainerInstances"` // 最大容器数量限制
+	MaxVMInstances        int    `json:"maxVMInstances"`        // 最大虚拟机数量限制
+	AllowConcurrentTasks  bool   `json:"allowConcurrentTasks"`  // 是否允许并发任务，默认false
+	MaxConcurrentTasks    int    `json:"maxConcurrentTasks"`    // 最大并发任务数，默认1
+	TaskPollInterval      int    `json:"taskPollInterval"`      // 任务轮询间隔（秒），默认60秒
+	EnableTaskPolling     bool   `json:"enableTaskPolling"`     // 是否启用任务轮询，默认true
+	// 存储配置（所有Provider类型通用）
+	StoragePool string `json:"storagePool"` // 存储池名称，用于存储虚拟机磁盘和容器（实际路径将自动检测）
+	// 操作执行配置
+	ExecutionRule string `json:"executionRule" binding:"omitempty,oneof=auto api_only ssh_only"` // 操作轮转规则：auto(自动切换), api_only(仅API), ssh_only(仅SSH)
+	// 端口映射配置
+	DefaultPortCount int    `json:"defaultPortCount"`                                                                                                          // 每个实例默认映射端口数量，默认10
+	PortRangeStart   int    `json:"portRangeStart"`                                                                                                            // 端口映射范围起始，默认10000
+	PortRangeEnd     int    `json:"portRangeEnd"`                                                                                                              // 端口映射范围结束，默认65535
+	FixedPorts       []int  `json:"fixedPorts"`                                                                                                                // 固定实例内端口，22强制保留
+	NetworkType      string `json:"networkType" binding:"omitempty,oneof=nat_ipv4 nat_ipv4_ipv6 dedicated_ipv4 dedicated_ipv4_ipv6 ipv6_only no_port_mapping"` // 网络配置类型：nat_ipv4, nat_ipv4_ipv6, dedicated_ipv4, dedicated_ipv4_ipv6, ipv6_only, no_port_mapping
+	// Proxmox 网桥配置（NodeInstallType == "third_party" 时生效）
+	NodeInstallType   string `json:"nodeInstallType"`   // 节点安装类型：script（本项目脚本安装）, third_party（第三方安装）
+	BridgeNAT         string `json:"bridgeNAT"`         // NAT网桥（替代vmbr1），仅proxmox+third_party时生效
+	BridgeDedicatedV4 string `json:"bridgeDedicatedV4"` // 独立IPv4网桥（替代vmbr0），仅proxmox+third_party时生效
+	BridgeDedicatedV6 string `json:"bridgeDedicatedV6"` // 独立IPv6网桥（替代vmbr2），仅proxmox+third_party时生效，可留空
+	NATSubnet         string `json:"natSubnet"`         // NAT内网网段（CIDR，如 172.16.1.0/24），仅proxmox+third_party时生效
+	// 带宽配置
+	DefaultInboundBandwidth  int `json:"defaultInboundBandwidth"`  // 默认入站带宽限制（Mbps）
+	DefaultOutboundBandwidth int `json:"defaultOutboundBandwidth"` // 默认出站带宽限制（Mbps）
+	MaxInboundBandwidth      int `json:"maxInboundBandwidth"`      // 最大入站带宽限制（Mbps）
+	MaxOutboundBandwidth     int `json:"maxOutboundBandwidth"`     // 最大出站带宽限制（Mbps）
+	// 磁盘读写 I/O 速率限制
+	ContainerReadIOLimit  string `json:"containerReadIoLimit"`  // 容器读取速率限制，如"50MB"
+	ContainerWriteIOLimit string `json:"containerWriteIoLimit"` // 容器写入速率限制，如"50MB"
+	VMReadIOLimit         string `json:"vmReadIoLimit"`         // 虚拟机读取速率限制，如"50MB"
+	VMWriteIOLimit        string `json:"vmWriteIoLimit"`        // 虚拟机写入速率限制，如"50MB"
+	// 流量管理
+	EnableTrafficControl     bool    `json:"enableTrafficControl"`     // 是否启用流量统计和限制，默认启用
+	MaxTraffic               int64   `json:"maxTraffic"`               // 最大流量限制（MB），默认1TB=1048576MB
+	TrafficCountMode         string  `json:"trafficCountMode"`         // 流量统计模式：both(双向), out(仅出向), in(仅入向)
+	TrafficMultiplier        float64 `json:"trafficMultiplier"`        // 流量计费倍率，默认1.0
+	TrafficSyncMethod        string  `json:"trafficSyncMethod"`        // 流量同步方式：pmacct(传统), agent(Rust Agent)
+	TrafficOverLimitAction   string  `json:"trafficOverLimitAction"`   // 流量超限操作：stop, speed_limit, freeze, mark_only
+	TrafficSpeedLimitKbps    int     `json:"trafficSpeedLimitKbps"`    // 限速值(Kbps)，仅speed_limit模式生效
+	TrafficQuotaVisible      *bool   `json:"trafficQuotaVisible"`      // 用户侧是否显示流量额度
+	TrafficResetDay          *int    `json:"trafficResetDay"`          // 每月流量重置日期，nil/0表示每月1日自然月重置
+	InstanceExpiryAction     string  `json:"instanceExpiryAction"`     // 实例到期操作：delete, freeze, stop, extend
+	InstanceExpiryExtendDays int     `json:"instanceExpiryExtendDays"` // 到期延期天数，仅extend模式生效
+	// 流量统计性能配置
+	TrafficStatsMode           string `json:"trafficStatsMode"`           // 流量统计性能模式：high, standard, light, minimal, custom
+	TrafficCollectInterval     int    `json:"trafficCollectInterval"`     // 流量统计间隔（秒）
+	TrafficCollectBatchSize    int    `json:"trafficCollectBatchSize"`    // 流量统计批量大小
+	TrafficLimitCheckInterval  int    `json:"trafficLimitCheckInterval"`  // 流量限制检测间隔（秒）
+	TrafficLimitCheckBatchSize int    `json:"trafficLimitCheckBatchSize"` // 流量限制检测批量大小
+	TrafficAutoResetInterval   int    `json:"trafficAutoResetInterval"`   // 流量自动重置检查间隔（秒）
+	TrafficAutoResetBatchSize  int    `json:"trafficAutoResetBatchSize"`  // 流量自动重置批量大小
+	// 硬件资源监控
+	EnableResourceMonitoring bool `json:"enableResourceMonitoring"` // 是否启用硬件资源监控
+
+	// 端口映射方式配置
+	IPv4PortMappingMethod string `json:"ipv4PortMappingMethod"` // IPv4端口映射方式：device_proxy, iptables, native
+	IPv6PortMappingMethod string `json:"ipv6PortMappingMethod"` // IPv6端口映射方式：device_proxy, iptables, native
+	// SSH连接配置
+	SSHConnectTimeout int `json:"sshConnectTimeout"` // SSH连接超时时间（秒），默认30秒
+	SSHExecuteTimeout int `json:"sshExecuteTimeout"` // SSH命令执行超时时间（秒），默认300秒
+	// 容器资源限制配置
+	ContainerLimitCpu    bool `json:"containerLimitCpu"`    // 容器CPU是否计入总量预算
+	ContainerLimitMemory bool `json:"containerLimitMemory"` // 容器内存是否计入总量预算
+	ContainerLimitDisk   bool `json:"containerLimitDisk"`   // 容器硬盘是否计入总量预算
+	// 虚拟机资源限制配置
+	VMLimitCpu    bool `json:"vmLimitCpu"`    // 虚拟机CPU是否计入总量预算
+	VMLimitMemory bool `json:"vmLimitMemory"` // 虚拟机内存是否计入总量预算
+	VMLimitDisk   bool `json:"vmLimitDisk"`   // 虚拟机硬盘是否计入总量预算
+	// 容器特殊配置选项（仅 LXD/Incus 容器）
+	ContainerPrivileged   bool   `json:"containerPrivileged"`   // 是否启用特权容器
+	ContainerAllowNesting bool   `json:"containerAllowNesting"` // 是否允许嵌套虚拟化
+	ContainerEnableLXCFS  bool   `json:"containerEnableLxcfs"`  // 是否启用LXCFS
+	ContainerCPUAllowance string `json:"containerCpuAllowance"` // CPU使用率上限（如"100%"）
+	ContainerMemorySwap   bool   `json:"containerMemorySwap"`   // 是否允许使用swap
+	ContainerMaxProcesses int    `json:"containerMaxProcesses"` // 最大进程数限制（0表示不限制）
+	ContainerDiskIOLimit  string `json:"containerDiskIoLimit"`  // 磁盘IO限制（如"10MB"或"100iops"）
+	// GPU直通配置（LXD/Incus 原生支持，Docker/Podman/Containerd/Orbstack 尽力通过运行参数附加）
+	GpuEnabled   bool   `json:"gpuEnabled"`   // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds"` // GPU设备ID列表（逗号分隔的PCI ordinal ID，如"0,1"）
+
+	// 内网穿透连接模式
+	ConnectionType string `json:"connectionType"` // 连接方式：ssh / agent / local
+	// 域名反向代理配置
+	EnableDomainBinding bool   `json:"enableDomainBinding"` // 是否启用域名绑定
+	ProxyHTTPPort       int    `json:"proxyHttpPort"`       // HTTP反向代理监听端口
+	ProxyHTTPSPort      int    `json:"proxyHttpsPort"`      // HTTPS反向代理监听端口
+	ProxyEnableHTTP     bool   `json:"proxyEnableHttp"`     // 是否启用HTTP反向代理
+	ProxyEnableHTTPS    bool   `json:"proxyEnableHttps"`    // 是否启用HTTPS反向代理
+	ProxyTLSCertPath    string `json:"proxyTlsCertPath"`    // TLS证书路径
+	ProxyTLSKeyPath     string `json:"proxyTlsKeyPath"`     // TLS私钥路径
+	ProxyAutoSync       bool   `json:"proxyAutoSync"`       // 是否自动同步代理配置
+	EnableVNC           bool   `json:"enableVNC"`           // 是否启用WebVNC
+	VNCBasePort         int    `json:"vncBasePort"`         // VNC端口基准
+	VNCHost             string `json:"vncHost"`             // VNC宿主地址
+
+	// 节点级别的等级限制配置
+	// 用于限制该节点上不同等级用户能创建的最大资源
+	LevelLimits map[int]map[string]interface{} `json:"levelLimits"` // 等级限制配置
+
+	// 实例发现与导入配置
+	DiscoverMode          bool    `json:"discoverMode"`          // 是否启用实例发现模式（发现并导入已有实例）
+	AutoImport            bool    `json:"autoImport"`            // 是否自动导入发现的实例
+	AutoAdjustQuota       bool    `json:"autoAdjustQuota"`       // 是否自动调整quota以适应导入的实例
+	ImportedInstanceOwner *string `json:"importedInstanceOwner"` // 导入实例的所有者（用户名，默认"admin"）
+}
+
+type UpdateProviderRequest struct {
+	ID                    uint            `json:"id"`
+	ProvidedFields        map[string]bool `json:"-"`
+	Name                  string          `json:"name"`
+	Description           string          `json:"description"`
+	Type                  string          `json:"type"`
+	Endpoint              string          `json:"endpoint"`
+	PortIP                string          `json:"portIP"` // 端口映射使用的公网IP
+	SSHPort               int             `json:"sshPort"`
+	Username              string          `json:"username"`
+	Password              *string         `json:"password,omitempty"` // 使用指针以区分"未提供"和"空值"
+	SSHKey                *string         `json:"sshKey,omitempty"`   // SSH私钥，使用指针以区分"未提供"和"空值"
+	Token                 string          `json:"token"`
+	Config                string          `json:"config"`
+	Region                string          `json:"region"`
+	Country               string          `json:"country"`
+	CountryCode           string          `json:"countryCode"`
+	City                  string          `json:"city"`
+	Architecture          string          `json:"architecture"`
+	ContainerEnabled      bool            `json:"container_enabled"`
+	VirtualMachineEnabled bool            `json:"vm_enabled"`
+	TotalQuota            int             `json:"totalQuota"`
+	AllowClaim            bool            `json:"allowClaim"`
+	RedeemCodeOnly        bool            `json:"redeemCodeOnly"` // 是否仅支持兑换码兑换
+	Status                string          `json:"status"`
+	ExpiresAt             string          `json:"expiresAt"`             // 过期时间，格式: "2006-01-02 15:04:05"
+	MaxContainerInstances int             `json:"maxContainerInstances"` // 最大容器数量限制
+	MaxVMInstances        int             `json:"maxVMInstances"`        // 最大虚拟机数量限制
+	AllowConcurrentTasks  bool            `json:"allowConcurrentTasks"`  // 是否允许并发任务，默认false
+	MaxConcurrentTasks    int             `json:"maxConcurrentTasks"`    // 最大并发任务数，默认1
+	TaskPollInterval      int             `json:"taskPollInterval"`      // 任务轮询间隔（秒），默认60秒
+	EnableTaskPolling     bool            `json:"enableTaskPolling"`     // 是否启用任务轮询，默认true
+	// 存储配置（所有Provider类型通用）
+	StoragePool string `json:"storagePool"` // 存储池名称，用于存储虚拟机磁盘和容器（实际路径将自动检测）
+	// 操作执行配置
+	ExecutionRule string `json:"executionRule" binding:"omitempty,oneof=auto api_only ssh_only"` // 操作轮转规则
+	// 端口映射配置
+	DefaultPortCount int    `json:"defaultPortCount"`                                                                                                          // 每个实例默认映射端口数量，默认10
+	PortRangeStart   int    `json:"portRangeStart"`                                                                                                            // 端口映射范围起始，默认10000
+	PortRangeEnd     int    `json:"portRangeEnd"`                                                                                                              // 端口映射范围结束，默认65535
+	FixedPorts       []int  `json:"fixedPorts"`                                                                                                                // 固定实例内端口，22强制保留
+	NetworkType      string `json:"networkType" binding:"omitempty,oneof=nat_ipv4 nat_ipv4_ipv6 dedicated_ipv4 dedicated_ipv4_ipv6 ipv6_only no_port_mapping"` // 网络配置类型
+	// 带宽配置
+	DefaultInboundBandwidth  int `json:"defaultInboundBandwidth"`  // 默认入站带宽限制（Mbps）
+	DefaultOutboundBandwidth int `json:"defaultOutboundBandwidth"` // 默认出站带宽限制（Mbps）
+	MaxInboundBandwidth      int `json:"maxInboundBandwidth"`      // 最大入站带宽限制（Mbps）
+	MaxOutboundBandwidth     int `json:"maxOutboundBandwidth"`     // 最大出站带宽限制（Mbps）
+	// 磁盘读写 I/O 速率限制
+	ContainerReadIOLimit  string `json:"containerReadIoLimit"`  // 容器读取速率限制，如"50MB"
+	ContainerWriteIOLimit string `json:"containerWriteIoLimit"` // 容器写入速率限制，如"50MB"
+	VMReadIOLimit         string `json:"vmReadIoLimit"`         // 虚拟机读取速率限制，如"50MB"
+	VMWriteIOLimit        string `json:"vmWriteIoLimit"`        // 虚拟机写入速率限制，如"50MB"
+	// 流量管理
+	EnableTrafficControl bool    `json:"enableTrafficControl"` // 是否启用流量统计和限制，默认启用
+	MaxTraffic           int64   `json:"maxTraffic"`           // 最大流量限制（MB），默认1TB=1048576MB
+	TrafficCountMode     string  `json:"trafficCountMode"`     // 流量统计模式：both(双向), out(仅出向), in(仅入向)
+	TrafficMultiplier    float64 `json:"trafficMultiplier"`    // 流量计费倍率，默认1.0
+	// 流量统计性能配置
+	TrafficOverLimitAction   string `json:"trafficOverLimitAction"`   // 流量超限操作：stop, speed_limit, freeze, mark_only
+	TrafficSpeedLimitKbps    int    `json:"trafficSpeedLimitKbps"`    // 限速值(Kbps)，仅speed_limit模式生效
+	TrafficQuotaVisible      *bool  `json:"trafficQuotaVisible"`      // 用户侧是否显示流量额度
+	TrafficResetDay          *int   `json:"trafficResetDay"`          // 每月流量重置日期，nil/0表示每月1日自然月重置
+	InstanceExpiryAction     string `json:"instanceExpiryAction"`     // 实例到期操作：delete, freeze, stop, extend
+	InstanceExpiryExtendDays int    `json:"instanceExpiryExtendDays"` // 到期延期天数，仅extend模式生效
+	// 流量统计性能配置
+	TrafficStatsMode           string `json:"trafficStatsMode"`           // 流量统计性能模式：high, standard, light, minimal, custom
+	TrafficCollectInterval     int    `json:"trafficCollectInterval"`     // 流量统计间隔（秒）
+	TrafficCollectBatchSize    int    `json:"trafficCollectBatchSize"`    // 流量统计批量大小
+	TrafficLimitCheckInterval  int    `json:"trafficLimitCheckInterval"`  // 流量限制检测间隔（秒）
+	TrafficLimitCheckBatchSize int    `json:"trafficLimitCheckBatchSize"` // 流量限制检测批量大小
+	TrafficAutoResetInterval   int    `json:"trafficAutoResetInterval"`   // 流量自动重置检查间隔（秒）
+	TrafficAutoResetBatchSize  int    `json:"trafficAutoResetBatchSize"`  // 流量自动重置批量大小
+	// 硬件资源监控
+	EnableResourceMonitoring bool   `json:"enableResourceMonitoring"` // 是否启用硬件资源监控
+	TrafficSyncMethod        string `json:"trafficSyncMethod"`        // 流量同步方式：pmacct(传统), agent(Rust Agent)
+
+	// 端口映射方式配置
+	IPv4PortMappingMethod string `json:"ipv4PortMappingMethod"` // IPv4端口映射方式：device_proxy, iptables, native
+	IPv6PortMappingMethod string `json:"ipv6PortMappingMethod"` // IPv6端口映射方式：device_proxy, iptables, native
+	// SSH连接配置
+	SSHConnectTimeout int `json:"sshConnectTimeout"` // SSH连接超时时间（秒），默认30秒
+	SSHExecuteTimeout int `json:"sshExecuteTimeout"` // SSH命令执行超时时间（秒），默认300秒
+	// 容器资源限制配置
+	ContainerLimitCpu    bool `json:"containerLimitCpu"`    // 容器CPU是否计入总量预算
+	ContainerLimitMemory bool `json:"containerLimitMemory"` // 容器内存是否计入总量预算
+	ContainerLimitDisk   bool `json:"containerLimitDisk"`   // 容器硬盘是否计入总量预算
+	// 虚拟机资源限制配置
+	VMLimitCpu    bool `json:"vmLimitCpu"`    // 虚拟机CPU是否计入总量预算
+	VMLimitMemory bool `json:"vmLimitMemory"` // 虚拟机内存是否计入总量预算
+	VMLimitDisk   bool `json:"vmLimitDisk"`   // 虚拟机硬盘是否计入总量预算
+	// 容器特殊配置选项（仅 LXD/Incus 容器）
+	ContainerPrivileged   bool   `json:"containerPrivileged"`   // 是否启用特权容器
+	ContainerAllowNesting bool   `json:"containerAllowNesting"` // 是否允许嵌套虚拟化
+	ContainerEnableLXCFS  bool   `json:"containerEnableLxcfs"`  // 是否启用LXCFS
+	ContainerCPUAllowance string `json:"containerCpuAllowance"` // CPU使用率上限（如"100%"）
+	ContainerMemorySwap   bool   `json:"containerMemorySwap"`   // 是否允许使用swap
+	ContainerMaxProcesses int    `json:"containerMaxProcesses"` // 最大进程数限制（0表示不限制）
+	ContainerDiskIOLimit  string `json:"containerDiskIoLimit"`  // 磁盘IO限制（如"10MB"或"100iops"）
+	// GPU直通配置（LXD/Incus 原生支持，Docker/Podman/Containerd/Orbstack 尽力通过运行参数附加）
+	GpuEnabled   bool   `json:"gpuEnabled"`   // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds"` // GPU设备ID列表（逗号分隔的PCI ordinal ID，如"0,1"）
+
+	// 内网穿透连接模式
+	ConnectionType string `json:"connectionType"` // 连接方式：ssh / agent / local
+	// 域名反向代理配置
+	EnableDomainBinding bool   `json:"enableDomainBinding"` // 是否启用域名绑定
+	ProxyHTTPPort       int    `json:"proxyHttpPort"`       // HTTP反向代理监听端口
+	ProxyHTTPSPort      int    `json:"proxyHttpsPort"`      // HTTPS反向代理监听端口
+	ProxyEnableHTTP     bool   `json:"proxyEnableHttp"`     // 是否启用HTTP反向代理
+	ProxyEnableHTTPS    bool   `json:"proxyEnableHttps"`    // 是否启用HTTPS反向代理
+	ProxyTLSCertPath    string `json:"proxyTlsCertPath"`    // TLS证书路径
+	ProxyTLSKeyPath     string `json:"proxyTlsKeyPath"`     // TLS私钥路径
+	ProxyAutoSync       bool   `json:"proxyAutoSync"`       // 是否自动同步代理配置
+	EnableVNC           bool   `json:"enableVNC"`           // 是否启用WebVNC
+	VNCBasePort         int    `json:"vncBasePort"`         // VNC端口基准
+	VNCHost             string `json:"vncHost"`             // VNC宿主地址
+
+	// 实例发现与导入配置（用于更新时的发现设置）
+	DiscoverMode          *bool   `json:"discoverMode,omitempty"`          // 是否启用实例发现模式（发现并导入已有实例），指针区分未提供
+	AutoImport            *bool   `json:"autoImport,omitempty"`            // 是否自动导入发现的实例
+	AutoAdjustQuota       *bool   `json:"autoAdjustQuota,omitempty"`       // 发现导入后是否自动调整配额
+	ImportedInstanceOwner *string `json:"importedInstanceOwner,omitempty"` // 导入实例的所有者（用户名，默认"admin"）
+
+	// Proxmox 网桥配置（NodeInstallType == "third_party" 时生效）
+	NodeInstallType   string `json:"nodeInstallType"`   // 节点安装类型：script / third_party
+	BridgeNAT         string `json:"bridgeNAT"`         // NAT网桥名（默认vmbr1）
+	BridgeDedicatedV4 string `json:"bridgeDedicatedV4"` // 独立IPv4网桥名（默认vmbr0）
+	BridgeDedicatedV6 string `json:"bridgeDedicatedV6"` // 独立IPv6网桥名（默认vmbr2，可留空）
+	NATSubnet         string `json:"natSubnet"`         // NAT内网网段（CIDR，如 172.16.1.0/24）
+
+	// 节点级别的等级限制配置
+	// 用于限制该节点上不同等级用户能创建的最大资源
+	LevelLimits map[int]map[string]interface{} `json:"levelLimits"` // 等级限制配置
+}
+
+type ProviderListRequest struct {
+	common.PageInfo
+	Name   string `json:"name" form:"name"`
+	Type   string `json:"type" form:"type"`
+	Status string `json:"status" form:"status"`
+}
+
+// 冻结管理相关请求
+
+// SetUserExpiryRequest 设置用户过期时间请求
+type SetUserExpiryRequest struct {
+	UserID    uint       `json:"userId" binding:"required"`
+	ExpiresAt *time.Time `json:"expiresAt"` // nil = clear expiry
+}
+
+// SetProviderExpiryRequest 设置Provider过期时间请求
+type SetProviderExpiryRequest struct {
+	ProviderID uint       `json:"providerId" binding:"required"`
+	ExpiresAt  *time.Time `json:"expiresAt"` // nil = clear expiry
+}
+
+// SetInstanceExpiryRequest 设置实例过期时间请求
+type SetInstanceExpiryRequest struct {
+	InstanceID uint       `json:"instanceId" binding:"required"`
+	ExpiresAt  *time.Time `json:"expiresAt"` // nil = clear expiry
+}
+
+// UnfreezeInstanceRequest 解冻实例请求
+type UnfreezeInstanceRequest struct {
+	InstanceID uint `json:"instanceId" binding:"required"`
+}
+
+// FreezeInstanceRequest 手动冻结实例请求
+type FreezeInstanceRequest struct {
+	InstanceID uint   `json:"instanceId" binding:"required"`
+	Reason     string `json:"reason"`
+}
+
+type FreezeProviderRequest struct {
+	ID     uint   `json:"id" binding:"required"`
+	Reason string `json:"reason"`
+}
+
+type UnfreezeProviderRequest struct {
+	ID        uint   `json:"id" binding:"required"`
+	ExpiresAt string `json:"expiresAt"` // 新的过期时间，格式: "2006-01-02 15:04:05"
+}
+
+// TestSSHConnectionRequest 测试SSH连接请求
+type TestSSHConnectionRequest struct {
+	Host      string `json:"host" binding:"required"`     // SSH服务器地址
+	Port      int    `json:"port" binding:"required"`     // SSH端口
+	Username  string `json:"username" binding:"required"` // SSH用户名
+	Password  string `json:"password"`                    // SSH密码（使用密码认证时必填）
+	SSHKey    string `json:"sshKey"`                      // SSH私钥（使用密钥认证时必填）
+	TestCount int    `json:"testCount"`                   // 测试次数，默认3次
+}
+
+type CreateInviteCodeRequest struct {
+	Code      string `json:"code"` // 自定义邀请码，如果为空则自动生成
+	Count     int    `json:"count" binding:"required,min=1,max=100"`
+	MaxUses   int    `json:"maxUses"`
+	ExpiresAt string `json:"expiresAt"`
+	Remark    string `json:"remark"`
+	Length    int    `json:"length"` // 邀请码长度，仅在自动生成时有效
+}
+
+type InviteCodeListRequest struct {
+	common.PageInfo
+	Code   string `json:"code" form:"code"`
+	IsUsed *bool  `json:"isUsed" form:"isUsed"` // 是否已使用：true-已使用，false-未使用
+	Status int    `json:"status" form:"status"`
+}
+
+// BatchDeleteInviteCodesRequest 批量删除邀请码请求
+type BatchDeleteInviteCodesRequest struct {
+	IDs []uint `json:"ids" binding:"required,min=1"`
+}
+
+type CreateInstanceRequest struct {
+	Name            string `json:"name"`
+	Provider        string `json:"provider"`                                             // Provider名称（与ProviderID二选一）
+	ProviderID      uint   `json:"provider_id"`                                          // Provider ID（与Provider二选一）
+	ProviderIDCamel uint   `json:"providerId"`                                           // 兼容前端camelCase字段
+	Image           string `json:"image" binding:"required"`                             // 镜像名称
+	CPU             int    `json:"cpu" binding:"min=1"`                                  // CPU核心数
+	Memory          int64  `json:"memory" binding:"min=1"`                               // 内存大小(MB)
+	Disk            int64  `json:"disk" binding:"min=1"`                                 // 磁盘大小(GB)
+	Bandwidth       int    `json:"bandwidth"`                                            // 网络带宽(Mbps)，默认使用Provider默认值
+	InstanceType    string `json:"instance_type" binding:"omitempty,oneof=container vm"` // 实例类型: container, vm
+	NetworkType     string `json:"network_type"`                                         // 网络类型
+	UserID          uint   `json:"userId"`                                               // 所有者用户ID
+	GpuEnabled      bool   `json:"gpuEnabled"`                                           // 是否启用GPU直通
+	GpuDeviceIds    string `json:"gpuDeviceIds"`                                         // GPU设备ID列表（逗号分隔）
+}
+
+type UpdateInstanceRequest struct {
+	ID             uint            `json:"id"`
+	ProvidedFields map[string]bool `json:"-"`
+	Name           string          `json:"name"`
+	CPU            int             `json:"cpu"`
+	Memory         int64           `json:"memory"`
+	Disk           int64           `json:"disk"`
+	Status         string          `json:"status"`
+}
+
+type InstanceListRequest struct {
+	common.PageInfo
+	Name         string `json:"name" form:"name"`                 // 实例名称搜索
+	ProviderName string `json:"providerName" form:"providerName"` // 节点名称搜索
+	OwnerName    string `json:"ownerName" form:"ownerName"`       // 所有者名称搜索
+	Status       string `json:"status" form:"status"`
+	InstanceType string `json:"instance_type" form:"instance_type"`
+	UserID       uint   `json:"userId" form:"userId"`
+}
+
+type InstanceActionRequest struct {
+	Action string `json:"action" binding:"required"`
+	Image  string `json:"image"`
+}
+
+type BatchInstanceActionRequest struct {
+	InstanceIDs []uint `json:"instanceIds" binding:"required,min=1,dive,required"`
+	Action      string `json:"action" binding:"required"`
+}
+
+// ResetInstancePasswordRequest 管理员重置实例密码请求
+type ResetInstancePasswordRequest struct {
+	// 不需要传递任何参数，由后端自动生成新密码
+}
+
+type CreateAnnouncementRequest struct {
+	Title       string `json:"title" binding:"required"`
+	Content     string `json:"content" binding:"required"`
+	ContentHTML string `json:"contentHtml"`
+	Type        string `json:"type" binding:"required,oneof=homepage topbar"` // 限制类型
+	Priority    int    `json:"priority"`
+	IsSticky    bool   `json:"isSticky"`
+	StartTime   string `json:"startTime"`
+	EndTime     string `json:"endTime"`
+}
+
+type UpdateAnnouncementRequest struct {
+	ID          uint   `json:"id"`
+	Title       string `json:"title"`
+	Content     string `json:"content"`
+	ContentHTML string `json:"contentHtml"`
+	Type        string `json:"type" binding:"omitempty,oneof=homepage topbar"`
+	Priority    int    `json:"priority"`
+	IsSticky    bool   `json:"isSticky"`
+	StartTime   string `json:"startTime"`
+	EndTime     string `json:"endTime"`
+	Status      int    `json:"status"`
+}
+
+type AnnouncementListRequest struct {
+	common.PageInfo
+	Title  string `json:"title" form:"title"`
+	Type   string `json:"type" form:"type"`
+	Status int    `json:"status" form:"status"` // -1表示获取所有状态，0表示禁用，1表示启用
+}
+
+// BatchAnnouncementRequest 批量公告操作请求
+type BatchAnnouncementRequest struct {
+	IDs []uint `json:"ids" binding:"required"`
+}
+
+// BatchUpdateStatusRequest 批量更新状态请求
+type BatchUpdateStatusRequest struct {
+	IDs    []uint `json:"ids" binding:"required"`
+	Status int    `json:"status" binding:"min=0,max=1"`
+}
+
+// UpdateUserStatusRequest 更新单个用户状态请求
+type UpdateUserStatusRequest struct {
+	Status int `json:"status" binding:"min=0,max=1"`
+}
+
+// ConfigurationTaskListRequest 配置任务列表请求
+type ConfigurationTaskListRequest struct {
+	common.PageInfo
+	ProviderID uint   `json:"providerId" form:"providerId"`
+	TaskType   string `json:"taskType" form:"taskType"`
+	Status     string `json:"status" form:"status"`
+	ExecutorID uint   `json:"executorId" form:"executorId"`
+}
+
+// AutoConfigureRequest 自动配置请求
+type AutoConfigureRequest struct {
+	ProviderID  uint `json:"providerId" binding:"required"`
+	Force       bool `json:"force"`       // 是否强制执行（即使有正在运行的任务）
+	ShowHistory bool `json:"showHistory"` // 是否显示历史记录
+}
+
+// BatchDeleteUsersRequest 批量删除用户请求
+type BatchDeleteUsersRequest struct {
+	UserIDs []uint `json:"userIds" binding:"required"`
+}
+
+// BatchUpdateUserStatusRequest 批量更新用户状态请求
+type BatchUpdateUserStatusRequest struct {
+	UserIDs []uint `json:"userIds" binding:"required"`
+	Status  int    `json:"status" binding:"min=0,max=1"`
+}
+
+// BatchUpdateUserLevelRequest 批量更新用户等级请求
+type BatchUpdateUserLevelRequest struct {
+	UserIDs []uint `json:"userIds" binding:"required"`
+	Level   int    `json:"level" binding:"min=1,max=99"`
+}
+
+// UpdateUserLevelRequest 更新单个用户等级请求
+type UpdateUserLevelRequest struct {
+	Level int `json:"level" binding:"min=1,max=99"`
+}
+
+// ResetUserPasswordRequest 管理员强制重置用户密码请求
+type ResetUserPasswordRequest struct {
+	// 不再需要前端传递密码，由后端自动生成
+}
+
+// UpdateInstanceTypePermissionsRequest 更新实例类型权限配置请求
+type UpdateInstanceTypePermissionsRequest struct {
+	MinLevelForContainer       int `json:"minLevelForContainer" binding:"min=0,max=99"`
+	MinLevelForVM              int `json:"minLevelForVM" binding:"min=0,max=99"`
+	MinLevelForDeleteContainer int `json:"minLevelForDeleteContainer" binding:"min=0,max=99"`
+	MinLevelForDeleteVM        int `json:"minLevelForDeleteVM" binding:"min=0,max=99"`
+	MinLevelForResetContainer  int `json:"minLevelForResetContainer" binding:"min=0,max=99"`
+	MinLevelForResetVM         int `json:"minLevelForResetVM" binding:"min=0,max=99"`
+}
+
+// 端口映射管理相关请求
+
+// PortMappingListRequest 端口映射列表请求
+type PortMappingListRequest struct {
+	common.PageInfo
+	Keyword    string `json:"keyword" form:"keyword"` // 搜索关键字（实例名称）
+	ProviderID uint   `json:"providerId" form:"providerId"`
+	InstanceID uint   `json:"instanceId" form:"instanceId"`
+	Protocol   string `json:"protocol" form:"protocol"`
+	Status     string `json:"status" form:"status"`
+}
+
+// CreatePortMappingRequest 创建端口映射请求（支持单个端口和端口段批量添加，仅支持 LXD/Incus/PVE）
+type CreatePortMappingRequest struct {
+	InstanceID   uint   `json:"instanceId" binding:"required"`
+	GuestPort    int    `json:"guestPort" binding:"required,min=1,max=65535"`          // 起始端口
+	PortCount    int    `json:"portCount" binding:"omitempty,min=1,max=1500"`          // 端口数量，默认1（单端口），最多1500个
+	Protocol     string `json:"protocol" binding:"required,oneof=tcp udp both"`        // 协议类型
+	Description  string `json:"description"`                                           // 端口用途描述
+	HostPort     int    `json:"hostPort"`                                              // 可选，不指定则自动分配，指定时作为起始端口
+	MappingType  string `json:"mappingType" binding:"omitempty,oneof=node controller"` // "node"（默认）或 "controller"（控制端转发）
+	InternalHost string `json:"internalHost"`                                          // 控制端转发目标地址（容器IP）
+}
+
+// BatchDeletePortMappingRequest 批量删除端口映射请求（仅支持删除手动添加的端口）
+type BatchDeletePortMappingRequest struct {
+	IDs []uint `json:"ids" binding:"required,min=1"`
+}
+
+// ProviderPortConfigRequest Provider端口配置请求
+type ProviderPortConfigRequest struct {
+	DefaultPortCount int    `json:"defaultPortCount" binding:"min=1,max=1500"`                                                                       // 每个实例默认映射端口数量
+	PortRangeStart   int    `json:"portRangeStart" binding:"min=1024,max=65535"`                                                                     // 端口映射范围起始
+	PortRangeEnd     int    `json:"portRangeEnd" binding:"min=1024,max=65535"`                                                                       // 端口映射范围结束
+	FixedPorts       []int  `json:"fixedPorts"`                                                                                                      // 固定实例内端口，22强制保留
+	NetworkType      string `json:"networkType" binding:"oneof=nat_ipv4 nat_ipv4_ipv6 dedicated_ipv4 dedicated_ipv4_ipv6 ipv6_only no_port_mapping"` // 网络配置类型
+}
+
+// CreateInstanceTaskRequest 创建实例任务数据结构
+type CreateInstanceTaskRequest struct {
+	ProviderId  uint   `json:"providerId"`
+	ImageId     uint   `json:"imageId"`
+	CPUId       string `json:"cpuId"`
+	MemoryId    string `json:"memoryId"`
+	DiskId      string `json:"diskId"`
+	BandwidthId string `json:"bandwidthId"`
+	Description string `json:"description"`
+	SessionId   string `json:"sessionId"` // 会话ID，用于新的资源预留机制
+	// 管理端直连创建模式：不依赖系统镜像表和规格ID，仍复用统一创建任务管线。
+	AdminDirect  bool   `json:"adminDirect,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Image        string `json:"image,omitempty"`
+	CPU          int    `json:"cpu,omitempty"`
+	Memory       int64  `json:"memory,omitempty"` // MB
+	Disk         int64  `json:"disk,omitempty"`   // GB
+	DiskMB       int64  `json:"diskMb,omitempty"` // MB，兼容旧资源申领接口的精确磁盘口径
+	Bandwidth    int    `json:"bandwidth,omitempty"`
+	InstanceType string `json:"instanceType,omitempty"`
+	NetworkType  string `json:"networkType,omitempty"`
+	// GPU直通配置（LXD/Incus 原生支持，Docker/Podman/Containerd/Orbstack 尽力通过运行参数附加）
+	GpuEnabled   bool   `json:"gpuEnabled"`   // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds"` // GPU设备ID列表（逗号分隔），为空则附加所有GPU
+}
+
+// CreateRedemptionInstanceTaskRequest 创建兑换码实例任务数据结构
+type CreateRedemptionInstanceTaskRequest struct {
+	RedemptionCodeID uint   `json:"redemptionCodeId"` // 兑换码 ID
+	ProviderId       uint   `json:"providerId"`
+	ImageId          uint   `json:"imageId"`
+	CPUId            string `json:"cpuId"`
+	MemoryId         string `json:"memoryId"`
+	DiskId           string `json:"diskId"`
+	BandwidthId      string `json:"bandwidthId"`
+	SessionId        string `json:"sessionId,omitempty"` // Provider资源预留会话ID
+	// 复制模式（LXD/Incus 与 Docker/Podman/Containerd/Orbstack 容器节点）
+	CreationMode    string `json:"creationMode,omitempty"`    // "standard"（默认）或 "copy"
+	SourceContainer string `json:"sourceContainer,omitempty"` // 复制模式下的源容器名称
+	// GPU直通配置（LXD/Incus 原生支持，Docker/Podman/Containerd/Orbstack 尽力通过运行参数附加）
+	GpuEnabled   bool   `json:"gpuEnabled"`   // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds"` // GPU设备ID列表（逗号分隔）
+}
+
+// RedemptionCodeListRequest 兑换码列表请求
+type RedemptionCodeListRequest struct {
+	common.PageInfo
+	Code       string `json:"code" form:"code"`
+	Status     string `json:"status" form:"status"`
+	ProviderID uint   `json:"providerId" form:"providerId"`
+}
+
+// BatchCreateRedemptionCodesRequest 批量创建兑换码请求
+type BatchCreateRedemptionCodesRequest struct {
+	ProviderID   uint   `json:"providerId" binding:"required"`
+	InstanceType string `json:"instanceType" binding:"required,oneof=container vm"`
+	ImageId      uint   `json:"imageId"`
+	CPUId        string `json:"cpuId"`
+	MemoryId     string `json:"memoryId"`
+	DiskId       string `json:"diskId"`
+	BandwidthId  string `json:"bandwidthId"`
+	Count        int    `json:"count" binding:"required,min=1,max=100"`
+	Remark       string `json:"remark"`
+	// 复制模式（LXD/Incus 与 Docker/Podman/Containerd/Orbstack 容器节点）
+	CreationMode    string `json:"creationMode"`    // "standard"（默认）或 "copy"
+	SourceContainer string `json:"sourceContainer"` // 复制模式下的源容器名称（仅 copy 模式）
+	// GPU直通配置（LXD/Incus 原生支持，Docker/Podman/Containerd/Orbstack 尽力通过运行参数附加）
+	GpuEnabled   bool   `json:"gpuEnabled"`   // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds"` // GPU设备ID列表（逗号分隔），为空则附加所有GPU
+}
+
+// BatchDeleteRedemptionCodesRequest 批量删除兑换码请求
+type BatchDeleteRedemptionCodesRequest struct {
+	IDs []uint `json:"ids" binding:"required,min=1"`
+}
+
+// ExportRedemptionCodesRequest 导出兑换码请求
+type ExportRedemptionCodesRequest struct {
+	IDs    []uint   `json:"ids"`    // 为空则导出所有
+	Fields []string `json:"fields"` // 要导出的字段列表，为空则导出所有字段
+	Lang   string   `json:"lang"`   // 语言: zh-CN, en-US
+}
+
+// InstanceOperationTaskRequest 实例操作任务数据结构（启动、停止、重启、重置）
+type InstanceOperationTaskRequest struct {
+	InstanceId uint `json:"instanceId"`
+	ProviderId uint `json:"providerId"`
+}
+
+// DeleteInstanceTaskRequest 删除实例任务数据结构
+type DeleteInstanceTaskRequest struct {
+	InstanceId     uint `json:"instanceId"`
+	ProviderId     uint `json:"providerId"`
+	AdminOperation bool `json:"adminOperation,omitempty"` // 是否为管理员操作
+}
+
+// ResetPasswordTaskRequest 重置密码任务数据结构
+type ResetPasswordTaskRequest struct {
+	InstanceId uint `json:"instanceId"`
+	ProviderId uint `json:"providerId"`
+}
+
+// CreatePortMappingTaskRequest 创建端口映射任务数据结构
+type CreatePortMappingTaskRequest struct {
+	PortID       uint   `json:"portId"`       // 端口映射ID
+	InstanceID   uint   `json:"instanceId"`   // 实例ID
+	ProviderID   uint   `json:"providerId"`   // Provider ID
+	HostPort     int    `json:"hostPort"`     // 主机起始端口
+	HostPortEnd  int    `json:"hostPortEnd"`  // 主机结束端口（单端口时为0）
+	GuestPort    int    `json:"guestPort"`    // 容器起始端口
+	GuestPortEnd int    `json:"guestPortEnd"` // 容器结束端口（单端口时为0）
+	PortCount    int    `json:"portCount"`    // 端口数量
+	Protocol     string `json:"protocol"`     // 协议
+	Description  string `json:"description"`  // 描述
+}
+
+// DeletePortMappingTaskRequest 删除端口映射任务数据结构
+type DeletePortMappingTaskRequest struct {
+	PortID     uint `json:"portId"`     // 端口映射ID
+	InstanceID uint `json:"instanceId"` // 实例ID
+	ProviderID uint `json:"providerId"` // Provider ID
+}
+
+// SyncPortMappingsTaskRequest 同步端口映射任务数据结构
+type SyncPortMappingsTaskRequest struct {
+	ProviderIDs     []uint `json:"providerIds,omitempty"`     // 指定要同步的Provider IDs（为空则同步所有）
+	DryRun          bool   `json:"dryRun,omitempty"`          // 仅生成预览，不创建同步任务
+	IncludedPortIDs []uint `json:"includedPortIds,omitempty"` // 预览后确认删除的端口ID；为空表示执行完整同步
+	ExcludedPortIDs []uint `json:"excludedPortIds,omitempty"` // 预览后取消勾选的端口ID
+}
+
+type SyncPortMappingCandidate struct {
+	PortID       uint   `json:"portId"`
+	InstanceID   uint   `json:"instanceId"`
+	InstanceName string `json:"instanceName"`
+	ProviderID   uint   `json:"providerId"`
+	ProviderName string `json:"providerName"`
+	HostPort     int    `json:"hostPort"`
+	GuestPort    int    `json:"guestPort"`
+	Protocol     string `json:"protocol"`
+	PortType     string `json:"portType"`
+	IsSSH        bool   `json:"isSsh"`
+	IsAutomatic  bool   `json:"isAutomatic"`
+	MappingType  string `json:"mappingType"`
+	Reason       string `json:"reason"`
+}
+
+type SyncProviderPortMappingsPreview struct {
+	ProviderID     uint                       `json:"providerId"`
+	ProviderName   string                     `json:"providerName"`
+	Healthy        bool                       `json:"healthy"`
+	Error          string                     `json:"error,omitempty"`
+	Checked        int                        `json:"checked"`
+	CandidateCount int                        `json:"candidateCount"`
+	Candidates     []SyncPortMappingCandidate `json:"candidates"`
+}
+
+type SyncPortMappingsPreviewResponse struct {
+	ProviderCount  int                               `json:"providerCount"`
+	CandidateCount int                               `json:"candidateCount"`
+	Providers      []SyncProviderPortMappingsPreview `json:"providers"`
+}
+
+// CheckPortAvailabilityRequest 检查端口可用性请求
+type CheckPortAvailabilityRequest struct {
+	ProviderID  uint   `json:"providerId" binding:"required"`                         // Provider ID
+	HostPort    int    `json:"hostPort" binding:"required,min=1,max=65535"`           // 要检查的主机端口（起始端口）
+	PortCount   int    `json:"portCount" binding:"omitempty,min=1,max=1500"`          // 端口数量（默认1，检查端口段时使用）
+	Protocol    string `json:"protocol" binding:"required,oneof=tcp udp both"`        // 协议类型
+	MappingType string `json:"mappingType" binding:"omitempty,oneof=node controller"` // 映射位置，默认节点侧
+}
+
+// CheckPortAvailabilityResponse 端口可用性检查响应
+type CheckPortAvailabilityResponse struct {
+	Available        bool   `json:"available"`        // 是否所有端口都可用
+	UnavailablePorts []int  `json:"unavailablePorts"` // 不可用的端口列表
+	AvailablePorts   []int  `json:"availablePorts"`   // 可用的端口列表
+	Message          string `json:"message"`          // 检查结果描述
+	PortRange        string `json:"portRange"`        // 端口范围描述（如 "10000-10009"）
+	Suggestion       string `json:"suggestion"`       // 建议（如果有冲突，提供替代方案）
+}

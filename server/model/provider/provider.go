@@ -1,0 +1,731 @@
+package provider
+
+import (
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+// TrafficStatsMode 流量统计性能模式
+const (
+	TrafficStatsModeHigh     = "high"     // 高性能模式（8核+独立服务器）
+	TrafficStatsModeStandard = "standard" // 标准模式（4-8核独立服务器）
+	TrafficStatsModeLight    = "light"    // 轻量模式（2-4核独立服务器，默认）
+	TrafficStatsModeMinimal  = "minimal"  // 最小模式（共享VPS/无独享内核）
+	TrafficStatsModeCustom   = "custom"   // 自定义模式
+)
+
+// TrafficStatsPreset 流量统计预设配置
+type TrafficStatsPreset struct {
+	SQLiteCollectInterval int // SQLite采集间隔（秒），采集后自动同步统计
+	CollectBatchSize      int // 采集批量大小（每次处理的实例数）
+	LimitCheckInterval    int // 流量限制检测间隔（秒）
+	LimitCheckBatchSize   int // 流量限制检测批量大小
+	AutoResetInterval     int // 自动重置检查间隔（秒）
+	AutoResetBatchSize    int // 自动重置批量大小
+}
+
+// GetTrafficStatsPreset 根据模式获取预设配置
+func GetTrafficStatsPreset(mode string) TrafficStatsPreset {
+	switch mode {
+	case TrafficStatsModeHigh:
+		// 高性能模式（8核+）- CPU占用10-15%, 响应快
+		return TrafficStatsPreset{
+			SQLiteCollectInterval: 30,  // 0.5分钟采集+统计
+			CollectBatchSize:      20,  // 批量20个
+			LimitCheckInterval:    30,  // 30秒检测
+			LimitCheckBatchSize:   20,  // 批量20个
+			AutoResetInterval:     600, // 10分钟检查
+			AutoResetBatchSize:    20,  // 批量20个
+		}
+	case TrafficStatsModeStandard:
+		// 标准模式（4-8核）- CPU占用5-10%, 响应正常
+		return TrafficStatsPreset{
+			SQLiteCollectInterval: 60,  // 1分钟采集+统计
+			CollectBatchSize:      15,  // 批量15个
+			LimitCheckInterval:    60,  // 1分钟检测
+			LimitCheckBatchSize:   15,  // 批量15个
+			AutoResetInterval:     900, // 15分钟检查
+			AutoResetBatchSize:    15,  // 批量15个
+		}
+	case TrafficStatsModeLight:
+		// 轻量模式（2-4核，默认）- CPU占用2-5%, 资源友好
+		return TrafficStatsPreset{
+			SQLiteCollectInterval: 90,   // 1.5分钟采集+统计
+			CollectBatchSize:      10,   // 批量10个
+			LimitCheckInterval:    90,   // 1.5分钟检测
+			LimitCheckBatchSize:   10,   // 批量10个
+			AutoResetInterval:     1800, // 30分钟检查
+			AutoResetBatchSize:    10,   // 批量10个
+		}
+	case TrafficStatsModeMinimal:
+		// 最小模式（共享VPS）- CPU占用0.5-2%, 极低负载
+		return TrafficStatsPreset{
+			SQLiteCollectInterval: 120,  // 2分钟采集+统计
+			CollectBatchSize:      5,    // 批量5个
+			LimitCheckInterval:    120,  // 2分钟检测
+			LimitCheckBatchSize:   5,    // 批量5个
+			AutoResetInterval:     3600, // 60分钟检查
+			AutoResetBatchSize:    5,    // 批量5个
+		}
+	default:
+		// 返回轻量模式作为默认
+		return GetTrafficStatsPreset(TrafficStatsModeLight)
+	}
+}
+
+type Provider struct {
+	// 基础字段
+	ID        uint      `json:"id" gorm:"primarykey"`                     // 主键ID
+	UUID      string    `json:"uuid" gorm:"uniqueIndex;not null;size:36"` // 唯一标识符
+	CreatedAt time.Time `json:"createdAt"`                                // 创建时间
+	UpdatedAt time.Time `json:"updatedAt"`                                // 更新时间
+
+	// 基本信息
+	// name已有uniqueIndex，type添加索引
+	Name        string `json:"name" gorm:"uniqueIndex;not null;size:64"`    // Provider名称（唯一）
+	Description string `json:"description" gorm:"type:text"`                // Provider描述（管理员备注）
+	Type        string `json:"type" gorm:"not null;size:32;index:idx_type"` // Provider类型：docker, podman, containerd, orbstack, lxd, incus, proxmox, qemu, kubevirt, vmware
+	Endpoint    string `json:"endpoint" gorm:"size:255"`                    // SSH连接端点地址
+	PortIP      string `json:"portIP" gorm:"size:255"`                      // 端口映射使用的公网IP（非必填，若为空则使用Endpoint）
+	SSHPort     int    `json:"sshPort" gorm:"default:22"`                   // SSH连接端口
+	Username    string `json:"username" gorm:"size:128"`                    // SSH连接用户名
+	Password    string `json:"-" gorm:"size:255"`                           // SSH连接密码（不返回给前端）
+	SSHKey      string `json:"-" gorm:"type:text"`                          // SSH私钥（不返回给前端，优先于密码使用）
+	Token       string `json:"-" gorm:"size:255"`                           // API访问令牌（不返回给前端）
+	Config      string `json:"config" gorm:"type:text"`                     // 额外配置信息（JSON格式）
+
+	// 状态和地理信息
+	Status      string `json:"status" gorm:"default:active;size:16;index:idx_status"` // Provider状态：active, inactive
+	Region      string `json:"region" gorm:"size:64;index:idx_region"`                // 地区
+	Country     string `json:"country" gorm:"size:64"`                                // 国家
+	CountryCode string `json:"countryCode" gorm:"size:8"`                             // 国家代码
+	City        string `json:"city" gorm:"size:64"`                                   // 城市（可选）
+	Version     string `json:"version" gorm:"size:32;default:''"`                     // 虚拟化平台版本（如Proxmox版本）
+
+	// 功能支持
+	ContainerEnabled      bool   `json:"container_enabled" gorm:"default:true"` // 是否支持容器实例
+	VirtualMachineEnabled bool   `json:"vm_enabled" gorm:"default:false"`       // 是否支持虚拟机实例
+	SupportedTypes        string `json:"supported_types" gorm:"size:128"`       // 支持的实例类型列表
+	AllowClaim            bool   `json:"allowClaim" gorm:"default:true"`        // 是否允许用户使用此Provider
+	RedeemCodeOnly        bool   `json:"redeemCodeOnly" gorm:"default:false"`   // 是否仅支持兑换码兑换（开启后用户申请界面隐藏常规配置表单）
+
+	// 端口映射配置
+	IPv4PortMappingMethod string `json:"ipv4PortMappingMethod" gorm:"size:16;default:device_proxy"` // IPv4端口映射方式：device_proxy, iptables, native
+	IPv6PortMappingMethod string `json:"ipv6PortMappingMethod" gorm:"size:16;default:device_proxy"` // IPv6端口映射方式：device_proxy, iptables, native
+
+	// 配额管理
+	UsedQuota      int        `json:"usedQuota" gorm:"default:0"`                     // 已使用配额（传统字段，兼容性保留）
+	TotalQuota     int        `json:"totalQuota" gorm:"default:0"`                    // 总配额（传统字段，兼容性保留）
+	Architecture   string     `json:"architecture" gorm:"size:16;default:amd64"`      // CPU架构：amd64, arm64, s390x等
+	ExpiresAt      *time.Time `json:"expiresAt" gorm:"index;column:expires_at"`       // Provider过期时间
+	IsFrozen       bool       `json:"isFrozen" gorm:"default:false;index:idx_frozen"` // 是否被冻结（冻结后无法使用，除了删除操作）
+	IsManualExpiry bool       `json:"isManualExpiry" gorm:"default:false"`            // 是否手动设置了过期时间
+	FrozenReason   string     `json:"frozenReason" gorm:"size:255"`                   // 冻结原因
+	FrozenAt       *time.Time `json:"frozenAt"`                                       // 冻结时间
+
+	// 存储配置（所有Provider类型通用）
+	StoragePool     string `json:"storagePool" gorm:"size:64;default:local"`   // 存储池名称，用于存储虚拟机磁盘和容器
+	StoragePoolPath string `json:"storagePoolPath" gorm:"size:255;default:''"` // 存储池实际挂载路径，用于准确获取硬盘大小
+
+	// 证书相关字段（用于TLS连接）
+	CertPath        string     `json:"certPath" gorm:"size:512"`                 // 客户端证书文件路径
+	KeyPath         string     `json:"keyPath" gorm:"size:512"`                  // 客户端私钥文件路径
+	CACertPath      string     `json:"caCertPath" gorm:"size:512"`               // CA证书文件路径
+	CertFingerprint string     `json:"certFingerprint" gorm:"size:128"`          // 证书指纹
+	APIStatus       string     `json:"apiStatus" gorm:"default:unknown;size:16"` // API连接状态：online, offline, unknown
+	SSHStatus       string     `json:"sshStatus" gorm:"default:unknown;size:16"` // SSH连接状态：online, offline, unknown
+	LastAPICheck    *time.Time `json:"lastApiCheck"`                             // 最后一次API健康检查时间
+	LastSSHCheck    *time.Time `json:"lastSshCheck"`                             // 最后一次SSH健康检查时间
+
+	// 配置管理字段
+	AuthConfig       string     `json:"-" gorm:"type:text"`                  // 完整认证配置JSON（不返回给前端）
+	ConfigVersion    int        `json:"configVersion" gorm:"default:0"`      // 配置版本号
+	AutoConfigured   bool       `json:"autoConfigured" gorm:"default:false"` // 是否已经自动配置完成
+	LastConfigUpdate *time.Time `json:"lastConfigUpdate"`                    // 最后一次配置更新时间
+	ConfigBackupPath string     `json:"configBackupPath" gorm:"size:512"`    // 配置备份文件路径
+	CertContent      string     `json:"-" gorm:"type:text"`                  // 证书内容（不返回给前端）
+	KeyContent       string     `json:"-" gorm:"type:text"`                  // 私钥内容（不返回给前端）
+	TokenContent     string     `json:"-" gorm:"type:text"`                  // Token内容JSON格式（不返回给前端）
+
+	// 节点硬件资源信息（通过SSH查询获得）
+	NodeCPUCores            int   `json:"nodeCpuCores" gorm:"default:0"`            // 节点总CPU核心数
+	NodeMemoryTotal         int64 `json:"nodeMemoryTotal" gorm:"default:0"`         // 节点总内存大小（MB）
+	NodeMemoryPhysicalTotal int64 `json:"nodeMemoryPhysicalTotal" gorm:"default:0"` // 节点物理内存大小（MB，不含Swap）
+	NodeMemorySwapTotal     int64 `json:"nodeMemorySwapTotal" gorm:"default:0"`     // 节点Swap大小（MB）
+	NodeDiskTotal           int64 `json:"nodeDiskTotal" gorm:"default:0"`           // 节点总磁盘空间（MB）
+
+	// 并发控制配置
+	AllowConcurrentTasks bool `json:"allowConcurrentTasks" gorm:"default:false"` // 是否允许并发执行任务
+	MaxConcurrentTasks   int  `json:"maxConcurrentTasks" gorm:"default:1"`       // 最大并发任务数量
+
+	// SSH连接配置
+	SSHConnectTimeout int `json:"sshConnectTimeout" gorm:"default:30"`  // SSH连接超时时间（秒），默认30秒
+	SSHExecuteTimeout int `json:"sshExecuteTimeout" gorm:"default:300"` // SSH命令执行超时时间（秒），默认300秒
+
+	// 任务调度配置
+	TaskPollInterval  int  `json:"taskPollInterval" gorm:"default:60"`    // 任务轮询间隔（秒）
+	EnableTaskPolling bool `json:"enableTaskPolling" gorm:"default:true"` // 是否启用任务轮询机制
+
+	// 操作执行配置
+	ExecutionRule string `json:"executionRule" gorm:"default:auto;size:16"` // 操作轮转规则：auto(自动切换), api_only(仅API), ssh_only(仅SSH)
+
+	// Proxmox 网桥配置（NodeInstallType == "third_party" 时生效，否则使用脚本安装的默认值）
+	// 脚本安装(script)时固定使用：vmbr0(独立IPv4), vmbr1(NAT), vmbr2(独立IPv6)
+	NodeInstallType   string `json:"nodeInstallType" gorm:"size:16;default:script"` // 节点安装类型：script（本项目脚本安装）, third_party（第三方安装）
+	BridgeNAT         string `json:"bridgeNAT" gorm:"size:32;default:''"`           // NAT网桥（v4/v6 NAT），仅proxmox+third_party时使用，对应vmbr1
+	BridgeDedicatedV4 string `json:"bridgeDedicatedV4" gorm:"size:32;default:''"`   // 独立IPv4网桥，仅proxmox+third_party时使用，对应vmbr0
+	BridgeDedicatedV6 string `json:"bridgeDedicatedV6" gorm:"size:32;default:''"`   // 独立IPv6网桥，仅proxmox+third_party时使用，对应vmbr2，可留空
+	NATSubnet         string `json:"natSubnet" gorm:"size:32;default:''"`           // NAT内网网段（CIDR，如 172.16.1.0/24），仅proxmox+third_party时使用
+	PveKvmAvailable   *bool  `json:"pveKvmAvailable" gorm:"default:null"`           // Proxmox节点是否支持KVM硬件加速（nil=未知，true=支持，false=不支持/仅QEMU软件模拟）
+	// 实例数量限制配置
+	MaxContainerInstances int `json:"maxContainerInstances" gorm:"default:0"` // 最大容器实例数量（0表示无限制）
+	MaxVMInstances        int `json:"maxVMInstances" gorm:"default:0"`        // 最大虚拟机实例数量（0表示无限制）
+
+	// 容器资源配额管理配置（Provider层面）
+	// 这些配置决定该资源是否计入Provider总量预算，不影响实例创建时的资源参数设置
+	// false=允许超分配（不计入总量），true=严格限制（计入总量）
+	ContainerLimitCPU    bool `json:"containerLimitCpu" gorm:"default:false"`    // 容器CPU是否计入Provider总量预算，默认false（允许超分配）
+	ContainerLimitMemory bool `json:"containerLimitMemory" gorm:"default:false"` // 容器内存是否计入Provider总量预算，默认false（允许超分配）
+	ContainerLimitDisk   bool `json:"containerLimitDisk" gorm:"default:true"`    // 容器硬盘是否计入Provider总量预算，默认true（严格限制）
+
+	// 虚拟机资源配额管理配置（Provider层面）
+	// 这些配置决定该资源是否计入Provider总量预算，不影响实例创建时的资源参数设置
+	// false=允许超分配（不计入总量），true=严格限制（计入总量）
+	VMLimitCPU    bool `json:"vmLimitCpu" gorm:"default:true"`    // 虚拟机CPU是否计入Provider总量预算，默认true（严格限制）
+	VMLimitMemory bool `json:"vmLimitMemory" gorm:"default:true"` // 虚拟机内存是否计入Provider总量预算，默认true（严格限制）
+	VMLimitDisk   bool `json:"vmLimitDisk" gorm:"default:true"`   // 虚拟机硬盘是否计入Provider总量预算，默认true（严格限制）
+
+	// 端口映射配置
+	DefaultPortCount  int    `json:"defaultPortCount" gorm:"default:10"`                   // 每个实例默认映射端口数量
+	PortRangeStart    int    `json:"portRangeStart" gorm:"default:10000"`                  // 端口映射范围起始
+	PortRangeEnd      int    `json:"portRangeEnd" gorm:"default:65535"`                    // 端口映射范围结束
+	NextAvailablePort int    `json:"nextAvailablePort" gorm:"default:10000"`               // 下一个可用端口
+	FixedPorts        []int  `json:"fixedPorts" gorm:"serializer:json;type:text"`          // 固定实例内端口，宿主机端口仍从端口池分配；22 强制保留
+	NetworkType       string `json:"networkType" gorm:"default:nat_ipv4;size:32;not null"` // 网络配置类型：nat_ipv4, nat_ipv4_ipv6, dedicated_ipv4, dedicated_ipv4_ipv6, ipv6_only
+
+	// 带宽配置（Mbps为单位）
+	DefaultInboundBandwidth  int `json:"defaultInboundBandwidth" gorm:"default:300"`  // 默认入站带宽限制（Mbps）
+	DefaultOutboundBandwidth int `json:"defaultOutboundBandwidth" gorm:"default:300"` // 默认出站带宽限制（Mbps）
+	MaxInboundBandwidth      int `json:"maxInboundBandwidth" gorm:"default:1000"`     // 最大入站带宽限制（Mbps）
+	MaxOutboundBandwidth     int `json:"maxOutboundBandwidth" gorm:"default:1000"`    // 最大出站带宽限制（Mbps）
+
+	// 磁盘读写 I/O 速率限制（Provider 默认值，按实例类型区分；空值表示不限制，后端 best-effort 应用）
+	ContainerReadIOLimit  string `json:"containerReadIoLimit" gorm:"size:32"`  // 容器读速率限制，如 "50MB"
+	ContainerWriteIOLimit string `json:"containerWriteIoLimit" gorm:"size:32"` // 容器写速率限制，如 "50MB"
+	VMReadIOLimit         string `json:"vmReadIoLimit" gorm:"size:32"`         // 虚拟机读速率限制，如 "50MB"
+	VMWriteIOLimit        string `json:"vmWriteIoLimit" gorm:"size:32"`        // 虚拟机写速率限制，如 "50MB"
+
+	// 流量管理（MB为单位）
+	EnableTrafficControl     bool       `json:"enableTrafficControl" gorm:"default:false"`       // 是否启用流量统计和限制，默认不启用
+	EnableResourceMonitoring bool       `json:"enableResourceMonitoring" gorm:"default:false"`   // 是否启用硬件资源监控（CPU/内存/磁盘），默认不启用
+	MaxTraffic               int64      `json:"maxTraffic" gorm:"default:1048576"`               // 最大流量限制（默认1TB=1048576MB）
+	TrafficLimited           bool       `json:"trafficLimited" gorm:"default:false"`             // 是否因流量超限被限制
+	TrafficResetAt           *time.Time `json:"trafficResetAt"`                                  // 流量重置时间
+	TrafficResetDay          *int       `json:"trafficResetDay" gorm:"column:traffic_reset_day"` // 每月流量重置日期，nil/0表示每月1日自然月重置
+	TrafficCountMode         string     `json:"trafficCountMode" gorm:"default:both;size:16"`    // 流量统计模式：both(双向), out(仅出向), in(仅入向)
+	TrafficMultiplier        float64    `json:"trafficMultiplier" gorm:"default:1.0"`            // 流量计费倍率（例如：入向0.5倍，出向1倍）
+	TrafficSyncMethod        string     `json:"trafficSyncMethod" gorm:"default:agent;size:16"`  // 流量同步方式：pmacct(传统SSH采集), agent(Rust Agent采集)
+
+	// 流量统计性能配置
+	TrafficStatsMode           string `json:"trafficStatsMode" gorm:"default:light;size:16"`                               // 流量统计性能模式：high(高性能), standard(标准), light(轻量), minimal(最小), custom(自定义)
+	TrafficCollectInterval     int    `json:"trafficCollectInterval" gorm:"column:traffic_collect_interval;default:300"`   // 流量采集间隔（秒），采集后自动统计，默认300秒（5分钟）
+	TrafficCollectBatchSize    int    `json:"trafficCollectBatchSize" gorm:"column:traffic_collect_batch_size;default:10"` // 流量采集批量大小，默认10个
+	TrafficLimitCheckInterval  int    `json:"trafficLimitCheckInterval" gorm:"default:600"`                                // 流量限制检测间隔（秒），默认600秒（10分钟）
+	TrafficLimitCheckBatchSize int    `json:"trafficLimitCheckBatchSize" gorm:"default:10"`                                // 流量限制检测批量大小，默认10个
+	TrafficAutoResetInterval   int    `json:"trafficAutoResetInterval" gorm:"default:1800"`                                // 流量自动重置检查间隔（秒），默认1800秒（30分钟）
+	TrafficAutoResetBatchSize  int    `json:"trafficAutoResetBatchSize" gorm:"default:10"`                                 // 流量自动重置批量大小，默认10个
+
+	// 资源占用统计（基于实际创建的实例计算）
+	UsedCPUCores     int        `json:"usedCpuCores" gorm:"default:0"`       // 已占用的CPU核心数
+	UsedMemory       int64      `json:"usedMemory" gorm:"default:0"`         // 已占用的内存大小（MB）
+	UsedDisk         int64      `json:"usedDisk" gorm:"default:0"`           // 已占用的磁盘空间（MB）
+	ContainerCount   int        `json:"containerCount" gorm:"default:0"`     // 当前运行的容器实例数量（缓存值，定期更新）
+	VMCount          int        `json:"vmCount" gorm:"default:0"`            // 当前运行的虚拟机实例数量（缓存值，定期更新）
+	ResourceSynced   bool       `json:"resourceSynced" gorm:"default:false"` // 资源信息是否已同步
+	ResourceSyncedAt *time.Time `json:"resourceSyncedAt"`                    // 资源信息最后同步时间
+	CountCacheExpiry *time.Time `json:"countCacheExpiry"`                    // 数量缓存过期时间（避免频繁查询数据库）
+
+	// 可用资源统计（动态计算得出）
+	AvailableCPUCores int   `json:"availableCpuCores" gorm:"default:0"` // 可用的CPU核心数（NodeCPUCores - UsedCPUCores）
+	AvailableMemory   int64 `json:"availableMemory" gorm:"default:0"`   // 可用的内存大小（NodeMemoryTotal - UsedMemory）
+	UsedInstances     int   `json:"usedInstances" gorm:"default:0"`     // 已使用的实例总数（ContainerCount + VMCount）
+
+	// 节点级别的等级限制配置（JSON格式存储）
+	// 用于限制该节点上不同等级用户能创建的最大资源，与全局等级配置类似但仅对当前节点生效
+	// 该字段会与用户全局等级限制进行比较，取两者的最小值作为实际限制
+	LevelLimits string `json:"levelLimits" gorm:"type:text"` // JSON格式: map[int]config.LevelLimitInfo
+
+	// 节点标识信息（用于区分多个hostname相同的节点）
+	HostName string `json:"hostName" gorm:"size:128"` // 节点主机名（hostname），由健康检查自动更新
+
+	// 普通管理员归属
+	OwnerAdminID     uint   `json:"ownerAdminId" gorm:"default:0;index:idx_owner_admin"` // 归属普通管理员ID(0=超级管理员)
+	ProviderGroupID  uint   `json:"groupId" gorm:"default:0;index"`                      // 所属节点分组ID（0=未分组）
+	GroupName        string `json:"groupName" gorm:"size:64"`                            // 分组名称(普通管理员可自定义)
+	GroupDescription string `json:"groupDescription" gorm:"type:text"`                   // 分组描述(Markdown源码，由前端/接口渲染为安全HTML)
+
+	// 域名绑定开关（高级配置）
+	EnableDomainBinding bool `json:"enableDomainBinding" gorm:"default:false"` // 是否启用域名绑定功能
+
+	// WebVNC 高级配置：默认关闭。仅对支持图形控制台的VM类Provider显示WebVNC按钮。
+	EnableVNC   bool   `json:"enableVNC" gorm:"default:false"`     // 是否启用WebVNC入口
+	VNCBasePort int    `json:"vncBasePort" gorm:"default:5900"`    // 直连VNC端口基准，默认5900；实际端口可由实例发现数据覆盖
+	VNCHost     string `json:"vncHost" gorm:"size:128;default:''"` // 可选VNC宿主地址，留空使用Provider Endpoint/PortIP
+
+	// 域名反向代理高级配置
+	ProxyHTTPPort    int        `json:"proxyHttpPort" gorm:"default:80"`       // HTTP反向代理监听端口(默认80)
+	ProxyHTTPSPort   int        `json:"proxyHttpsPort" gorm:"default:443"`     // HTTPS反向代理监听端口(默认443)
+	ProxyEnableHTTP  bool       `json:"proxyEnableHttp" gorm:"default:true"`   // 是否启用HTTP反向代理
+	ProxyEnableHTTPS bool       `json:"proxyEnableHttps" gorm:"default:false"` // 是否启用HTTPS反向代理
+	ProxyTLSCertPath string     `json:"proxyTlsCertPath" gorm:"size:512"`      // TLS证书文件路径(节点上的绝对路径)
+	ProxyTLSKeyPath  string     `json:"proxyTlsKeyPath" gorm:"size:512"`       // TLS私钥文件路径(节点上的绝对路径)
+	ProxyTLSCertData string     `json:"-" gorm:"type:text"`                    // TLS证书内容(Base64编码，不返回给前端)
+	ProxyTLSKeyData  string     `json:"-" gorm:"type:text"`                    // TLS私钥内容(Base64编码，不返回给前端)
+	ProxyAutoSync    bool       `json:"proxyAutoSync" gorm:"default:true"`     // 是否自动同步证书到节点
+	ProxySyncedAt    *time.Time `json:"proxySyncedAt"`                         // 证书最后同步时间
+
+	// 签到续期开关（高级配置）
+	EnableCheckin bool `json:"enableCheckin" gorm:"default:false"` // 是否启用签到续期
+
+	// 流量超限动作
+	TrafficOverLimitAction string `json:"trafficOverLimitAction" gorm:"size:16;default:stop"` // 流量超限操作: stop(停机), speed_limit(限速), freeze(冻结), mark_only(仅标记)
+	TrafficSpeedLimitKbps  int    `json:"trafficSpeedLimitKbps" gorm:"default:1024"`          // 限速值(Kbps), 仅speed_limit模式生效
+	TrafficQuotaVisible    bool   `json:"trafficQuotaVisible" gorm:"default:true"`            // 用户侧是否显示流量额度与用量
+
+	// 实例到期处置策略
+	InstanceExpiryAction     string `json:"instanceExpiryAction" gorm:"size:16;default:delete"` // 实例到期操作: delete(删除), freeze(冻结), stop(关机), extend(延期)
+	InstanceExpiryExtendDays int    `json:"instanceExpiryExtendDays" gorm:"default:0"`          // 到期延期天数，仅extend模式生效
+
+	// 容器特殊配置选项（仅适用于 LXD 和 Incus 的容器实例）
+	ContainerPrivileged   bool   `json:"containerPrivileged" gorm:"default:false"`          // 容器特权模式：允许容器访问宿主机资源
+	ContainerAllowNesting bool   `json:"containerAllowNesting" gorm:"default:false"`        // 容器嵌套：允许在容器内运行容器
+	ContainerEnableLXCFS  bool   `json:"containerEnableLxcfs" gorm:"default:true"`          // LXCFS资源视图：显示真实资源限制
+	ContainerCPUAllowance string `json:"containerCpuAllowance" gorm:"default:100%;size:16"` // CPU限制：例如 "100%" 或 "50%"
+	ContainerMemorySwap   bool   `json:"containerMemorySwap" gorm:"default:true"`           // 内存交换：允许使用swap空间
+	ContainerMaxProcesses int    `json:"containerMaxProcesses" gorm:"default:0"`            // 最大进程数：0表示不限制
+	ContainerDiskIOLimit  string `json:"containerDiskIoLimit" gorm:"size:32"`               // 磁盘IO限制：例如 "10MB" 或 "100iops"
+
+	// GPU直通配置（仅适用于 LXD 和 Incus 节点）
+	GpuEnabled   bool   `json:"gpuEnabled" gorm:"default:false"` // 是否启用GPU直通（创建实例时自动附加GPU设备）
+	GpuDeviceIds string `json:"gpuDeviceIds" gorm:"size:256"`    // GPU设备ID列表（逗号分隔的PCI ID，如"0,1"），为空则附加所有GPU
+	GpuInfo      string `json:"gpuInfo" gorm:"type:json"`        // 缓存GPU/NPU检测结果（JSON数组），供前端展示选择，免去每次检测
+
+	// 连接模式（agent 由 Rust Agent 主动连回控制端，local 直接管理本机 libvirt/QEMU）
+	ConnectionType   string     `json:"connectionType" gorm:"default:ssh;size:16"`  // 连接方式：ssh（控制端主动SSH）/ agent（Agent反向连接）/ local（本机libvirt/QEMU）
+	AgentSecret      string     `json:"-" gorm:"size:128"`                          // Agent 连接鉴权密钥（不返回给前端，由控制端生成）
+	AgentStatus      string     `json:"agentStatus" gorm:"default:offline;size:16"` // Agent 在线状态：online / offline
+	AgentLastSeen    *time.Time `json:"agentLastSeen"`                              // Agent 最后心跳时间
+	AgentConnectedAt *time.Time `json:"agentConnectedAt"`                           // Agent 本次连接建立时间（用于计算在线时长）
+	AgentHostname    string     `json:"agentHostname" gorm:"size:128"`              // Agent 上报的主机名
+	AgentRemoteIP    string     `json:"agentRemoteIP" gorm:"size:64"`               // Agent 连接来源 IP（WebSocket 连接的 RemoteAddr）
+	AgentVersion     string     `json:"agentVersion" gorm:"size:32;default:''"`     // Agent 上报的版本号
+
+	// 非纯净节点实例发现配置。InstanceDiscoveryEnabled 是持久能力开关；
+	// PendingDiscovery 仅表示 Agent 尚未连接时仍有一次待入队的后台任务。
+	InstanceDiscoveryEnabled bool `json:"instanceDiscoveryEnabled" gorm:"default:false;index"` // 录入时是否声明为非纯净节点
+	PendingDiscovery         bool `json:"pendingDiscovery" gorm:"default:false"`               // 是否有待入队的实例同步任务
+	DiscoveryOwnerUserID     uint `json:"discoveryOwnerUserId" gorm:"default:0"`               // 发现实例的归属用户 ID
+	DiscoveryAutoImport      bool `json:"discoveryAutoImport" gorm:"default:true"`             // 发现时是否自动导入
+	DiscoveryAutoAdjust      bool `json:"discoveryAutoAdjust" gorm:"default:true"`             // 发现时是否自动调整配额
+}
+
+type AdminGroupSetting struct {
+	ID               uint      `json:"id" gorm:"primarykey"`
+	OwnerAdminID     uint      `json:"ownerAdminId" gorm:"default:0;index:idx_group_owner_name,unique"`
+	GroupName        string    `json:"groupName" gorm:"size:64;not null;index:idx_group_owner_name,unique"`
+	GroupDescription string    `json:"groupDescription" gorm:"type:text"`
+	SortOrder        int       `json:"sortOrder" gorm:"default:0;index"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+}
+
+func (p *Provider) BeforeCreate(tx *gorm.DB) error {
+	p.UUID = uuid.New().String()
+
+	// 如果没有设置流量统计模式，使用默认轻量模式
+	if p.TrafficStatsMode == "" {
+		p.TrafficStatsMode = TrafficStatsModeLight
+	}
+	if p.TrafficOverLimitAction == "" {
+		p.TrafficOverLimitAction = TrafficOverLimitActionStop
+	}
+	if p.InstanceExpiryAction == "" {
+		p.InstanceExpiryAction = InstanceExpiryActionDelete
+	}
+	if p.TrafficSpeedLimitKbps <= 0 {
+		p.TrafficSpeedLimitKbps = 1024
+	}
+
+	// 应用预设配置（如果不是自定义模式且配置值为0）
+	if p.TrafficStatsMode != TrafficStatsModeCustom {
+		p.ApplyTrafficStatsPreset()
+	}
+
+	// 初始化 JSON 列默认值，避免空字符串写入 MySQL JSON 列导致
+	// "Error 3140: Invalid JSON text: The document is empty."
+	if p.GpuInfo == "" {
+		p.GpuInfo = "[]"
+	}
+	if len(p.FixedPorts) == 0 {
+		p.FixedPorts = []int{22}
+	}
+
+	return nil
+}
+
+func (p *Provider) BeforeSave(tx *gorm.DB) error {
+	if len(p.FixedPorts) == 0 {
+		p.FixedPorts = []int{22}
+	}
+	return nil
+}
+
+// ApplyTrafficStatsPreset 应用流量统计预设配置
+// 强制应用所有预设值（不保留旧值）
+func (p *Provider) ApplyTrafficStatsPreset() {
+	preset := GetTrafficStatsPreset(p.TrafficStatsMode)
+
+	// 强制应用预设配置的所有值
+	p.TrafficCollectInterval = preset.SQLiteCollectInterval
+	p.TrafficCollectBatchSize = preset.CollectBatchSize
+	p.TrafficLimitCheckInterval = preset.LimitCheckInterval
+	p.TrafficLimitCheckBatchSize = preset.LimitCheckBatchSize
+	p.TrafficAutoResetInterval = preset.AutoResetInterval
+	p.TrafficAutoResetBatchSize = preset.AutoResetBatchSize
+}
+
+// GetTrafficStatsConfig 获取流量统计配置
+func (p *Provider) GetTrafficStatsConfig() TrafficStatsPreset {
+	return TrafficStatsPreset{
+		SQLiteCollectInterval: p.TrafficCollectInterval,
+		CollectBatchSize:      p.TrafficCollectBatchSize,
+		LimitCheckInterval:    p.TrafficLimitCheckInterval,
+		LimitCheckBatchSize:   p.TrafficLimitCheckBatchSize,
+		AutoResetInterval:     p.TrafficAutoResetInterval,
+		AutoResetBatchSize:    p.TrafficAutoResetBatchSize,
+	}
+}
+
+// GetAuthMethod 返回当前使用的认证方式。
+// 当节点未配置 SSH 凭据时返回空字符串。
+func (p *Provider) GetAuthMethod() string {
+	// SSH密钥优先
+	if p.SSHKey != "" {
+		return "sshKey"
+	}
+	if p.Password != "" {
+		return "password"
+	}
+	return ""
+}
+
+// Instance 实例模型
+type Instance struct {
+	// 基础字段
+	ID        uint           `json:"id" gorm:"primarykey"`                                                            // 实例主键ID
+	UUID      string         `json:"uuid" gorm:"uniqueIndex;not null;size:36"`                                        // 实例唯一标识符
+	CreatedAt time.Time      `json:"createdAt"`                                                                       // 实例创建时间
+	UpdatedAt time.Time      `json:"updatedAt"`                                                                       // 实例信息更新时间
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index:idx_deleted_at;uniqueIndex:idx_instance_name_provider,priority:3"` // 软删除时间（参与复合唯一，避免软删除实例名称占坑）
+
+	// 基本信息
+	// 添加覆盖索引，包含常用查询字段
+	Name         string `json:"name" gorm:"uniqueIndex:idx_instance_name_provider,priority:1;not null;size:128"`                                                         // 实例名称（与provider_id组合唯一）
+	Provider     string `json:"provider" gorm:"not null;size:64;index:idx_provider_name"`                                                                                // Provider名称
+	ProviderID   uint   `json:"providerId" gorm:"uniqueIndex:idx_instance_name_provider,priority:2;index:idx_provider_id;index:idx_provider_status,priority:1;not null"` // 关联的Provider ID（与name组合唯一）
+	Status       string `json:"status" gorm:"size:32;index:idx_status;index:idx_provider_status,priority:2"`                                                             // 实例状态：creating, running, stopped, failed等
+	Image        string `json:"image" gorm:"size:512"`                                                                                                                   // 使用的镜像名称（多容器场景可包含多个镜像）
+	InstanceType string `json:"instance_type" gorm:"size:16;default:container;index:idx_instance_type"`                                                                  // 实例类型：container, vm
+
+	// 资源配置
+	CPU       int   `json:"cpu" gorm:"default:1"`        // CPU核心数
+	Memory    int64 `json:"memory" gorm:"default:512"`   // 内存大小（MB）
+	Disk      int64 `json:"disk" gorm:"default:10240"`   // 磁盘大小（MB）
+	Bandwidth int   `json:"bandwidth" gorm:"default:10"` // 网络带宽（Mbps）
+
+	// 网络配置
+	Network        string `json:"network" gorm:"size:64"`                      // 网络名称或配置
+	PrivateIP      string `json:"privateIP" gorm:"size:64"`                    // 内网/私有IPv4地址
+	PublicIP       string `json:"publicIP" gorm:"size:64"`                     // 公网IPv4地址
+	IPv6Address    string `json:"ipv6Address" gorm:"size:128"`                 // 内网IPv6地址
+	PublicIPv6     string `json:"publicIPv6" gorm:"size:128"`                  // 公网IPv6地址
+	SSHPort        int    `json:"sshPort" gorm:"default:22"`                   // SSH访问端口
+	PortRangeStart int    `json:"portRangeStart"`                              // 端口映射范围起始
+	PortRangeEnd   int    `json:"portRangeEnd"`                                // 端口映射范围结束
+	NetworkType    string `json:"networkType" gorm:"size:32;default:nat_ipv4"` // 创建时继承的网络类型（用于reset时恢复IPv6配置）
+
+	// 访问凭据
+	Username string `json:"username" gorm:"size:64"`  // 登录用户名
+	Password string `json:"password" gorm:"size:128"` // 登录密码
+
+	// 系统信息
+	OSType string `json:"osType" gorm:"size:64"` // 操作系统类型：ubuntu, centos, debian等
+	Region string `json:"region" gorm:"size:64"` // 所在地区
+
+	// 流量统计（实例层面）
+	MaxTraffic         int64      `json:"maxTraffic" gorm:"default:0"`                        // 实例流量限制（MB），0表示不限制，从用户等级继承
+	TrafficLimited     bool       `json:"trafficLimited" gorm:"default:false"`                // 是否因流量超限被限制
+	TrafficLimitReason string     `json:"trafficLimitReason" gorm:"size:16;default:''"`       // 流量限制原因：instance(实例超限), user(用户超限), provider(Provider超限)
+	TrafficStopped     bool       `json:"trafficStopped" gorm:"default:false"`                // 是否由流量策略自动停机，解除限制后可自动恢复
+	TrafficStoppedAt   *time.Time `json:"trafficStoppedAt"`                                   // 流量策略自动停机时间
+	PmacctInterfaceV4  string     `json:"pmacctInterfaceV4" gorm:"size:32"`                   // pmacct 监控的IPv4网络接口名称
+	PmacctInterfaceV6  string     `json:"pmacctInterfaceV6" gorm:"size:32"`                   // pmacct 监控的IPv6网络接口名称
+	ProviderVMID       string     `json:"providerVmId" gorm:"column:provider_vm_id;size:512"` // 虚拟化平台的可操作实例ID（VMID、容器ID、VMX路径或远端实例名）
+
+	// 生命周期和冻结管理
+	ExpiresAt       *time.Time `json:"expiresAt" gorm:"index:idx_expires_at;column:expires_at"` // 实例到期时间（默认与节点同步，手动设置优先级更高）
+	IsFrozen        bool       `json:"isFrozen" gorm:"default:false;index:idx_frozen"`          // 是否被冻结（冻结后无法操作，除了删除）
+	IsManualExpiry  bool       `json:"isManualExpiry" gorm:"default:false"`                     // 是否手动设置了过期时间（手动设置的优先级高于节点）
+	FrozenReason    string     `json:"frozenReason" gorm:"size:255"`                            // 冻结原因：expired(到期), node_frozen(节点冻结), manual(手动冻结)
+	FrozenAt        *time.Time `json:"frozenAt"`                                                // 冻结时间
+	ExpiryStopped   bool       `json:"expiryStopped" gorm:"default:false"`                      // 是否由过期策略自动停机，续期后可自动恢复
+	ExpiryStoppedAt *time.Time `json:"expiryStoppedAt"`                                         // 过期策略自动停机时间
+
+	// GPU/NPU直通配置（从兑换码/导入时继承，用于展示和运维参考）
+	GpuEnabled   bool   `json:"gpuEnabled" gorm:"default:false"` // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds" gorm:"size:256"`    // GPU设备ID列表（逗号分隔）
+	NpuEnabled   bool   `json:"npuEnabled" gorm:"default:false"` // 是否启用NPU直通
+	NpuDeviceIds string `json:"npuDeviceIds" gorm:"size:256"`    // NPU设备ID列表（逗号分隔）
+
+	// 关联关系
+	// 添加UserID索引以支持按用户查询
+	UserID uint `json:"userId" gorm:"index:idx_user_id;index:idx_user_status,priority:1"` // 所属用户ID
+
+	// 实例导入相关字段
+	IsImported         bool       `json:"isImported" gorm:"default:false;index:idx_imported"` // 是否为导入的实例（从已有provider发现）
+	ImportedAt         *time.Time `json:"importedAt"`                                         // 导入时间
+	HasPortConflict    bool       `json:"hasPortConflict" gorm:"default:false"`               // 是否存在端口冲突
+	PortConflictDetail string     `json:"portConflictDetail" gorm:"type:text"`                // 端口冲突详情（JSON格式记录冲突端口信息）
+	DiscoveredData     string     `json:"discoveredData" gorm:"type:longtext"`                // 发现时的脱敏原始数据（JSON格式，用于调试和审计）
+}
+
+func (i *Instance) BeforeCreate(tx *gorm.DB) error {
+	// Normal instance creation leaves UUID empty and receives a fresh controller
+	// identity. Discovery/import supplies a provider-scoped deterministic UUID so
+	// repeated scans remain stable without exposing or globally colliding remote
+	// runtime identifiers.
+	if strings.TrimSpace(i.UUID) == "" {
+		i.UUID = uuid.New().String()
+	}
+	return nil
+}
+
+func (i Instance) ProviderInstanceIdentifier() string {
+	if value := strings.TrimSpace(i.ProviderVMID); value != "" {
+		return value
+	}
+	return i.Name
+}
+
+// Port 端口映射模型
+type Port struct {
+	// 基础字段
+	ID        uint           `json:"id" gorm:"primarykey"`                                         // 端口映射主键ID
+	CreatedAt time.Time      `json:"createdAt"`                                                    // 创建时间
+	UpdatedAt time.Time      `json:"updatedAt"`                                                    // 更新时间
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:idx_provider_host_port,priority:3"` // 软删除时间（参与唯一索引避免软删除行占坑）
+
+	// 端口映射信息
+	// 为常用查询添加复合索引
+	InstanceID   uint   `json:"instanceId" gorm:"index:idx_instance_ssh,priority:1;index:idx_instance_status,priority:1"` // 关联的实例ID
+	ProviderID   uint   `json:"providerId" gorm:"index:idx_provider_id;uniqueIndex:idx_provider_host_port,priority:1"`    // 关联的Provider ID
+	HostPort     int    `json:"hostPort" gorm:"not null;uniqueIndex:idx_provider_host_port,priority:2"`                   // 宿主机端口（起始端口）
+	HostPortEnd  int    `json:"hostPortEnd" gorm:"default:0"`                                                             // 宿主机端口结束（0表示单端口）
+	GuestPort    int    `json:"guestPort" gorm:"not null"`                                                                // 容器/虚拟机内部端口（起始端口）
+	GuestPortEnd int    `json:"guestPortEnd" gorm:"default:0"`                                                            // 容器/虚拟机内部端口结束（0表示单端口）
+	PortCount    int    `json:"portCount" gorm:"default:1"`                                                               // 端口数量（端口段包含的端口个数）
+	Protocol     string `json:"protocol" gorm:"default:both;size:8"`                                                      // 协议类型：tcp, udp, both
+	Status       string `json:"status" gorm:"default:active;size:16;index:idx_instance_status,priority:2"`                // 映射状态：active, inactive
+	Description  string `json:"description" gorm:"size:256"`                                                              // 端口用途描述（支持更长描述）
+	IsSSH        bool   `json:"isSsh" gorm:"default:false;index:idx_instance_ssh,priority:2"`                             // 是否为SSH端口
+	IsAutomatic  bool   `json:"isAutomatic" gorm:"default:true"`                                                          // 是否为自动分配的端口
+	PortType     string `json:"portType" gorm:"default:range_mapped;size:16"`                                             // 端口类型：range_mapped(区间映射), manual(手动添加), batch(批量添加)
+
+	// IPv6支持
+	IPv6Enabled   bool   `json:"ipv6Enabled" gorm:"default:false"`            // 是否启用IPv6映射
+	IPv6Address   string `json:"ipv6Address" gorm:"size:64"`                  // IPv6映射地址
+	MappingMethod string `json:"mappingMethod" gorm:"size:32;default:native"` // 映射方法：native, iptables, firewall
+
+	// 内网穿透（控制端转发）模式
+	MappingType  string `json:"mappingType" gorm:"size:16;default:node"` // node: 节点侧映射（默认）；controller: 控制端TCP转发
+	InternalHost string `json:"internalHost" gorm:"size:128"`            // 控制端转发目标地址（容器IP或名字）
+}
+
+// PendingDeletion 待删除资源模型
+type PendingDeletion struct {
+	ID           uint      `json:"id" gorm:"primarykey"`
+	CreatedAt    time.Time `json:"createdAt"`
+	ResourceType string    `json:"resourceType" gorm:"not null;size:32"`
+	ResourceID   uint      `json:"resourceId" gorm:"not null"`
+	ResourceUUID string    `json:"resourceUuid" gorm:"not null;size:36"`
+	ScheduledAt  time.Time `json:"scheduledAt"`
+	Status       string    `json:"status" gorm:"default:pending;size:16"`
+}
+
+// HardwareTestReport 硬件测试报告模型（通过粘贴URL获取报告内容）
+type HardwareTestReport struct {
+	ID            uint           `json:"id" gorm:"primarykey"`
+	CreatedAt     time.Time      `json:"createdAt"`
+	UpdatedAt     time.Time      `json:"updatedAt"`
+	DeletedAt     gorm.DeletedAt `json:"-" gorm:"index;uniqueIndex:idx_hardware_report_provider_deleted,priority:2"`
+	ProviderID    uint           `json:"providerId" gorm:"uniqueIndex:idx_hardware_report_provider_deleted,priority:1"`
+	PasteURL      string         `json:"pasteUrl" gorm:"size:512"`        // 粘贴板URL，如 https://paste.spiritlhl.net/#/show/xxx.txt
+	ReportText    string         `json:"reportText" gorm:"type:longtext"` // 从粘贴板URL下载的报告内容
+	VendorSummary string         `json:"vendorSummary" gorm:"type:text"`  // 从报告内容提取出的硬件厂商摘要
+	UpdatedBy     uint           `json:"updatedBy"`                       // 最后更新者
+}
+
+// 以下是业务层结构体（不是数据库模型）
+
+// ProviderInstance 实例信息
+type ProviderInstance struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Status      string            `json:"status"`
+	Type        string            `json:"type"`
+	Image       string            `json:"image"`
+	IP          string            `json:"ip"`          // 内网IP地址（向后兼容）
+	PrivateIP   string            `json:"privateIP"`   // 内网/私有IP地址
+	PublicIP    string            `json:"publicIP"`    // 公网IP地址
+	IPv6Address string            `json:"ipv6Address"` // IPv6地址
+	CPU         string            `json:"cpu"`
+	Memory      string            `json:"memory"`
+	Disk        string            `json:"disk"`
+	Created     time.Time         `json:"created"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+// ProviderImage 镜像信息
+type ProviderImage struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Tag         string            `json:"tag"`
+	Size        string            `json:"size"`
+	Created     time.Time         `json:"created"`
+	Description string            `json:"description"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+// ProviderInstanceConfig 实例配置
+type ProviderInstanceConfig struct {
+	Name         string            `json:"name"`
+	Image        string            `json:"image"`
+	ImageURL     string            `json:"image_url"`  // 镜像下载URL
+	ImagePath    string            `json:"image_path"` // 镜像文件路径
+	UseCDN       bool              `json:"use_cdn"`    // 是否使用CDN加速下载镜像
+	CPU          string            `json:"cpu"`
+	Memory       string            `json:"memory"`
+	Disk         string            `json:"disk"`
+	Network      string            `json:"network"`
+	Ports        []string          `json:"ports"`
+	Env          map[string]string `json:"env"`
+	Metadata     map[string]string `json:"metadata"`
+	InstanceType string            `json:"instance_type"` // container 或 vm
+
+	// 容器特殊配置选项（仅适用于 LXD 和 Incus 的容器实例）
+	Privileged   *bool   `json:"privileged,omitempty"`   // 容器特权模式，使用指针以区分 false 和未设置
+	AllowNesting *bool   `json:"allowNesting,omitempty"` // 容器嵌套
+	EnableLXCFS  *bool   `json:"enableLxcfs,omitempty"`  // LXCFS资源视图
+	CPUAllowance *string `json:"cpuAllowance,omitempty"` // CPU限制
+	MemorySwap   *bool   `json:"memorySwap,omitempty"`   // 内存交换
+	MaxProcesses *int    `json:"maxProcesses,omitempty"` // 最大进程数
+	DiskIOLimit  *string `json:"diskIoLimit,omitempty"`  // 磁盘IO限制
+	ReadIOLimit  *string `json:"readIoLimit,omitempty"`  // 磁盘读取速率限制
+	WriteIOLimit *string `json:"writeIoLimit,omitempty"` // 磁盘写入速率限制
+
+	// GPU直通配置（LXD/Incus 原生支持，Docker/Podman/Containerd/Orbstack 尽力通过运行参数附加）
+	GpuEnabled   bool   `json:"gpuEnabled,omitempty"`   // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds,omitempty"` // GPU设备ID列表（逗号分隔），为空则附加所有GPU
+
+	// 复制模式（LXD/Incus 与 Docker/Podman/Containerd/Orbstack 容器节点）
+	CopyMode       bool   `json:"copyMode,omitempty"`       // 是否使用容器复制模式（lxc copy）代替 lxc launch
+	CopySourceName string `json:"copySourceName,omitempty"` // 复制模式下的源容器名称
+}
+
+// ProviderNodeConfig 节点配置
+type ProviderNodeConfig struct {
+	ID                    uint     `json:"id"` // Provider ID，用于资源清理
+	UUID                  string   `json:"uuid"`
+	Name                  string   `json:"name"`
+	Host                  string   `json:"host"`
+	PortIP                string   `json:"port_ip"` // 端口映射使用的公网IP（非必填，若为空则使用Host）
+	Port                  int      `json:"port"`
+	Username              string   `json:"username"`
+	Password              string   `json:"password"`
+	PrivateKey            string   `json:"private_key"` // SSH私钥内容，优先于密码使用
+	Token                 string   `json:"token"`       // API Token Secret，用于ProxmoxVE等
+	TokenID               string   `json:"token_id"`    // API Token ID，用于ProxmoxVE等 (USER@REALM!TOKENID)
+	CertPath              string   `json:"cert_path"`
+	KeyPath               string   `json:"key_path"`
+	CACertPath            string   `json:"ca_cert_path"`        // API服务端CA证书路径（可选）
+	Country               string   `json:"country"`             // Provider所在国家，用于CDN选择
+	City                  string   `json:"city"`                // Provider所在城市（可选）
+	Architecture          string   `json:"architecture"`        // 架构类型，如amd64, arm64等
+	Type                  string   `json:"type"`                // docker, podman, containerd, orbstack, lxd, incus, proxmox, qemu, kubevirt, vmware, virtualbox, multipass, vagrant
+	SupportedTypes        []string `json:"supported_types"`     // 支持的实例类型: container, vm, both
+	ContainerEnabled      bool     `json:"container_enabled"`   // 是否支持容器
+	VirtualMachineEnabled bool     `json:"vm_enabled"`          // 是否支持虚拟机
+	SSHConnectTimeout     int      `json:"ssh_connect_timeout"` // SSH连接超时时间（秒）
+	SSHExecuteTimeout     int      `json:"ssh_execute_timeout"` // SSH命令执行超时时间（秒）
+	ExecutionRule         string   `json:"execution_rule"`      // 操作轮转规则：auto, api_only, ssh_only
+	NetworkType           string   `json:"networkType"`         // 网络配置类型：nat_ipv4, nat_ipv4_ipv6, dedicated_ipv4, dedicated_ipv4_ipv6, ipv6_only
+	FixedPorts            []int    `json:"fixedPorts"`          // 固定实例内端口，22 强制保留
+	StoragePool           string   `json:"storagePool"`         // 存储池名称；VMware 等本地虚拟化类型可作为实例目录路径使用
+	StoragePoolPath       string   `json:"storagePoolPath"`     // 存储池实际挂载路径，优先级高于 StoragePool
+	// Proxmox 网桥配置（third_party 安装类型时生效）
+	NodeInstallType   string `json:"node_install_type"`   // 节点安装类型：script, third_party
+	BridgeNAT         string `json:"bridge_nat"`          // NAT网桥（替代vmbr1）
+	BridgeDedicatedV4 string `json:"bridge_dedicated_v4"` // 独立IPv4网桥（替代vmbr0）
+	BridgeDedicatedV6 string `json:"bridge_dedicated_v6"` // 独立IPv6网桥（替代vmbr2），可为空
+	NATSubnet         string `json:"nat_subnet"`          // NAT内网网段（CIDR，如 172.16.1.0/24），可为空表示使用默认网段
+	// 容器资源限制配置（Provider层面）
+	ContainerLimitCPU    bool `json:"containerLimitCpu"`    // 容器是否限制CPU数量，默认不限制
+	ContainerLimitMemory bool `json:"containerLimitMemory"` // 容器是否限制内存大小，默认不限制
+	ContainerLimitDisk   bool `json:"containerLimitDisk"`   // 容器是否限制硬盘大小，默认限制
+
+	// 虚拟机资源限制配置（Provider层面）
+	VMLimitCPU    bool `json:"vmLimitCpu"`    // 虚拟机是否限制CPU数量，默认限制
+	VMLimitMemory bool `json:"vmLimitMemory"` // 虚拟机是否限制内存大小，默认限制
+	VMLimitDisk   bool `json:"vmLimitDisk"`   // 虚拟机是否限制硬盘大小，默认限制
+
+	// 磁盘读写 I/O 速率限制（Provider 默认值，按实例类型区分）
+	ContainerReadIOLimit  string `json:"containerReadIoLimit"`  // 容器读取速率限制
+	ContainerWriteIOLimit string `json:"containerWriteIoLimit"` // 容器写入速率限制
+	VMReadIOLimit         string `json:"vmReadIoLimit"`         // 虚拟机读取速率限制
+	VMWriteIOLimit        string `json:"vmWriteIoLimit"`        // 虚拟机写入速率限制
+
+	// 节点标识（用于区分多个相同hostname的节点）
+	HostName string `json:"host_name"` // 节点主机名（hostname），用于Proxmox等需要节点名的Provider
+
+	// 容器特殊配置选项（仅适用于 LXD 和 Incus 的容器实例）
+	ContainerPrivileged   bool   `json:"containerPrivileged"`   // 容器特权模式
+	ContainerAllowNesting bool   `json:"containerAllowNesting"` // 容器嵌套
+	ContainerEnableLXCFS  bool   `json:"containerEnableLxcfs"`  // LXCFS资源视图
+	ContainerCPUAllowance string `json:"containerCpuAllowance"` // CPU限制
+	ContainerMemorySwap   bool   `json:"containerMemorySwap"`   // 内存交换
+	ContainerMaxProcesses int    `json:"containerMaxProcesses"` // 最大进程数
+	ContainerDiskIOLimit  string `json:"containerDiskIoLimit"`  // 磁盘IO限制
+
+	// GPU直通配置（LXD/Incus 原生支持，Docker/Podman/Containerd/Orbstack 尽力通过运行参数附加）
+	GpuEnabled   bool   `json:"gpuEnabled"`   // 是否启用GPU直通
+	GpuDeviceIds string `json:"gpuDeviceIds"` // GPU设备ID列表（逗号分隔），为空则附加所有GPU
+}
+
+// ProviderResponse 用于返回给前端的Provider响应结构
+// 包含认证方式标识，但不包含敏感的密码和SSH密钥内容。
+// 当节点未配置 SSH 凭据时，AuthMethod 为空字符串。
+type ProviderResponse struct {
+	Provider
+	AuthMethod string `json:"authMethod"` // 当前使用的认证方式: "password" 或 "sshKey"
+}
+
+// ToResponse 将Provider转换为ProviderResponse
+func (p *Provider) ToResponse() ProviderResponse {
+	return ProviderResponse{
+		Provider:   *p,
+		AuthMethod: p.GetAuthMethod(),
+	}
+}

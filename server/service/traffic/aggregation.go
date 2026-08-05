@@ -1,0 +1,455 @@
+package traffic
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"oneclickvirt/global"
+	monitoringModel "oneclickvirt/model/monitoring"
+	"oneclickvirt/utils"
+	"oneclickvirt/utils/dbcompat"
+
+	"go.uber.org/zap"
+)
+
+// aggregationInstanceInfo 内部用于记录实例层级信息的辅助结构
+type aggregationInstanceInfo struct {
+	ID         uint
+	ProviderID uint
+	UserID     uint
+}
+
+// AggregationService 流量聚合服务 - 定期将pmacct原始数据聚合到缓存表
+type AggregationService struct {
+	queryService *QueryService
+}
+
+// NewAggregationService 创建流量聚合服务
+func NewAggregationService() *AggregationService {
+	return &AggregationService{
+		queryService: NewQueryService(),
+	}
+}
+
+// AggregateMonthlyTraffic 聚合指定月份的流量数据到缓存表
+// 用于加速查询，避免每次都执行复杂的分段计算
+func (s *AggregationService) AggregateMonthlyTraffic(year, month int) error {
+	global.APP_LOG.Info("开始聚合流量数据",
+		zap.Int("year", year),
+		zap.Int("month", month))
+
+	// 获取所有有流量记录的实例ID
+	var instanceIDs []uint
+	err := global.APP_DB.Table("pmacct_traffic_records").
+		Select("DISTINCT instance_id").
+		Where("year = ? AND month = ?", year, month).
+		Pluck("instance_id", &instanceIDs).Error
+
+	if err != nil {
+		return fmt.Errorf("获取实例ID列表失败: %w", err)
+	}
+
+	if len(instanceIDs) == 0 {
+		global.APP_LOG.Debug("没有需要聚合的流量数据")
+		return nil
+	}
+
+	global.APP_LOG.Debug("找到需要聚合的实例",
+		zap.Int("count", len(instanceIDs)))
+
+	// 预加载所有实例的provider_id和user_id
+	var instanceInfos []aggregationInstanceInfo
+	err = global.APP_DB.Unscoped().Table("instances").
+		Select("id, provider_id, user_id").
+		Where("id IN ?", instanceIDs).
+		Find(&instanceInfos).Error
+	if err != nil {
+		return fmt.Errorf("预加载实例信息失败: %w", err)
+	}
+
+	// 创建实例信息映射
+	instanceInfoMap := make(map[uint]aggregationInstanceInfo)
+	for _, info := range instanceInfos {
+		instanceInfoMap[info.ID] = info
+	}
+
+	// 分批处理，避免一次性处理太多数据
+	sort.Slice(instanceIDs, func(i, j int) bool { return instanceIDs[i] < instanceIDs[j] })
+
+	batchSize := 20
+	successCount := 0
+	errorCount := 0
+
+	for i := 0; i < len(instanceIDs); i += batchSize {
+		end := i + batchSize
+		if end > len(instanceIDs) {
+			end = len(instanceIDs)
+		}
+		batch := instanceIDs[i:end]
+
+		// 计算这批实例的流量
+		statsMap, err := s.queryService.computeBatchMonthlyTraffic(batch, year, month)
+		if err != nil {
+			global.APP_LOG.Warn("计算流量失败",
+				zap.Error(err),
+				zap.Int("batch_start", i),
+				zap.Int("batch_end", end))
+			errorCount += len(batch)
+			continue
+		}
+
+		// 批量保存到缓存表（一条 SQL 替代 N 条）
+		batchSuccess, batchErr := s.saveBatchToCacheWithInfo(statsMap, instanceInfoMap, year, month)
+		if batchErr > 0 {
+			global.APP_LOG.Warn("批量保存流量缓存部分失败",
+				zap.Int("errCount", batchErr),
+				zap.Int("batch_start", i),
+				zap.Int("batch_end", end))
+		}
+		successCount += batchSuccess
+		errorCount += batchErr
+	}
+
+	global.APP_LOG.Info("流量聚合完成",
+		zap.Int("success", successCount),
+		zap.Int("error", errorCount))
+
+	return nil
+}
+
+// saveBatchToCacheWithInfo 批量保存流量统计到缓存表（一多行 INSERT ON DUPLICATE KEY UPDATE）
+func (s *AggregationService) saveBatchToCacheWithInfo(
+	statsMap map[uint]*TrafficStats,
+	instanceInfoMap map[uint]aggregationInstanceInfo,
+	year, month int,
+) (successCount, errCount int) {
+	now := time.Now()
+
+	type batchRow struct {
+		instanceID, providerID, userID   uint
+		trafficIn, trafficOut, totalUsed float64
+	}
+	var rows []batchRow
+
+	for instanceID, stats := range statsMap {
+		info, exists := instanceInfoMap[instanceID]
+		if !exists {
+			global.APP_LOG.Warn("实例信息不存在",
+				zap.Uint("instance_id", instanceID))
+			errCount++
+			continue
+		}
+		rows = append(rows, batchRow{
+			instanceID: instanceID,
+			providerID: info.ProviderID,
+			userID:     info.UserID,
+			trafficIn:  float64(stats.RxBytes) / 1048576.0,
+			trafficOut: float64(stats.TxBytes) / 1048576.0,
+			totalUsed:  float64(stats.RxBytes+stats.TxBytes) / 1048576.0,
+		})
+	}
+
+	if len(rows) == 0 {
+		return 0, errCount
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].providerID != rows[j].providerID {
+			return rows[i].providerID < rows[j].providerID
+		}
+		if rows[i].userID != rows[j].userID {
+			return rows[i].userID < rows[j].userID
+		}
+		return rows[i].instanceID < rows[j].instanceID
+	})
+
+	// 构建批量 INSERT ON DUPLICATE KEY UPDATE
+	placeholders := make([]string, len(rows))
+	args := make([]interface{}, 0, len(rows)*9)
+	for i, r := range rows {
+		placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NOW(), NOW())"
+		args = append(args, r.instanceID, r.providerID, r.userID,
+			r.trafficIn, r.trafficOut, r.totalUsed,
+			year, month, now)
+	}
+
+	valuesClause := strings.Join(placeholders, ", ")
+	var sql string
+	if dbcompat.UseRowAlias() {
+		// MySQL 9.0+: row-alias syntax (VALUES() removed)
+		sql = `INSERT INTO instance_traffic_histories
+			(instance_id, provider_id, user_id, traffic_in, traffic_out, total_used,
+			 year, month, day, hour, record_time, created_at, updated_at)
+			VALUES ` + valuesClause + ` AS _new_row
+			ON DUPLICATE KEY UPDATE
+				provider_id = _new_row.provider_id,
+				user_id = _new_row.user_id,
+				traffic_in = _new_row.traffic_in,
+				traffic_out = _new_row.traffic_out,
+				total_used = _new_row.total_used,
+				record_time = _new_row.record_time,
+				updated_at = NOW()`
+	} else {
+		// MariaDB / MySQL < 9: legacy VALUES() syntax
+		sql = `INSERT INTO instance_traffic_histories
+			(instance_id, provider_id, user_id, traffic_in, traffic_out, total_used,
+			 year, month, day, hour, record_time, created_at, updated_at)
+			VALUES ` + valuesClause + `
+			ON DUPLICATE KEY UPDATE
+				provider_id = VALUES(provider_id),
+				user_id = VALUES(user_id),
+				traffic_in = VALUES(traffic_in),
+				traffic_out = VALUES(traffic_out),
+				total_used = VALUES(total_used),
+				record_time = VALUES(record_time),
+				updated_at = NOW()`
+	}
+
+	ctx := global.APP_SHUTDOWN_CONTEXT
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := utils.RetryableDBOperation(ctx, func() error {
+		return global.APP_DB.Exec(sql, args...).Error
+	}, 8); err != nil {
+		global.APP_LOG.Error("批量保存流量缓存失败",
+			zap.Error(err),
+			zap.Int("rows", len(rows)))
+		return 0, errCount + len(rows)
+	}
+	return len(rows), errCount
+}
+
+// saveToCacheWithInfo 保存流量统计到缓存表（使用预加载的实例信息）
+func (s *AggregationService) saveToCacheWithInfo(instanceID, providerID, userID uint, year, month int, stats *TrafficStats) error {
+	// 使用UPSERT逻辑（ON DUPLICATE KEY UPDATE）
+	record := monitoringModel.InstanceTrafficHistory{
+		InstanceID: instanceID,
+		ProviderID: providerID,
+		UserID:     userID,
+		TrafficIn:  float64(stats.RxBytes) / 1048576, // 转换为MB
+		TrafficOut: float64(stats.TxBytes) / 1048576, // 转换为MB
+		TotalUsed:  float64(stats.RxBytes+stats.TxBytes) / 1048576,
+		Year:       year,
+		Month:      month,
+		Day:        0, // 0表示月度汇总
+		Hour:       0, // 0表示月度汇总
+		RecordTime: time.Now(),
+	}
+
+	// 使用原生SQL实现真正的 UPSERT，避免并发问题和重复数据错误
+	// 使用重复参数替代 VALUES(col)，对所有数据库版本通用
+	sql := `
+		INSERT INTO instance_traffic_histories 
+			(instance_id, provider_id, user_id, traffic_in, traffic_out, total_used, 
+			 year, month, day, hour, record_time, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+		ON DUPLICATE KEY UPDATE
+			provider_id = ?,
+			user_id = ?,
+			traffic_in = ?,
+			traffic_out = ?,
+			total_used = ?,
+			record_time = ?,
+			updated_at = NOW()
+	`
+
+	return global.APP_DB.Exec(sql,
+		record.InstanceID, record.ProviderID, record.UserID,
+		record.TrafficIn, record.TrafficOut, record.TotalUsed,
+		record.Year, record.Month, record.Day, record.Hour,
+		record.RecordTime,
+		record.ProviderID, record.UserID,
+		record.TrafficIn, record.TrafficOut, record.TotalUsed,
+		record.RecordTime,
+	).Error
+}
+
+// saveToCache 保存流量统计到缓存表（保留用于单独调用）
+func (s *AggregationService) saveToCache(instanceID uint, year, month int, stats *TrafficStats) error {
+	// 获取instance的provider_id和user_id
+	var instance struct {
+		ProviderID uint
+		UserID     uint
+	}
+	err := global.APP_DB.Unscoped().Table("instances").
+		Select("provider_id, user_id").
+		Where("id = ?", instanceID).
+		First(&instance).Error
+
+	if err != nil {
+		return fmt.Errorf("获取实例信息失败: %w", err)
+	}
+
+	return s.saveToCacheWithInfo(instanceID, instance.ProviderID, instance.UserID, year, month, stats)
+}
+
+// AggregateCurrentMonth 聚合当月流量数据（定时任务调用）
+func (s *AggregationService) AggregateCurrentMonth() error {
+	now := time.Now()
+	return s.AggregateMonthlyTraffic(now.Year(), int(now.Month()))
+}
+
+// AggregateDailyTraffic 聚合每日流量数据（可选，用于更细粒度的缓存）
+// 每日聚合也需要使用完整的分段逻辑处理pmacct重启
+func (s *AggregationService) AggregateDailyTraffic(year, month, day int) error {
+	global.APP_LOG.Info("开始聚合每日流量数据",
+		zap.Int("year", year),
+		zap.Int("month", month),
+		zap.Int("day", day))
+
+	// 获取当天有流量记录的实例ID
+	var instanceIDs []uint
+	err := global.APP_DB.Table("pmacct_traffic_records").
+		Select("DISTINCT instance_id").
+		Where("year = ? AND month = ? AND day = ?", year, month, day).
+		Pluck("instance_id", &instanceIDs).Error
+
+	if err != nil {
+		return fmt.Errorf("获取实例ID列表失败: %w", err)
+	}
+
+	if len(instanceIDs) == 0 {
+		return nil
+	}
+
+	// 预加载所有实例信息
+	type InstanceInfo struct {
+		ID         uint
+		ProviderID uint
+		UserID     uint
+	}
+	var instanceInfos []InstanceInfo
+	err = global.APP_DB.Unscoped().Table("instances").
+		Select("id, provider_id, user_id").
+		Where("id IN ?", instanceIDs).
+		Find(&instanceInfos).Error
+	if err != nil {
+		return fmt.Errorf("预加载实例信息失败: %w", err)
+	}
+
+	instanceInfoMap := make(map[uint]InstanceInfo)
+	for _, info := range instanceInfos {
+		instanceInfoMap[info.ID] = info
+	}
+
+	start := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
+	end := start.AddDate(0, 0, 1)
+	statsMap, err := s.queryService.computeBatchTrafficInWindow(instanceIDs, start, end)
+	if err != nil {
+		return fmt.Errorf("批量计算每日流量失败: %w", err)
+	}
+
+	// 对每个实例保存当天的流量（统一使用窗口基线增量逻辑）
+	for _, instanceID := range instanceIDs {
+		instanceInfo, exists := instanceInfoMap[instanceID]
+		if !exists {
+			global.APP_LOG.Warn("实例信息不存在",
+				zap.Uint("instance_id", instanceID))
+			continue
+		}
+
+		// 保存到缓存表（day!=0, hour=0表示按天缓存）
+		err = s.saveDailyCacheWithInfo(instanceID, instanceInfo.ProviderID, instanceInfo.UserID, year, month, day, statsMap[instanceID])
+		if err != nil {
+			global.APP_LOG.Warn("保存每日缓存失败",
+				zap.Uint("instance_id", instanceID),
+				zap.Error(err))
+		}
+	}
+
+	global.APP_LOG.Info("每日流量聚合完成",
+		zap.Int("instance_count", len(instanceIDs)))
+
+	return nil
+}
+
+// computeDailyTraffic 计算实例的每日流量（处理pmacct重启）
+func (s *AggregationService) computeDailyTraffic(instanceID uint, year, month, day int) (*TrafficStats, error) {
+	{
+		start := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
+		end := start.AddDate(0, 0, 1)
+		statsMap, err := s.queryService.computeBatchTrafficInWindow([]uint{instanceID}, start, end)
+		if err != nil {
+			return nil, fmt.Errorf("查询每日流量失败: %w", err)
+		}
+		if stats, ok := statsMap[instanceID]; ok {
+			return stats, nil
+		}
+		return &TrafficStats{}, nil
+	}
+
+}
+
+// saveDailyCacheWithInfo 保存每日缓存数据（使用预加载的实例信息）
+func (s *AggregationService) saveDailyCacheWithInfo(instanceID, providerID, userID uint, year, month, day int, stats *TrafficStats) error {
+	// 转换为MB
+	trafficInMB := float64(stats.RxBytes) / 1048576.0
+	trafficOutMB := float64(stats.TxBytes) / 1048576.0
+	totalUsedMB := float64(stats.RxBytes+stats.TxBytes) / 1048576.0
+
+	// 使用原生SQL实现真正的 UPSERT（day!=0, hour=0表示按天缓存）
+	// 使用重复参数替代 VALUES(col)，对所有数据库版本通用
+	sql := `
+		INSERT INTO instance_traffic_histories 
+			(instance_id, provider_id, user_id, traffic_in, traffic_out, total_used, 
+			 year, month, day, hour, record_time, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+		ON DUPLICATE KEY UPDATE
+			provider_id = ?,
+			user_id = ?,
+			traffic_in = ?,
+			traffic_out = ?,
+			total_used = ?,
+			record_time = ?,
+			updated_at = NOW()
+	`
+	now := time.Now()
+	return global.APP_DB.Exec(sql,
+		instanceID, providerID, userID,
+		trafficInMB, trafficOutMB, totalUsedMB,
+		year, month, day, 0, now,
+		providerID, userID,
+		trafficInMB, trafficOutMB, totalUsedMB, now,
+	).Error
+}
+
+// saveDailyCache 保存每日缓存数据（保留用于单独调用）
+func (s *AggregationService) saveDailyCache(instanceID uint, year, month, day int, stats *TrafficStats) error {
+	// 获取实例关联信息
+	var instance struct {
+		ProviderID uint
+		UserID     uint
+	}
+	err := global.APP_DB.Unscoped().Table("instances").
+		Select("provider_id, user_id").
+		Where("id = ?", instanceID).
+		Scan(&instance).Error
+	if err != nil {
+		return fmt.Errorf("查询实例信息失败: %w", err)
+	}
+
+	return s.saveDailyCacheWithInfo(instanceID, instance.ProviderID, instance.UserID, year, month, day, stats)
+}
+
+// CleanOldCache 清理过期的缓存数据
+func (s *AggregationService) CleanOldCache(retentionMonths int) error {
+	cutoffDate := time.Now().AddDate(0, -retentionMonths, 0)
+	cutoffYear := cutoffDate.Year()
+	cutoffMonth := int(cutoffDate.Month())
+
+	result := global.APP_DB.
+		Where("year < ? OR (year = ? AND month < ?)", cutoffYear, cutoffYear, cutoffMonth).
+		Delete(&monitoringModel.InstanceTrafficHistory{})
+
+	if result.Error != nil {
+		return result.Error
+	}
+
+	global.APP_LOG.Info("清理旧缓存完成",
+		zap.Int64("deleted_rows", result.RowsAffected))
+
+	return nil
+}

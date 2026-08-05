@@ -1,0 +1,707 @@
+name: Build and Push Docker Images
+on:
+  workflow_run:
+    workflows: ["Build and Release oneclickvirt"]
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  DOCKER_IMAGE: oneclickvirt/oneclickvirt
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  check-workflow-success:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check trigger type and status
+        run: |
+          echo "Event name: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manually triggered workflow"
+          else
+            echo "Triggered by workflow_run event"
+            echo "Previous workflow: ${{ github.event.workflow_run.name }}"
+            echo "Conclusion: ${{ github.event.workflow_run.conclusion }}"
+          fi
+
+      - name: Validate no-db runtime configuration persistence
+        run: |
+          bash -n deploy/no-db-entrypoint.sh scripts/tests/no_db_entrypoint_test.sh
+          bash scripts/tests/no_db_entrypoint_test.sh
+
+  build-dockerhub:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    needs: check-workflow-success
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            variant: full
+            dockerfile: Dockerfile
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            variant: full
+            dockerfile: Dockerfile
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            variant: no-db
+            dockerfile: Dockerfile.no-db
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            variant: no-db
+            dockerfile: Dockerfile.no-db
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate Docker context prerequisites
+        run: |
+          if [ ! -d server/docs ]; then
+            echo "Missing server/docs directory; Go build imports oneclickvirt/docs"
+            exit 1
+          fi
+          if grep -Eq '^server/docs/?$' .dockerignore; then
+            echo "Invalid .dockerignore: server/docs is excluded but required for Go build"
+            exit 1
+          fi
+
+      - name: Resolve Go version from go.mod
+        id: go-version
+        run: |
+          GO_VERSION=$(awk '/^go / {print $2; exit}' server/go.mod)
+          if [ -z "${GO_VERSION}" ]; then
+            echo "Failed to resolve Go version from server/go.mod"
+            exit 1
+          fi
+          if ! echo "${GO_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "Invalid Go version format in server/go.mod: ${GO_VERSION}"
+            exit 1
+          fi
+          echo "value=${GO_VERSION}" >> $GITHUB_OUTPUT
+          echo "Resolved Go version: ${GO_VERSION}"
+      
+      - name: Get latest release tag
+        id: latest-tag
+        run: |
+          TAG=$(curl -fsSL "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" | \
+            jq -r '.tag_name // "dev"')
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Latest release tag: ${TAG}"
+
+      - name: Stage optional agent assets
+        run: |
+          mkdir -p server/assets/agent
+          cp scripts/install_agent.sh server/assets/agent/install_agent.sh
+
+          TAG="${{ steps.latest-tag.outputs.tag }}"
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          for file in oneclickvirt-agent-linux-amd64.tar.gz oneclickvirt-agent-linux-arm64.tar.gz; do
+            if curl -fsSL "${BASE_URL}/${file}" -o "server/assets/agent/${file}"; then
+              echo "Staged ${file}"
+            else
+              echo "Warning: failed to stage ${file}; Docker build will fall back to runtime GitHub redirects"
+              rm -f "server/assets/agent/${file}"
+            fi
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+      
+      - name: Login to Docker Hub
+        id: login-dockerhub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Extract metadata for Docker Hub
+        if: steps.login-dockerhub.outcome == 'success'
+        id: meta-dockerhub
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=${{ matrix.variant == 'no-db' && 'no-db' || 'latest' }}
+          flavor: |
+            suffix=-${{ matrix.arch }}
+      
+      - name: Build and push to Docker Hub
+        if: steps.login-dockerhub.outcome == 'success'
+        id: build-dockerhub
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          pull: true
+          build-args: |
+            GO_VERSION=${{ steps.go-version.outputs.value }}
+            SERVER_VERSION=${{ steps.latest-tag.outputs.tag }}
+          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: |
+            type=gha,scope=dockerhub-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=dockerhub-${{ matrix.variant }}-${{ matrix.arch }}
+      
+      - name: Export Docker Hub digest
+        if: steps.build-dockerhub.outcome == 'success'
+        run: |
+          mkdir -p /tmp/digests-dockerhub
+          digest="${{ steps.build-dockerhub.outputs.digest }}"
+          touch "/tmp/digests-dockerhub/${digest#sha256:}"
+      
+      - name: Upload Docker Hub digest
+        if: steps.build-dockerhub.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-dockerhub-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests-dockerhub/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-ghcr:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    needs: check-workflow-success
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            variant: full
+            dockerfile: Dockerfile
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            variant: full
+            dockerfile: Dockerfile
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            variant: no-db
+            dockerfile: Dockerfile.no-db
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            variant: no-db
+            dockerfile: Dockerfile.no-db
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate Docker context prerequisites
+        run: |
+          if [ ! -d server/docs ]; then
+            echo "Missing server/docs directory; Go build imports oneclickvirt/docs"
+            exit 1
+          fi
+          if grep -Eq '^server/docs/?$' .dockerignore; then
+            echo "Invalid .dockerignore: server/docs is excluded but required for Go build"
+            exit 1
+          fi
+
+      - name: Resolve Go version from go.mod
+        id: go-version
+        run: |
+          GO_VERSION=$(awk '/^go / {print $2; exit}' server/go.mod)
+          if [ -z "${GO_VERSION}" ]; then
+            echo "Failed to resolve Go version from server/go.mod"
+            exit 1
+          fi
+          if ! echo "${GO_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "Invalid Go version format in server/go.mod: ${GO_VERSION}"
+            exit 1
+          fi
+          echo "value=${GO_VERSION}" >> $GITHUB_OUTPUT
+          echo "Resolved Go version: ${GO_VERSION}"
+      
+      - name: Get latest release tag
+        id: latest-tag
+        run: |
+          TAG=$(curl -fsSL "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" | \
+            jq -r '.tag_name // "dev"')
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Latest release tag: ${TAG}"
+
+      - name: Stage optional agent assets
+        run: |
+          mkdir -p server/assets/agent
+          cp scripts/install_agent.sh server/assets/agent/install_agent.sh
+
+          TAG="${{ steps.latest-tag.outputs.tag }}"
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          for file in oneclickvirt-agent-linux-amd64.tar.gz oneclickvirt-agent-linux-arm64.tar.gz; do
+            if curl -fsSL "${BASE_URL}/${file}" -o "server/assets/agent/${file}"; then
+              echo "Staged ${file}"
+            else
+              echo "Warning: failed to stage ${file}; Docker build will fall back to runtime GitHub redirects"
+              rm -f "server/assets/agent/${file}"
+            fi
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+      
+      - name: Login to GitHub Container Registry
+        id: login-ghcr
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata for GHCR
+        if: steps.login-ghcr.outcome == 'success'
+        id: meta-ghcr
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=raw,value=${{ matrix.variant == 'no-db' && 'no-db' || 'latest' }}
+          flavor: |
+            suffix=-${{ matrix.arch }}
+      
+      - name: Build and push to GHCR
+        if: steps.login-ghcr.outcome == 'success'
+        id: build-ghcr
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          pull: true
+          build-args: |
+            GO_VERSION=${{ steps.go-version.outputs.value }}
+            SERVER_VERSION=${{ steps.latest-tag.outputs.tag }}
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: |
+            type=gha,scope=ghcr-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=min,scope=ghcr-${{ matrix.variant }}-${{ matrix.arch }}
+      
+      - name: Export GHCR digest
+        if: steps.build-ghcr.outcome == 'success'
+        run: |
+          mkdir -p /tmp/digests-ghcr
+          digest="${{ steps.build-ghcr.outputs.digest }}"
+          touch "/tmp/digests-ghcr/${digest#sha256:}"
+      
+      - name: Upload GHCR digest
+        if: steps.build-ghcr.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-ghcr-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests-ghcr/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-full-dockerhub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-dockerhub
+    if: ${{ needs.build-dockerhub.result == 'success' }}
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      
+      - name: Login to Docker Hub
+        id: login-dockerhub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+      
+      - name: Download Docker Hub digests
+        id: download-dockerhub
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-dockerhub-full-*
+          merge-multiple: true
+          path: /tmp/digests-dockerhub
+      
+      - name: Extract metadata for Docker Hub
+        if: steps.login-dockerhub.outcome == 'success' && steps.download-dockerhub.outcome == 'success'
+        id: meta-dockerhub
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v${{ steps.date.outputs.date }}
+            type=raw,value={{date 'YYYYMMDD'}}
+      
+      - name: Create manifest list and push to Docker Hub
+        if: steps.login-dockerhub.outcome == 'success' && steps.download-dockerhub.outcome == 'success'
+        working-directory: /tmp/digests-dockerhub
+        run: |
+          DIGEST_COUNT=$(ls -1 | wc -l)
+          if [ "$DIGEST_COUNT" -ne 2 ]; then
+            echo "Expected 2 platform digests (amd64 + arm64), found ${DIGEST_COUNT}. Failing to avoid publishing inconsistent tags."
+            exit 1
+          fi
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.DOCKER_IMAGE }}@sha256:%s ' *)
+      
+      - name: Inspect Docker Hub image
+        if: steps.login-dockerhub.outcome == 'success' && steps.download-dockerhub.outcome == 'success'
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKER_IMAGE }}:latest
+      
+      - name: Update Docker Hub Description
+        if: steps.login-dockerhub.outcome == 'success'
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKER_IMAGE }}
+          readme-filepath: ./README.md
+
+  merge-full-ghcr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-ghcr
+    if: ${{ needs.build-ghcr.result == 'success' }}
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      
+      - name: Login to GitHub Container Registry
+        id: login-ghcr
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+      
+      - name: Download GHCR digests
+        id: download-ghcr
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-ghcr-full-*
+          merge-multiple: true
+          path: /tmp/digests-ghcr
+      
+      - name: Extract metadata for GHCR
+        if: steps.login-ghcr.outcome == 'success' && steps.download-ghcr.outcome == 'success'
+        id: meta-ghcr
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v${{ steps.date.outputs.date }}
+            type=raw,value={{date 'YYYYMMDD'}}
+      
+      - name: Create manifest list and push to GHCR
+        if: steps.login-ghcr.outcome == 'success' && steps.download-ghcr.outcome == 'success'
+        working-directory: /tmp/digests-ghcr
+        run: |
+          DIGEST_COUNT=$(ls -1 | wc -l)
+          if [ "$DIGEST_COUNT" -ne 2 ]; then
+            echo "Expected 2 platform digests (amd64 + arm64), found ${DIGEST_COUNT}. Failing to avoid publishing inconsistent tags."
+            exit 1
+          fi
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
+      
+      - name: Inspect GHCR image
+        if: steps.login-ghcr.outcome == 'success' && steps.download-ghcr.outcome == 'success'
+        run: |
+          docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}:latest
+
+  merge-no-db-dockerhub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-dockerhub
+    if: ${{ needs.build-dockerhub.result == 'success' }}
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      
+      - name: Login to Docker Hub
+        id: login-dockerhub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+      
+      - name: Download Docker Hub digests
+        id: download-dockerhub
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-dockerhub-no-db-*
+          merge-multiple: true
+          path: /tmp/digests-dockerhub
+      
+      - name: Extract metadata for Docker Hub
+        if: steps.login-dockerhub.outcome == 'success' && steps.download-dockerhub.outcome == 'success'
+        id: meta-dockerhub
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=no-db
+            type=raw,value=no-db-v${{ steps.date.outputs.date }}
+            type=raw,value=no-db-{{date 'YYYYMMDD'}}
+      
+      - name: Create manifest list and push to Docker Hub
+        if: steps.login-dockerhub.outcome == 'success' && steps.download-dockerhub.outcome == 'success'
+        working-directory: /tmp/digests-dockerhub
+        run: |
+          DIGEST_COUNT=$(ls -1 | wc -l)
+          if [ "$DIGEST_COUNT" -ne 2 ]; then
+            echo "Expected 2 platform digests (amd64 + arm64), found ${DIGEST_COUNT}. Failing to avoid publishing inconsistent tags."
+            exit 1
+          fi
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.DOCKER_IMAGE }}@sha256:%s ' *)
+      
+      - name: Inspect Docker Hub image
+        if: steps.login-dockerhub.outcome == 'success' && steps.download-dockerhub.outcome == 'success'
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKER_IMAGE }}:no-db
+
+  merge-no-db-ghcr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-ghcr
+    if: ${{ needs.build-ghcr.result == 'success' }}
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      
+      - name: Login to GitHub Container Registry
+        id: login-ghcr
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+      
+      - name: Download GHCR digests
+        id: download-ghcr
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-ghcr-no-db-*
+          merge-multiple: true
+          path: /tmp/digests-ghcr
+      
+      - name: Extract metadata for GHCR
+        if: steps.login-ghcr.outcome == 'success' && steps.download-ghcr.outcome == 'success'
+        id: meta-ghcr
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=raw,value=no-db
+            type=raw,value=no-db-v${{ steps.date.outputs.date }}
+            type=raw,value=no-db-{{date 'YYYYMMDD'}}
+      
+      - name: Create manifest list and push to GHCR
+        if: steps.login-ghcr.outcome == 'success' && steps.download-ghcr.outcome == 'success'
+        working-directory: /tmp/digests-ghcr
+        run: |
+          DIGEST_COUNT=$(ls -1 | wc -l)
+          if [ "$DIGEST_COUNT" -ne 2 ]; then
+            echo "Expected 2 platform digests (amd64 + arm64), found ${DIGEST_COUNT}. Failing to avoid publishing inconsistent tags."
+            exit 1
+          fi
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
+      
+      - name: Inspect GHCR image
+        if: steps.login-ghcr.outcome == 'success' && steps.download-ghcr.outcome == 'success'
+        run: |
+          docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}:no-db
+
+  update-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [merge-full-dockerhub, merge-full-ghcr, merge-no-db-dockerhub, merge-no-db-ghcr]
+    if: always()
+    
+    steps:
+      - name: Checkout oneclickvirt repo
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+      
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+      
+      - name: Update local README_ZH.md
+        run: |
+          DATE_TAG="${{ steps.date.outputs.date }}"
+
+          # Normalize legacy Docker Hub namespace before updating date tags.
+          sed -i "s#spiritlhl/oneclickvirt#oneclickvirt/oneclickvirt#g" README_ZH.md
+          
+          # Update Chinese README - only match the image tag date portion
+          sed -i "s/\(oneclickvirt\/oneclickvirt:\)[0-9]\{8\}/\1${DATE_TAG}/g" README_ZH.md
+          sed -i "s/\(oneclickvirt\/oneclickvirt:no-db-\)[0-9]\{8\}/\1${DATE_TAG}/g" README_ZH.md
+          
+          echo "Updated README_ZH.md with tag: ${DATE_TAG}"
+      
+      - name: Update local README.md
+        run: |
+          DATE_TAG="${{ steps.date.outputs.date }}"
+
+          # Normalize legacy Docker Hub namespace before updating date tags.
+          sed -i "s#spiritlhl/oneclickvirt#oneclickvirt/oneclickvirt#g" README.md
+          
+          # Update English README - only match the image tag date portion
+          sed -i "s/\(oneclickvirt\/oneclickvirt:\)[0-9]\{8\}/\1${DATE_TAG}/g" README.md
+          sed -i "s/\(oneclickvirt\/oneclickvirt:no-db-\)[0-9]\{8\}/\1${DATE_TAG}/g" README.md
+          
+          echo "Updated README.md with tag: ${DATE_TAG}"
+      
+      - name: Commit and push local changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if git diff --quiet; then
+            echo "No changes to commit in local repo"
+          else
+            git add README.md README_ZH.md
+            git commit -m "chore: update Docker image tags to ${{ steps.date.outputs.date }}"
+            git push
+            echo "Successfully pushed local documentation updates"
+          fi
+      
+      - name: Checkout documentation repo
+        uses: actions/checkout@v7
+        with:
+          repository: oneclickvirt/oneclickvirt.github.io
+          token: ${{ secrets.PAT_TOKEN }}
+          path: docs-repo
+      
+      - name: Update Chinese documentation
+        run: |
+          DATE_TAG="${{ steps.date.outputs.date }}"
+          DOC_FILE="docs-repo/docs/guide/oneclickvirt/oneclickvirt_install.md"
+
+          # Normalize legacy Docker Hub namespace before updating date tags.
+          sed -i "s#spiritlhl/oneclickvirt#oneclickvirt/oneclickvirt#g" "$DOC_FILE"
+          
+          # Update the image tag table - only match the date portion in image tags
+          sed -i "s/\(oneclickvirt\/oneclickvirt:\)[0-9]\{8\}/\1${DATE_TAG}/g" "$DOC_FILE"
+          sed -i "s/\(oneclickvirt\/oneclickvirt:no-db-\)[0-9]\{8\}/\1${DATE_TAG}/g" "$DOC_FILE"
+          
+          echo "Updated Chinese documentation with tag: ${DATE_TAG}"
+      
+      - name: Update English documentation
+        run: |
+          DATE_TAG="${{ steps.date.outputs.date }}"
+          DOC_FILE="docs-repo/docs/en/guide/oneclickvirt/oneclickvirt_install.md"
+
+          # Normalize legacy Docker Hub namespace before updating date tags.
+          sed -i "s#spiritlhl/oneclickvirt#oneclickvirt/oneclickvirt#g" "$DOC_FILE"
+          
+          # Update the image tag table - only match the date portion in image tags
+          sed -i "s/\(oneclickvirt\/oneclickvirt:\)[0-9]\{8\}/\1${DATE_TAG}/g" "$DOC_FILE"
+          sed -i "s/\(oneclickvirt\/oneclickvirt:no-db-\)[0-9]\{8\}/\1${DATE_TAG}/g" "$DOC_FILE"
+          
+          echo "Updated English documentation with tag: ${DATE_TAG}"
+      
+      - name: Commit and push external doc changes
+        run: |
+          cd docs-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if git diff --quiet; then
+            echo "No changes to commit in external docs"
+          else
+            git add .
+            git commit -m "chore: update Docker image tags to ${{ steps.date.outputs.date }}"
+            git push
+            echo "Successfully pushed external documentation updates"
+          fi

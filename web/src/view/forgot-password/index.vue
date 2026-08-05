@@ -1,0 +1,515 @@
+<template>
+  <div class="forgot-password-container">
+    <!-- 顶部栏 -->
+    <header class="auth-header">
+      <div class="header-content">
+        <div class="logo">
+          <img
+            :src="siteStore.logoSrc"
+            alt="OneClickVirt Logo"
+            class="logo-image"
+          >
+          <h1>{{ siteStore.displaySiteName }}</h1>
+        </div>
+        <nav class="nav-actions">
+          <button
+            class="nav-link theme-btn"
+            :title="themeStore.isDark ? t('navbar.lightMode') : t('navbar.darkMode')"
+            @click="toggleTheme"
+          >
+            <el-icon><component :is="themeStore.isDark ? Sunny : Moon" /></el-icon>
+          </button>
+          <button
+            class="nav-link language-btn"
+            @click="switchLanguage"
+          >
+            <el-icon><Operation /></el-icon>
+            {{ languageStore.currentLanguage === 'zh-CN' ? 'English' : '中文' }}
+          </button>
+          <router-link
+            to="/"
+            class="nav-link home-btn"
+          >
+            <el-icon><HomeFilled /></el-icon>
+            {{ t('common.backToHome') }}
+          </router-link>
+        </nav>
+      </div>
+    </header>
+
+    <div class="forgot-password-form">
+      <div v-if="!emailSent">
+        <h2>{{ t('forgotPassword.title') }}</h2>
+        <p>{{ t('forgotPassword.subtitle') }}</p>
+
+        <el-form
+          ref="forgotFormRef"
+          :model="forgotForm"
+          :rules="forgotRules"
+          label-width="0"
+          size="large"
+        >
+          <el-form-item prop="email">
+            <el-input
+              v-model="forgotForm.email"
+              :placeholder="t('forgotPassword.pleaseEnterEmail')"
+              prefix-icon="Message"
+            />
+          </el-form-item>
+
+          <el-form-item
+            v-if="captchaEnabled"
+            prop="captcha"
+          >
+            <div class="captcha-container">
+              <el-input
+                v-model="forgotForm.captcha"
+                :placeholder="t('login.pleaseEnterCaptcha')"
+                style="width: 60%"
+              />
+              <div
+                class="captcha-image"
+                @click="refreshCaptcha"
+              >
+                <img
+                  v-if="captchaImage"
+                  :src="captchaImage"
+                  :alt="t('login.captchaAlt')"
+                >
+                <div
+                  v-else
+                  class="captcha-loading"
+                >
+                  {{ t('common.loading') }}
+                </div>
+              </div>
+            </div>
+          </el-form-item>
+
+          <el-form-item>
+            <el-button
+              type="primary"
+              :loading="loading"
+              style="width: 100%;"
+              @click="handleForgotPassword"
+            >
+              {{ t('forgotPassword.sendResetLink') }}
+            </el-button>
+          </el-form-item>
+
+          <div class="form-footer">
+            <router-link to="/login">
+              {{ t('forgotPassword.backToLogin') }}
+            </router-link>
+          </div>
+        </el-form>
+      </div>
+
+      <div
+        v-else
+        class="success-message"
+      >
+        <el-result
+          icon="success"
+          :title="t('forgotPassword.emailSent')"
+          :sub-title="t('forgotPassword.checkEmail')"
+        >
+          <template #extra>
+            <el-button
+              type="primary"
+              @click="goToLogin"
+            >
+              {{ t('forgotPassword.backToLogin') }}
+            </el-button>
+          </template>
+        </el-result>
+      </div>
+    </div>
+    <AppFooter />
+  </div>
+</template>
+
+<script setup>
+import { ref, reactive, onMounted, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { ElMessage } from 'element-plus'
+import { forgotPassword } from '@/api/auth'
+import { getCaptcha } from '@/api/auth'
+import { getPublicConfig } from '@/api/public'
+import { Operation, HomeFilled, Sunny, Moon } from '@element-plus/icons-vue'
+import { useLanguageStore } from '@/pinia/modules/language'
+import { useThemeStore } from '@/pinia/modules/theme'
+import { useSiteStore } from '@/pinia/modules/site'
+import AppFooter from '@/view/layout/components/AppFooter.vue'
+
+const router = useRouter()
+const { t, locale } = useI18n()
+const languageStore = useLanguageStore()
+const themeStore = useThemeStore()
+const siteStore = useSiteStore()
+const forgotFormRef = ref()
+const loading = ref(false)
+const emailSent = ref(false)
+const captchaImage = ref('')
+const captchaId = ref('')
+const captchaEnabled = ref(false)
+
+const forgotForm = reactive({
+  email: '',
+  captcha: ''
+})
+
+const forgotRules = computed(() => ({
+  email: [
+    { required: true, message: t('validation.emailRequired'), trigger: 'blur' },
+    { type: 'email', message: t('validation.emailFormat'), trigger: 'blur' }
+  ],
+  ...(captchaEnabled.value ? {
+    captcha: [
+      { required: true, message: t('validation.captchaRequired'), trigger: 'blur' }
+    ]
+  } : {})
+}))
+
+const handleForgotPassword = async () => {
+  if (!forgotFormRef.value) return
+
+  await forgotFormRef.value.validate(async (valid) => {
+    if (!valid) return
+
+    loading.value = true
+    try {
+      const response = await forgotPassword({
+        email: forgotForm.email,
+        ...(captchaEnabled.value ? {
+          captcha: forgotForm.captcha,
+          captchaId: captchaId.value
+        } : {
+          captcha: undefined,
+          captchaId: undefined
+        })
+      })
+
+      if (response.code === 200) {
+        emailSent.value = true
+      }
+    } catch (error) {
+      console.error(t('forgotPassword.resetFailed'), error)
+      ElMessage.error(t('forgotPassword.resetFailed'))
+      if (captchaEnabled.value) {
+        refreshCaptcha()
+      }
+    } finally {
+      loading.value = false
+    }
+  })
+}
+
+const refreshCaptcha = async () => {
+  if (!captchaEnabled.value) {
+    clearCaptchaState()
+    return
+  }
+
+  try {
+    const response = await getCaptcha()
+    if (response.code === 200) {
+      captchaImage.value = response.data.imageData
+      captchaId.value = response.data.captchaId
+      forgotForm.captcha = ''
+    }
+  } catch (error) {
+    console.error(t('forgotPassword.captchaFailed'), error)
+  }
+}
+
+const clearCaptchaState = () => {
+  captchaImage.value = ''
+  captchaId.value = ''
+  forgotForm.captcha = ''
+}
+
+const loadCaptchaConfig = async () => {
+  try {
+    const response = await getPublicConfig()
+    captchaEnabled.value = response.data?.captchaEnabled ?? false
+  } catch (error) {
+    captchaEnabled.value = false
+  }
+}
+
+const goToLogin = () => {
+  router.push('/login')
+}
+
+// 切换语言
+const switchLanguage = () => {
+  const newLang = languageStore.toggleLanguage()
+  locale.value = newLang
+  ElMessage.success(t('navbar.languageSwitched'))
+}
+
+const toggleTheme = () => {
+  themeStore.toggleTheme()
+}
+
+onMounted(async () => {
+  await loadCaptchaConfig()
+  if (captchaEnabled.value) {
+    refreshCaptcha()
+  } else {
+    clearCaptchaState()
+  }
+})
+</script>
+
+<style scoped>
+.forgot-password-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--auth-page-bg);
+}
+
+/* 顶部栏样式 */
+.auth-header {
+  background: var(--auth-header-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: var(--box-shadow-light);
+  border-bottom: 1px solid var(--border-color);
+  padding-top: env(safe-area-inset-top);
+}
+
+.header-content {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  min-height: 60px;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-image {
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+}
+
+.logo h1 {
+  font-size: 24px;
+  color: var(--primary-color);
+  margin: 0;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.nav-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nav-link.theme-btn {
+  padding: 8px 10px;
+  min-width: 38px;
+  justify-content: center;
+}
+
+.nav-link {
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border-radius: 22px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-color-primary);
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.nav-link:hover {
+  background: var(--primary-color-bg-hover);
+  color: var(--accent-text-color);
+  transform: translateY(-2px);
+}
+
+.nav-link.home-btn {
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  color: white;
+  border: none;
+  box-shadow: 0 4px 15px var(--primary-color-shadow);
+}
+
+.nav-link.home-btn:hover {
+  background: linear-gradient(135deg, var(--primary-color-dark), var(--primary-color));
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px var(--primary-color-shadow-hover);
+}
+
+.forgot-password-form {
+  margin: 32px auto;
+  width: min(420px, calc(100% - 32px));
+  padding: 36px 38px;
+  background: var(--card-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 20px;
+  box-shadow: var(--box-shadow-heavy);
+  border: 1px solid var(--border-color);
+}
+
+.forgot-password-form h2 {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--text-color-primary);
+  margin-bottom: 10px;
+  text-align: center;
+}
+
+.forgot-password-form p {
+  font-size: 14px;
+  color: var(--text-color-secondary);
+  margin-bottom: 30px;
+  text-align: center;
+}
+
+.form-footer {
+  text-align: center;
+  margin-top: 20px;
+}
+
+.form-footer a {
+  color: var(--accent-text-color);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.form-footer a:hover {
+  color: var(--accent-text-color-hover);
+}
+
+.success-message {
+  text-align: center;
+}
+
+.captcha-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.captcha-image {
+  width: 38%;
+  height: 40px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.captcha-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.captcha-loading {
+  font-size: 12px;
+  color: var(--text-color-tertiary);
+}
+
+@media (max-width: 768px) {
+  .header-content {
+    min-height: 56px;
+    padding: 8px 16px;
+    gap: 10px;
+  }
+
+  .logo {
+    gap: 8px;
+  }
+
+  .logo-image {
+    width: 38px;
+    height: 38px;
+  }
+
+  .logo h1 {
+    font-size: 21px;
+  }
+
+  .nav-actions {
+    gap: 6px;
+  }
+
+  .nav-link {
+    padding: 8px 10px;
+    font-size: 14px;
+  }
+
+  .forgot-password-form {
+    width: calc(100% - 24px);
+    margin: 24px auto;
+    padding: 24px;
+  }
+}
+
+@media (max-width: 480px) {
+  .header-content {
+    justify-content: center;
+    padding: 8px 12px;
+  }
+
+  .logo {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .logo-image {
+    width: 34px;
+    height: 34px;
+  }
+
+  .logo h1 {
+    font-size: 20px;
+  }
+
+  .nav-actions {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .nav-link {
+    padding: 7px 9px;
+    font-size: 13px;
+    border-radius: 18px;
+  }
+
+  .forgot-password-form {
+    padding: 22px 18px;
+  }
+}
+</style>

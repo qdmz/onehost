@@ -1,0 +1,635 @@
+#!/bin/bash
+# Module 09: Provider Management
+# Dependencies: 01_init (ADMIN_TOKEN), worker node (WORKER_IP + WORKER_PASSWORD or ALICE_PRIVATE_KEY)
+
+run_module_09() {
+    report_add_section "09 - Provider Management"
+    local group="providers"
+
+    if [[ -z "$WORKER_IP" && -n "$NODE_IP" ]]; then
+        WORKER_IP="$NODE_IP"
+    fi
+    local worker_pass="${WORKER_PASSWORD:-${NODE_PASSWORD:-}}"
+    local worker_key="${ALICE_PRIVATE_KEY:-}"
+    if [[ -z "$WORKER_IP" || ( -z "$worker_pass" && -z "$worker_key" ) ]]; then
+        chain_break "$group" "No worker node information (need IP + password or SSH key)"
+        return 1
+    fi
+    local provider_arch; provider_arch=$(current_test_arch "amd64")
+    log_info "Provider test architecture: ${provider_arch}"
+
+    # -- Provider list --
+    test_api "Provider list" "GET" "/api/v1/admin/providers?page=1&pageSize=10" "200" "" "$group"
+
+    # -- SSH connection test (use available auth method) --
+    local password_ssh_code="" key_ssh_code=""
+    if [[ -n "$worker_pass" ]]; then
+        local password_ssh_resp=""
+        password_ssh_resp=$(test_api "Test SSH connection (password)" "POST" "/api/v1/admin/providers/test-ssh-connection" "200|400|500" \
+            "{\"host\":\"${WORKER_IP}\",\"port\":22,\"username\":\"root\",\"password\":\"${worker_pass}\"}" "$group") || password_ssh_resp=""
+        password_ssh_code=$(echo "$password_ssh_resp" | jq -r '.code // empty' 2>/dev/null || true)
+    fi
+    if [[ -n "$worker_key" ]]; then
+        local escaped_key; escaped_key=$(echo "$worker_key" | jq -Rsa .)
+        local key_ssh_resp=""
+        key_ssh_resp=$(test_api "Test SSH connection (key)" "POST" "/api/v1/admin/providers/test-ssh-connection" "200|400" \
+            "{\"host\":\"${WORKER_IP}\",\"port\":22,\"username\":\"root\",\"sshKey\":${escaped_key}}" "$group") || key_ssh_resp=""
+        key_ssh_code=$(echo "$key_ssh_resp" | jq -r '.code // empty' 2>/dev/null || true)
+    fi
+
+    # -- SSH test with invalid credentials --
+    test_api "Test SSH (invalid)" "POST" "/api/v1/admin/providers/test-ssh-connection" "400|500" \
+        '{"host":"192.0.2.1","port":22,"username":"root","password":"wrong"}' "$group"
+
+    # -- Check provider name --
+    test_api "Check provider name" "GET" "/api/v1/admin/providers/check-name?name=ci-test-provider" "200" "" "$group"
+
+    # -- Check endpoint --
+    test_api "Check endpoint" "GET" "/api/v1/admin/providers/check-endpoint?endpoint=${WORKER_IP}&sshPort=22" "200" "" "$group"
+
+    # -- Create provider (or reuse existing one from state restoration) --
+    # Build auth payload at function scope (always set to avoid set -u issues)
+    local auth_payload="" auth_method=""
+    if [[ -n "$worker_key" && "$key_ssh_code" == "200" ]]; then
+        local escaped_key_create; escaped_key_create=$(echo "$worker_key" | jq -Rsa .)
+        auth_payload="\"password\":\"\",\"sshKey\":${escaped_key_create}"
+        auth_method="sshKey"
+    elif [[ -n "$worker_pass" && "$password_ssh_code" == "200" ]]; then
+        auth_payload="\"password\":\"${worker_pass}\",\"sshKey\":\"\""
+        auth_method="password"
+    elif [[ -n "$worker_key" ]]; then
+        local escaped_key_fallback; escaped_key_fallback=$(echo "$worker_key" | jq -Rsa .)
+        auth_payload="\"password\":\"\",\"sshKey\":${escaped_key_fallback}"
+        auth_method="sshKey-fallback"
+    elif [[ -n "$worker_pass" ]]; then
+        auth_payload="\"password\":\"${worker_pass}\",\"sshKey\":\"\""
+        auth_method="password-fallback"
+    fi
+    log_info "Provider SSH auth selected: ${auth_method:-none} (password_code=${password_ssh_code:-n/a}, key_code=${key_ssh_code:-n/a})"
+
+    if [[ -n "$PROVIDER_ID" ]]; then
+        # Provider ID exists (restored from previous module),verify it's still valid
+        log_info "Using existing provider ID: ${PROVIDER_ID}"
+        local verify_resp; verify_resp=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+            "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}" 2>/dev/null) || true
+        local verify_code; verify_code=$(echo "$verify_resp" | jq -r '.code // empty' 2>/dev/null)
+        if [[ "$verify_code" != "200" ]]; then
+            log_warning "Existing PROVIDER_ID ${PROVIDER_ID} is invalid, creating new one"
+            PROVIDER_ID=""
+        fi
+    fi
+
+    if [[ -z "$PROVIDER_ID" ]]; then
+        log_info "Creating provider with executionRule=${EXECUTION_RULE}"
+        local pr; pr=$(test_api "Create provider" "POST" "/api/v1/admin/providers" "200" \
+            "{\"name\":\"ci-${ENV_TYPE}-provider\",\"type\":\"${ENV_TYPE}\",\"executionRule\":\"${EXECUTION_RULE}\",\"networkType\":\"nat_ipv4\",\"architecture\":\"${provider_arch}\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",\"discoverMode\":true,\"autoImport\":true,\"autoAdjustQuota\":true,\"importedInstanceOwner\":\"admin\",${auth_payload}}" "$group")
+        
+        # Debug: log the response
+        log_debug "Provider creation response: ${pr}"
+        
+        # Try multiple possible field names for the provider ID
+        PROVIDER_ID=$(echo "$pr" | jq -r '.data.id // .data.ID // .data.provider_id // .data.providerId // .data.providerID // empty' 2>/dev/null)
+        
+        # If still empty, try to get from list (newly created should be the only one or last one)
+        if [[ -z "$PROVIDER_ID" ]]; then
+            log_warning "Provider ID not found in response, fetching from provider list..."
+            local list_resp; list_resp=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+                "${SERVER_URL}/api/v1/admin/providers?page=1&pageSize=10" 2>/dev/null) || true
+            PROVIDER_ID=$(echo "$list_resp" | jq -r '.data.list[]? | select(.name=="ci-'"${ENV_TYPE}"'-provider") | .id // .ID' 2>/dev/null | head -1)
+        fi
+        
+        if [[ -z "$PROVIDER_ID" ]]; then
+            log_error "Failed to extract provider ID from response or list"
+            log_error "Response was: ${pr}"
+            chain_break "$group" "Provider creation failed - no ID in response"
+            return 1
+        fi
+        
+        log_info "Created new provider ID: ${PROVIDER_ID}"
+    fi
+
+    local provider_detail_for_auth; provider_detail_for_auth=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}" 2>/dev/null) || true
+    local provider_container_enabled; provider_container_enabled=$(echo "$provider_detail_for_auth" | jq -r '.data.container_enabled // .data.containerEnabled // .data.container_enabled_flag // empty' 2>/dev/null || true)
+    local provider_vm_enabled; provider_vm_enabled=$(echo "$provider_detail_for_auth" | jq -r '.data.vm_enabled // .data.vmEnabled // .data.virtualMachineEnabled // empty' 2>/dev/null || true)
+    if [[ "$provider_container_enabled" != "true" && "$provider_container_enabled" != "false" ]]; then
+        case "$INSTANCE_TYPES" in
+            both|container) provider_container_enabled="true" ;;
+            vm) provider_container_enabled="false" ;;
+            *) if env_supports_container; then provider_container_enabled="true"; else provider_container_enabled="false"; fi ;;
+        esac
+    fi
+    if [[ "$provider_vm_enabled" != "true" && "$provider_vm_enabled" != "false" ]]; then
+        case "$INSTANCE_TYPES" in
+            both|vm) provider_vm_enabled="true" ;;
+            container) provider_vm_enabled="false" ;;
+            *) if env_supports_vm; then provider_vm_enabled="true"; else provider_vm_enabled="false"; fi ;;
+        esac
+    fi
+    test_api "Refresh provider SSH auth" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        "{\"connectionType\":\"ssh\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",\"networkType\":\"nat_ipv4\",\"architecture\":\"${provider_arch}\",\"container_enabled\":${provider_container_enabled},\"vm_enabled\":${provider_vm_enabled},${auth_payload}}" "$group"
+
+    # -- Create duplicate name --
+    test_api "Create duplicate provider" "POST" "/api/v1/admin/providers" "409" \
+        "{\"name\":\"ci-${ENV_TYPE}-provider\",\"type\":\"${ENV_TYPE}\",\"executionRule\":\"${EXECUTION_RULE}\",\"networkType\":\"nat_ipv4\",\"architecture\":\"${provider_arch}\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",${auth_payload}}" "$group"
+
+    # -- Edit provider --
+    test_api "Edit provider" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"name":"ci-provider-updated"}' "$group"
+
+    # -- Lifecycle policy: update provider with instance expiry and traffic over-limit policies --
+    log_info "Testing provider lifecycle and traffic policies..."
+    test_api "Update provider lifecycle policy (freeze)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"instanceExpiryAction":"freeze","instanceExpiryExtendDays":0}' "$group"
+    test_api "Update provider lifecycle policy (stop)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"instanceExpiryAction":"stop"}' "$group"
+    test_api "Update provider lifecycle policy (extend)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"instanceExpiryAction":"extend","instanceExpiryExtendDays":3}' "$group"
+    test_api "Update provider lifecycle policy (delete)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"instanceExpiryAction":"delete","instanceExpiryExtendDays":0}' "$group"
+
+    # -- Traffic over-limit policy --
+    test_api "Update traffic over-limit (speed_limit)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"trafficOverLimitAction":"speed_limit","trafficSpeedLimitKbps":2048}' "$group"
+    test_api "Update traffic over-limit (freeze)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"trafficOverLimitAction":"freeze"}' "$group"
+    test_api "Update traffic over-limit (mark_only)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"trafficOverLimitAction":"mark_only"}' "$group"
+    test_api "Update traffic over-limit (stop)" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"trafficOverLimitAction":"stop","trafficSpeedLimitKbps":1024}' "$group"
+
+    # -- Traffic quota visibility --
+    test_api "Update traffic quota visible=false" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"trafficQuotaVisible":false}' "$group"
+
+    # -- Verify all new fields persisted in provider detail --
+    local policy_detail; policy_detail=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}" 2>/dev/null)
+    local saved_expiry_action; saved_expiry_action=$(echo "$policy_detail" | jq -r '.data.instanceExpiryAction // empty' 2>/dev/null)
+    local saved_traffic_action; saved_traffic_action=$(echo "$policy_detail" | jq -r '.data.trafficOverLimitAction // empty' 2>/dev/null)
+    local saved_quota_visible; saved_quota_visible=$(echo "$policy_detail" | jq -r '.data.trafficQuotaVisible' 2>/dev/null)
+    local saved_speed_kbps; saved_speed_kbps=$(echo "$policy_detail" | jq -r '.data.trafficSpeedLimitKbps // empty' 2>/dev/null)
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    if [[ "$saved_expiry_action" == "delete" ]]; then
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        log_success "instanceExpiryAction=delete saved correctly"
+        _add_result_json "Lifecycle policy verify" "GET" "/api/v1/admin/providers/${PROVIDER_ID}" "PASS" "delete" "$saved_expiry_action" "" "$group"
+    else
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        log_error "instanceExpiryAction: expected delete, got ${saved_expiry_action}"
+        _add_result_json "Lifecycle policy verify" "GET" "/api/v1/admin/providers/${PROVIDER_ID}" "FAIL" "delete" "$saved_expiry_action" "$policy_detail" "$group"
+    fi
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    if [[ "$saved_traffic_action" == "stop" ]]; then
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        log_success "trafficOverLimitAction=stop saved correctly"
+        _add_result_json "Traffic over-limit verify" "GET" "/api/v1/admin/providers/${PROVIDER_ID}" "PASS" "stop" "$saved_traffic_action" "" "$group"
+    else
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        log_error "trafficOverLimitAction: expected stop, got ${saved_traffic_action}"
+        _add_result_json "Traffic over-limit verify" "GET" "/api/v1/admin/providers/${PROVIDER_ID}" "FAIL" "stop" "$saved_traffic_action" "$policy_detail" "$group"
+    fi
+
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    if [[ "$saved_quota_visible" == "false" ]]; then
+        PASSED_TESTS=$((PASSED_TESTS + 1))
+        log_success "trafficQuotaVisible=false saved correctly"
+        _add_result_json "Traffic quota visible verify" "GET" "/api/v1/admin/providers/${PROVIDER_ID}" "PASS" "false" "$saved_quota_visible" "" "$group"
+    else
+        FAILED_TESTS=$((FAILED_TESTS + 1))
+        log_error "trafficQuotaVisible: expected false, got ${saved_quota_visible}"
+        _add_result_json "Traffic quota visible verify" "GET" "/api/v1/admin/providers/${PROVIDER_ID}" "FAIL" "false" "$saved_quota_visible" "$policy_detail" "$group"
+    fi
+
+    # -- Revert trafficQuotaVisible to true for downstream modules --
+    test_api "Revert traffic quota visible=true" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"trafficQuotaVisible":true}' "$group"
+
+    # -- Negative: invalid lifecycle policy values --
+    test_api "Invalid instanceExpiryAction" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200|400" \
+        '{"instanceExpiryAction":"invalid_action"}' "$group"
+    test_api "Invalid trafficOverLimitAction" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200|400" \
+        '{"trafficOverLimitAction":"invalid_action"}' "$group"
+    test_api "Edit provider back" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        "{\"name\":\"ci-${ENV_TYPE}-provider\"}" "$group"
+
+    # -- nodeInstallType / bridge fields (proxmox only) --
+    if [[ "$ENV_TYPE" == "proxmox" || "$ENV_TYPE" == "proxmoxve" ]]; then
+        # Verify default nodeInstallType is "script" in the created provider
+        local provider_detail; provider_detail=$(curl -s --max-time 30 \
+            -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+            "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}" 2>/dev/null) || true
+        local node_install_type; node_install_type=$(echo "$provider_detail" | jq -r '.data.nodeInstallType // empty' 2>/dev/null)
+        if [[ "$node_install_type" == "script" || "$node_install_type" == "" ]]; then
+            log_info "nodeInstallType default=script verified"
+        else
+            log_warning "nodeInstallType default expected 'script', got '${node_install_type}'"
+        fi
+
+        # Update to script install type (no bridge fields required)
+        test_api "Set nodeInstallType=script" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+            '{"nodeInstallType":"script"}' "$group"
+
+        # Update to third_party with all required bridge fields
+        test_api "Set nodeInstallType=third_party" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+            '{"nodeInstallType":"third_party","bridgeNAT":"vmbr1","bridgeDedicatedV4":"vmbr0","bridgeDedicatedV6":"","natSubnet":"172.16.1.0/24"}' "$group"
+
+        # Verify third_party fields were saved
+        local tp_detail; tp_detail=$(curl -s --max-time 30 \
+            -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+            "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}" 2>/dev/null) || true
+        local saved_nat; saved_nat=$(echo "$tp_detail" | jq -r '.data.bridgeNAT // empty' 2>/dev/null)
+        local saved_v4; saved_v4=$(echo "$tp_detail" | jq -r '.data.bridgeDedicatedV4 // empty' 2>/dev/null)
+        local saved_subnet; saved_subnet=$(echo "$tp_detail" | jq -r '.data.natSubnet // empty' 2>/dev/null)
+        if [[ "$saved_nat" == "vmbr1" && "$saved_v4" == "vmbr0" && "$saved_subnet" == "172.16.1.0/24" ]]; then
+            log_info "third_party bridge fields saved correctly"
+        else
+            log_warning "third_party fields mismatch: bridgeNAT=${saved_nat} bridgeDedicatedV4=${saved_v4} natSubnet=${saved_subnet}"
+        fi
+
+        # Test with custom subnet (different from default 172.16.1.0/24)
+        test_api "Set third_party custom subnet" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+            '{"nodeInstallType":"third_party","bridgeNAT":"br0","bridgeDedicatedV4":"br1","bridgeDedicatedV6":"br2","natSubnet":"10.10.0.0/24"}' "$group"
+
+        # Revert back to script install for subsequent tests
+        test_api "Revert nodeInstallType=script" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+            '{"nodeInstallType":"script"}' "$group"
+
+        # Test creating a proxmox provider with third_party type (validation should pass with required fields)
+        local tp_create_resp; tp_create_resp=$(test_api "Create proxmox third_party provider" "POST" "/api/v1/admin/providers" "200|409" \
+            "{\"name\":\"ci-proxmox-thirdparty\",\"type\":\"${ENV_TYPE}\",\"executionRule\":\"${EXECUTION_RULE}\",\"networkType\":\"nat_ipv4\",\"architecture\":\"${provider_arch}\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",${auth_payload},\"nodeInstallType\":\"third_party\",\"bridgeNAT\":\"vmbr1\",\"bridgeDedicatedV4\":\"vmbr0\",\"bridgeDedicatedV6\":\"\",\"natSubnet\":\"172.16.1.0/24\"}" "$group")
+        local tp_pid; tp_pid=$(echo "$tp_create_resp" | jq -r '.data.id // .data.ID // empty' 2>/dev/null)
+        if [[ -n "$tp_pid" ]]; then
+            delete_provider_and_wait "$tp_pid" "third_party test provider" "$group" "$ADMIN_TOKEN" true
+        fi
+    fi
+
+    # -- Auto configure (required for api_only and auto execution rules, skip for ssh_only) --
+    if [[ "$EXECUTION_RULE" != "ssh_only" ]]; then
+        # -- Auto configure (streaming) --
+        test_api_retry "Auto configure (stream)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/auto-configure-stream" "200" \
+            '{}' 3 10 "$group"
+        sleep 5
+
+        # -- Auto configure (task) --
+        local ac; ac=$(test_api "Auto configure (task)" "POST" "/api/v1/admin/providers/auto-configure" "200|400|500" \
+            "{\"providerId\":${PROVIDER_ID}}" "$group")
+        local ac_task; ac_task=$(echo "$ac" | jq -r '.data.taskId // .data.task_id // empty' 2>/dev/null)
+        local auto_config_task_required=false
+        case "$ENV_TYPE" in
+            lxd|incus|proxmox|proxmoxve) auto_config_task_required=true ;;
+        esac
+        if [[ -n "$ac_task" ]]; then
+            local ac_result=""
+            if ac_result=$(wait_configuration_task_complete_nonfatal "$ac_task" "$ADMIN_TOKEN" "$CONFIG_TASK_MAX_WAIT" 10); then
+                TOTAL_TESTS=$((TOTAL_TESTS + 1))
+                PASSED_TESTS=$((PASSED_TESTS + 1))
+                log_success "Auto configure task completion"
+                report_add_pass "Auto configure task completion" "GET" "/api/v1/admin/configuration-tasks/${ac_task}"
+                _record_result "Auto configure task completion" "GET" "/api/v1/admin/configuration-tasks/${ac_task}" "PASS" "completed" "completed" "" "$group"
+            else
+                local ac_status
+                ac_status=$(safe_jq "$ac_result" '.data.status // "unknown"' 'unknown')
+                record_fail_result "Auto configure task completion" "GET" "/api/v1/admin/configuration-tasks/${ac_task}" "completed" "$ac_status" "$ac_result" "$group"
+            fi
+        elif [[ "$auto_config_task_required" == "true" ]]; then
+            record_fail_result "Auto configure task creation" "POST" "/api/v1/admin/providers/auto-configure" "task id" "missing" "$ac" "$group"
+        else
+            log_info "Auto-configure task is unsupported for ${ENV_TYPE}; no task ID expected"
+        fi
+    else
+        log_info "Skipping auto-configure for ssh_only execution rule"
+    fi
+
+    # -- Health check --
+    if ! ensure_provider_health_ready "$PROVIDER_ID" "$ADMIN_TOKEN" 0; then
+        record_fail_result "Provider health check" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/health-check-task" \
+            "completed task" "failed" "Provider health task did not complete" "$group"
+    fi
+
+    # -- Provider status --
+    test_api "Provider status" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/status" "200" "" "$group"
+
+    # -- Certificate generation (may not exist for certain provider types) --
+    # LXD/Incus/Proxmox certificate setup is covered by the asynchronous
+    # auto-configure task above; avoid launching a duplicate long SSH task here.
+    case "$ENV_TYPE" in
+        lxd|incus|proxmox|proxmoxve)
+            record_skip_result "Generate certificate (sync)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/generate-cert" "covered by auto-configure task for ${ENV_TYPE}" "$group"
+            ;;
+        *)
+            test_api "Generate certificate" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/generate-cert" "200|400|404|500" \
+                '{}' "$group"
+            ;;
+    esac
+
+    # -- Port configuration --
+    test_api "Update port config" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}/port-config" "200" \
+        '{"portRangeStart":20000,"portRangeEnd":30000,"defaultPortCount":10,"networkType":"nat_ipv4"}' "$group"
+    test_api "Get port usage" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/port-usage" "200" "" "$group"
+
+    # -- IPv4 pool --
+    test_api "Set IPv4 pool" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv4-pool" "200" \
+        '{"addresses":"10.0.0.100/24"}' "$group"
+    test_api "Get IPv4 pool" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/ipv4-pool" "200" "" "$group"
+
+    # -- Delete specific IPv4 pool entry --
+    local pool_resp; pool_resp=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}/ipv4-pool" 2>/dev/null)
+    local pool_entry_id; pool_entry_id=$(echo "$pool_resp" | jq -r '.data[0].id // .data.list[0].id // empty' 2>/dev/null)
+    if [[ -n "$pool_entry_id" ]]; then
+        test_api "Delete IPv4 pool entry" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/ipv4-pool/${pool_entry_id}" "200" "" "$group"
+    fi
+
+    test_api "Clear IPv4 pool" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/ipv4-pool" "200" "" "$group"
+
+    # -- Configuration tasks --
+    test_api "Configuration tasks" "GET" "/api/v1/admin/configuration-tasks?page=1&pageSize=10" "200" "" "$group"
+
+    # -- Hardware report --
+    test_api "Save hardware report" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "200|400|500" \
+        '{"pasteUrl":"https://paste.spiritlhl.net/#/show/ENn4E.txt"}' "$group"
+    test_api "Save hardware report (invalid URL)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "400" \
+        '{"pasteUrl":"https://example.com/some-report.txt"}' "$group"
+    test_api "Get hardware report" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "200|404" "" "$group"
+    test_api_noauth "Public hardware report" "GET" "/api/v1/public/providers/${PROVIDER_ID}/hardware-report" "200|404" "" "$group"
+    test_api "Delete hardware report" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "200" "" "$group"
+
+    # -- Checkin config --
+    test_api "Get checkin config" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/checkin-config" "200" "" "$group"
+    test_api "Update checkin config" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}/checkin-config" "200" \
+        '{"enabled":true,"extension_hours":24}' "$group"
+
+    # -- Domain config --
+    test_api "Get domain config" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/domain-config" "200" "" "$group"
+    test_api "Update domain config" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}/domain-config" "200" \
+        '{"enabled":true,"maxDomainsPerUser":3,"dnsType":"hosts","allowedSuffixes":".example.com"}' "$group"
+
+    # -- Export configs --
+    test_api "Export provider configs" "POST" "/api/v1/admin/providers/export-configs" "200" \
+        "{\"provider_ids\":[${PROVIDER_ID}]}" "$group"
+
+    # -- CSV import/export --
+    test_api "Export providers CSV (selected)" "GET" "/api/v1/admin/providers/export-csv?ids=${PROVIDER_ID}" "200" "" "$group"
+    test_api "Export providers CSV (empty template)" "GET" "/api/v1/admin/providers/export-csv?ids=999999999" "200" "" "$group"
+
+    local csv_template_tmp; csv_template_tmp=$(mktemp)
+    local csv_template_code
+    csv_template_code=$(curl -s --max-time 60 -o "$csv_template_tmp" -w "%{http_code}" \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers/export-csv?ids=999999999" 2>/dev/null || echo "000")
+    if [[ "$csv_template_code" == "200" ]]; then
+        local csv_template_header; csv_template_header=$(head -n 1 "$csv_template_tmp" | tr -d '\r')
+        # Verify new lifecycle/traffic policy fields are present in CSV header
+        if [[ "$csv_template_header" == id,name,type,* ]]; then
+            if echo "$csv_template_header" | grep -q "trafficOverLimitAction" && \
+               echo "$csv_template_header" | grep -q "trafficQuotaVisible" && \
+               echo "$csv_template_header" | grep -q "instanceExpiryAction"; then
+                log_success "Exported empty CSV template contains header row + lifecycle/traffic policy fields"
+            else
+                log_warning "CSV template missing some lifecycle/traffic policy fields in header"
+                log_success "Exported empty CSV template contains header row (basic check passed)"
+            fi
+        else
+            log_error "CSV template header mismatch: ${csv_template_header}"
+            rm -f "$csv_template_tmp"
+            chain_break "$group" "CSV template header mismatch"
+            return 1
+        fi
+    else
+        log_error "Export empty CSV template failed, HTTP ${csv_template_code}"
+        rm -f "$csv_template_tmp"
+        chain_break "$group" "CSV template export failed"
+        return 1
+    fi
+    rm -f "$csv_template_tmp"
+
+    local csv_import_name="ci-csv-import-${ENV_TYPE}-${RANDOM}"
+    local csv_import_file; csv_import_file=$(mktemp)
+    cat > "$csv_import_file" <<EOF
+id,name,type,endpoint,portIP,sshPort,username,password,sshKey,connectionType,status,architecture,container_enabled,vm_enabled,allowClaim,redeemCodeOnly,region,country,countryCode,city,executionRule,networkType,defaultPortCount,portRangeStart,portRangeEnd,maxTraffic,trafficCountMode,trafficMultiplier,enableTrafficControl,enableResourceMonitoring
+,${csv_import_name},${ENV_TYPE},,,,,,,agent,active,amd64,true,false,true,false,csv-region,,,,auto,no_port_mapping,10,10000,65535,1048576,both,1,false,false
+EOF
+
+    local csv_import_resp; csv_import_resp=$(curl -s --max-time 120 -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -F "file=@${csv_import_file};type=text/csv" \
+        "${SERVER_URL}/api/v1/admin/providers/import-csv" 2>/dev/null || true)
+    local csv_import_code; csv_import_code=$(echo "$csv_import_resp" | tail -1)
+    local csv_import_body; csv_import_body=$(echo "$csv_import_resp" | sed '$d')
+    if [[ "$csv_import_code" != "200" ]]; then
+        log_error "Import providers CSV failed, expected 200 got ${csv_import_code}"
+        log_error "Import response: ${csv_import_body}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import create failed"
+        return 1
+    fi
+    local csv_created; csv_created=$(echo "$csv_import_body" | jq -r '.data.created // 0' 2>/dev/null)
+    if [[ "$csv_created" == "0" ]]; then
+        log_error "CSV import create returned created=0: ${csv_import_body}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import create did not create row"
+        return 1
+    fi
+
+    local csv_created_id
+    local csv_list_resp; csv_list_resp=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers?page=1&pageSize=200&name=${csv_import_name}" 2>/dev/null || true)
+    csv_created_id=$(echo "$csv_list_resp" | jq -r '.data.list[]? | select(.name=="'"${csv_import_name}"'") | .id // .ID' 2>/dev/null | head -1)
+    if [[ -z "$csv_created_id" ]]; then
+        log_error "CSV-created provider not found by name: ${csv_import_name}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import create verification failed"
+        return 1
+    fi
+
+    cat > "$csv_import_file" <<EOF
+id,name,type,endpoint,portIP,sshPort,username,password,sshKey,connectionType,status,architecture,container_enabled,vm_enabled,allowClaim,redeemCodeOnly,region,country,countryCode,city,executionRule,networkType,defaultPortCount,portRangeStart,portRangeEnd,maxTraffic,trafficCountMode,trafficMultiplier,enableTrafficControl,enableResourceMonitoring
+${csv_created_id},${csv_import_name},${ENV_TYPE},,,,,,,agent,active,amd64,true,false,true,false,csv-region-updated,,,,auto,no_port_mapping,10,10000,65535,1048576,both,1,false,false
+EOF
+
+    local csv_update_resp; csv_update_resp=$(curl -s --max-time 120 -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -F "file=@${csv_import_file};type=text/csv" \
+        "${SERVER_URL}/api/v1/admin/providers/import-csv" 2>/dev/null || true)
+    local csv_update_code; csv_update_code=$(echo "$csv_update_resp" | tail -1)
+    local csv_update_body; csv_update_body=$(echo "$csv_update_resp" | sed '$d')
+    if [[ "$csv_update_code" != "200" ]]; then
+        log_error "Import providers CSV update failed, expected 200 got ${csv_update_code}"
+        log_error "Import update response: ${csv_update_body}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import update failed"
+        return 1
+    fi
+
+    local csv_updated; csv_updated=$(echo "$csv_update_body" | jq -r '.data.updated // 0' 2>/dev/null)
+    if [[ "$csv_updated" == "0" ]]; then
+        log_error "CSV import update returned updated=0: ${csv_update_body}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import update did not update row"
+        return 1
+    fi
+
+    local csv_detail_resp; csv_detail_resp=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers/${csv_created_id}" 2>/dev/null || true)
+    local csv_region; csv_region=$(echo "$csv_detail_resp" | jq -r '.data.region // empty' 2>/dev/null)
+    if [[ "$csv_region" != "csv-region-updated" ]]; then
+        log_error "CSV import update verification failed: expected region=csv-region-updated, got ${csv_region}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import update verification failed"
+        return 1
+    fi
+
+    # Fallback matching by name: when id is empty, existing provider should be updated by name
+    cat > "$csv_import_file" <<EOF
+id,name,type,endpoint,portIP,sshPort,username,password,sshKey,connectionType,status,architecture,container_enabled,vm_enabled,allowClaim,redeemCodeOnly,region,country,countryCode,city,executionRule,networkType,defaultPortCount,portRangeStart,portRangeEnd,maxTraffic,trafficCountMode,trafficMultiplier,enableTrafficControl,enableResourceMonitoring
+,${csv_import_name},${ENV_TYPE},,,,,,,agent,active,amd64,true,false,true,false,csv-region-by-name,,,,auto,no_port_mapping,10,10000,65535,1048576,both,1,false,false
+EOF
+
+    local csv_name_update_resp; csv_name_update_resp=$(curl -s --max-time 120 -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -F "file=@${csv_import_file};type=text/csv" \
+        "${SERVER_URL}/api/v1/admin/providers/import-csv" 2>/dev/null || true)
+    local csv_name_update_code; csv_name_update_code=$(echo "$csv_name_update_resp" | tail -1)
+    local csv_name_update_body; csv_name_update_body=$(echo "$csv_name_update_resp" | sed '$d')
+    if [[ "$csv_name_update_code" != "200" ]]; then
+        log_error "Import providers CSV by-name update failed, expected 200 got ${csv_name_update_code}"
+        log_error "Import by-name response: ${csv_name_update_body}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import by-name update failed"
+        return 1
+    fi
+
+    local csv_name_updated; csv_name_updated=$(echo "$csv_name_update_body" | jq -r '.data.updated // 0' 2>/dev/null)
+    if [[ "$csv_name_updated" == "0" ]]; then
+        log_error "CSV import by-name update returned updated=0: ${csv_name_update_body}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import by-name update did not update row"
+        return 1
+    fi
+
+    local csv_name_detail_resp; csv_name_detail_resp=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers/${csv_created_id}" 2>/dev/null || true)
+    local csv_name_region; csv_name_region=$(echo "$csv_name_detail_resp" | jq -r '.data.region // empty' 2>/dev/null)
+    if [[ "$csv_name_region" != "csv-region-by-name" ]]; then
+        log_error "CSV import by-name verification failed: expected region=csv-region-by-name, got ${csv_name_region}"
+        rm -f "$csv_import_file"
+        chain_break "$group" "CSV import by-name verification failed"
+        return 1
+    fi
+
+    rm -f "$csv_import_file"
+    delete_provider_and_wait "$csv_created_id" "CSV imported provider" "$group" "$ADMIN_TOKEN" true
+
+    # -- Provider API routes --
+    test_api "Provider API list" "GET" "/api/v1/providers" "200" "" "$group"
+    test_api "Provider API status" "GET" "/api/v1/providers/${PROVIDER_ID}/status" "200" "" "$group"
+    test_api "Provider API capabilities" "GET" "/api/v1/providers/${PROVIDER_ID}/capabilities" "200" "" "$group"
+    test_api "Provider API images" "GET" "/api/v1/providers/${PROVIDER_ID}/images" "200|400|500" "" "$group"
+
+    # -- Traffic history --
+    test_api "Provider traffic history" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/traffic/history" "200" "" "$group"
+
+    # -- isPureNode field: create provider with isPureNode=true and verify --
+    local pure_node_resp; pure_node_resp=$(test_api "Create isPureNode provider" "POST" "/api/v1/admin/providers" "200|409" \
+        "{\"name\":\"ci-pure-node\",\"type\":\"${ENV_TYPE}\",\"executionRule\":\"${EXECUTION_RULE}\",\"networkType\":\"nat_ipv4\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",${auth_payload},\"isPureNode\":true}" "$group")
+    local pure_pid; pure_pid=$(echo "$pure_node_resp" | jq -r '.data.id // .data.ID // empty' 2>/dev/null)
+    if [[ -n "$pure_pid" ]]; then
+        local pure_detail; pure_detail=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+            "${SERVER_URL}/api/v1/admin/providers/${pure_pid}" 2>/dev/null)
+        local is_pure; is_pure=$(echo "$pure_detail" | jq -r '.data.isPureNode // false' 2>/dev/null)
+        if [[ "$is_pure" == "true" ]]; then
+            log_success "isPureNode=true saved and returned correctly"
+        else
+            log_warning "isPureNode mismatch: expected true, got '${is_pure}'"
+        fi
+        delete_provider_and_wait "$pure_pid" "isPureNode provider" "$group" "$ADMIN_TOKEN" true
+    fi
+
+    # -- gpuEnabled field: update provider with gpuEnabled=true --
+    test_api "Update provider gpuEnabled" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"gpuEnabled":true,"gpuDeviceIds":"0"}' "$group"
+    test_api "Update provider gpuEnabled off" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"gpuEnabled":false,"gpuDeviceIds":""}' "$group"
+
+    # -- detect-gpus: SSH-based GPU detection (may fail on non-LXD, accept 400/500) --
+    test_api "Detect provider GPUs" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/detect-gpus" "200|400|500" "" "$group"
+
+    # -- stopped-containers: fetch copyable source containers for supported container runtimes --
+    test_api "Get copyable source containers" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/stopped-containers" "200|400|500" "" "$group"
+
+    # -- exec: run a command on provider via SSH --
+    test_api "Exec command on provider" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/exec" "200|400|500" \
+        '{"command":"echo hello","timeout":10}' "$group"
+
+    # -- exec: empty command must fail --
+    test_api "Exec empty command (400)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/exec" "400" \
+        '{"command":"","timeout":10}' "$group"
+
+    # -- exec: nonexistent provider --
+    test_api "Exec nonexistent provider (404)" "POST" "/api/v1/admin/providers/99999/exec" "404|400" \
+        '{"command":"echo hello","timeout":10}' "$group"
+
+    # -- detect-gpus on nonexistent provider --
+    test_api "Detect GPUs nonexistent provider" "GET" "/api/v1/admin/providers/99999/detect-gpus" "404|400" "" "$group"
+
+    # -- stopped-containers on nonexistent provider --
+    test_api "Stopped containers nonexistent provider" "GET" "/api/v1/admin/providers/99999/stopped-containers" "404|400" "" "$group"
+
+    # -- connectionType: update to agent mode and verify field persists --
+    test_api "Update connectionType=agent" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"connectionType":"agent"}' "$group"
+    local ct_detail; ct_detail=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}" 2>/dev/null)
+    local saved_ct; saved_ct=$(echo "$ct_detail" | jq -r '.data.connectionType // empty' 2>/dev/null)
+    if [[ "$saved_ct" == "agent" ]]; then
+        log_success "connectionType=agent saved correctly"
+    else
+        log_warning "connectionType expected 'agent', got '${saved_ct}'"
+    fi
+    # Revert to ssh — must restore endpoint/sshPort/networkType/container_enabled/vm_enabled
+    # because "Update connectionType=agent" forced endpoint="" sshPort=0 networkType="no_port_mapping"
+    # and direct bool assignment zeroed container_enabled/vm_enabled.
+    # Without this, SSH health checks fail for ~60 min and the provider is auto-frozen,
+    # causing HTTP 400 in module 29 VM image creates (images 15-22) and module 30 failures.
+    test_api "Revert connectionType=ssh" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        "{\"connectionType\":\"ssh\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",\"networkType\":\"nat_ipv4\",\"container_enabled\":${provider_container_enabled},\"vm_enabled\":${provider_vm_enabled},${auth_payload}}" "$group"
+    if [[ -n "${ALICE_PRIVATE_KEY:-}" ]]; then
+        local escaped_key; escaped_key=$(echo "$ALICE_PRIVATE_KEY" | jq -Rsa .)
+        local key_provider; key_provider=$(test_api "Create provider (key auth)" "POST" "/api/v1/admin/providers" "200|409" \
+            "{\"name\":\"ci-${ENV_TYPE}-key-provider\",\"type\":\"${ENV_TYPE}\",\"executionRule\":\"auto\",\"networkType\":\"nat_ipv4\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",\"sshKey\":${escaped_key}}" "$group")
+        local key_pid; key_pid=$(echo "$key_provider" | jq -r '.data.id // .data.ID // empty' 2>/dev/null)
+        if [[ -n "$key_pid" ]]; then
+            test_api "Key provider status" "GET" "/api/v1/admin/providers/${key_pid}/status" "200" "" "$group"
+            delete_provider_and_wait "$key_pid" "key provider" "$group" "$ADMIN_TOKEN" true
+        fi
+    fi
+
+    # -- Negative tests --
+    # Create provider with missing required fields
+    test_api "Create provider (no name)" "POST" "/api/v1/admin/providers" "400" \
+        "{\"type\":\"docker\",\"endpoint\":\"${WORKER_IP}\",\"sshPort\":22,\"username\":\"root\",\"password\":\"test\"}" "$group"
+
+    # Create provider with out-of-range SSH port (backend accepts any int, no port-range validation on create)
+    local inv_port_resp; inv_port_resp=$(test_api "Create provider (invalid port)" "POST" "/api/v1/admin/providers" "200|409" \
+        '{"name":"invalid-port-provider","type":"docker","endpoint":"192.0.2.1","sshPort":99999,"username":"root","password":"test"}' "$group")
+    local inv_port_id; inv_port_id=$(echo "$inv_port_resp" | jq -r '.data.id // .data.ID // empty' 2>/dev/null)
+    if [[ -n "$inv_port_id" ]]; then
+        delete_provider_and_wait "$inv_port_id" "invalid-port provider" "$group" "$ADMIN_TOKEN" true
+    fi
+
+    # Get nonexistent provider
+    test_api "Get nonexistent provider" "GET" "/api/v1/admin/providers/99999" "404" "" "$group"
+
+    # Delete nonexistent provider
+    test_api "Delete nonexistent provider" "DELETE" "/api/v1/admin/providers/99999" "404|400" "" "$group"
+
+    # Edit nonexistent provider
+    test_api "Edit nonexistent provider" "PUT" "/api/v1/admin/providers/99999" "404|400" \
+        '{"name":"ghost-provider"}' "$group"
+
+    # Health check on nonexistent provider
+    test_api "Health check nonexistent" "POST" "/api/v1/admin/providers/99999/health-check" "404|400" '{}' "$group"
+}

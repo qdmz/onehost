@@ -1,0 +1,227 @@
+// 实例详情页 - 纯格式化工具函数
+import { useI18n } from 'vue-i18n'
+
+export function useInstanceFormatters() {
+  const { t, locale } = useI18n()
+
+  const getNetworkTypeFromLegacy = (ipv4MappingType, hasIPv6) => {
+    if (ipv4MappingType === 'nat') {
+      return hasIPv6 ? 'nat_ipv4_ipv6' : 'nat_ipv4'
+    } else if (ipv4MappingType === 'dedicated') {
+      return hasIPv6 ? 'dedicated_ipv4_ipv6' : 'dedicated_ipv4'
+    } else if (ipv4MappingType === 'ipv6_only') {
+      return 'ipv6_only'
+    }
+    return 'nat_ipv4'
+  }
+
+  const getNetworkTypeDisplayName = (networkType) => {
+    const typeNames = {
+      'nat_ipv4': 'NAT IPv4',
+      'nat_ipv4_ipv6': `NAT IPv4 + ${t('user.apply.networkConfig.dedicatedIPv6')}`,
+      'dedicated_ipv4': t('user.apply.networkConfig.dedicatedIPv4'),
+      'dedicated_ipv4_ipv6': `${t('user.apply.networkConfig.dedicatedIPv4')} + ${t('user.apply.networkConfig.dedicatedIPv6')}`,
+      'ipv6_only': t('user.apply.networkConfig.ipv6Only')
+    }
+    return typeNames[networkType] || t('user.instanceDetail.unknownType')
+  }
+
+  const getNetworkTypeTagType = (networkType) => {
+    const tagTypes = {
+      'nat_ipv4': 'primary',
+      'nat_ipv4_ipv6': 'success',
+      'dedicated_ipv4': 'warning',
+      'dedicated_ipv4_ipv6': 'success',
+      'ipv6_only': 'info'
+    }
+    return tagTypes[networkType] || 'default'
+  }
+
+  const getProviderTypeName = (type) => {
+    const names = { docker: 'Docker', lxd: 'LXD', incus: 'Incus', proxmox: 'Proxmox', podman: 'Podman', containerd: 'Containerd', qemu: 'QEMU/KVM', kubevirt: 'KubeVirt' }
+    return names[type] || type
+  }
+
+  const getProviderTypeColor = (type) => {
+    const colors = { docker: 'info', lxd: 'success', incus: 'warning', proxmox: '', podman: 'info', containerd: 'info', qemu: 'danger', kubevirt: 'danger' }
+    return colors[type] || ''
+  }
+
+  const getTaskTitle = (task) => {
+    const taskTypes = {
+      create: t('user.instanceDetail.taskTitleCreate'),
+      delete: t('user.instanceDetail.taskTitleDelete'),
+      start: t('user.instanceDetail.taskTitleStart'),
+      stop: t('user.instanceDetail.taskTitleStop'),
+      restart: t('user.instanceDetail.taskTitleRestart'),
+      reset: t('user.instanceDetail.taskTitleReset'),
+      rebuild: t('user.tasks.taskTypeRebuild'),
+      reset_password: t('user.instanceDetail.taskTitleResetPassword'),
+      'reset-password': t('user.tasks.taskTypeResetPassword'),
+      'snapshot-create': t('user.tasks.taskTypeSnapshotCreate'),
+      'snapshot-delete': t('user.tasks.taskTypeSnapshotDelete'),
+      'snapshot-restore': t('user.tasks.taskTypeSnapshotRestore'),
+      'monitor-sync': t('user.tasks.taskTypeMonitorSync'),
+      'agent-deploy': t('user.tasks.taskTypeAgentDeploy'),
+      'agent-uninstall': t('user.tasks.taskTypeAgentUninstall'),
+      'traffic-monitor-enable': t('user.tasks.taskTypeTrafficMonitorEnable'),
+      'traffic-monitor-disable': t('user.tasks.taskTypeTrafficMonitorDisable'),
+      'traffic-monitor-detect': t('user.tasks.taskTypeTrafficMonitorDetect'),
+      'provider-image-cleanup': t('user.tasks.taskTypeProviderImageCleanup'),
+      'provider-instance-sync': t('user.tasks.taskTypeProviderInstanceSync'),
+      'provider-orphan-cleanup': t('user.tasks.taskTypeProviderOrphanCleanup'),
+      'provider-health-check': t('user.tasks.taskTypeProviderHealthCheck'),
+      'provider-io-limit-sync': t('user.tasks.taskTypeProviderIOLimitSync'),
+      'provider-runtime-reload': t('user.tasks.taskTypeProviderRuntimeReload'),
+      'provider-delete': t('user.tasks.taskTypeProviderDelete')
+    }
+    return taskTypes[task.taskType] || t('user.instanceDetail.taskTitleDefault')
+  }
+
+  const getTaskTypeText = (taskType) => {
+    const taskTypes = {
+      create: t('user.instanceDetail.taskCreate'),
+      delete: t('user.instanceDetail.taskDelete'),
+      start: t('user.instanceDetail.taskStart'),
+      stop: t('user.instanceDetail.taskStop'),
+      restart: t('user.instanceDetail.taskRestart'),
+      reset: t('user.instanceDetail.taskReset'),
+      rebuild: t('user.tasks.taskTypeRebuild'),
+      reset_password: t('user.instanceDetail.taskResetPassword'),
+      'reset-password': t('user.tasks.taskTypeResetPassword'),
+      create_redemption_instance: t('user.instanceDetail.taskRedemption'),
+      'create-port-mapping': t('user.tasks.taskTypeCreatePortMapping'),
+      'delete-port-mapping': t('user.tasks.taskTypeDeletePortMapping'),
+      'sync-port-mappings': t('user.tasks.taskTypeSyncPortMappings'),
+      'repair-port-mappings': t('user.tasks.taskTypeRepairPortMappings'),
+      'snapshot-create': t('user.tasks.taskTypeSnapshotCreate'),
+      'snapshot-delete': t('user.tasks.taskTypeSnapshotDelete'),
+      'snapshot-restore': t('user.tasks.taskTypeSnapshotRestore'),
+      'monitor-sync': t('user.tasks.taskTypeMonitorSync'),
+      'agent-deploy': t('user.tasks.taskTypeAgentDeploy'),
+      'agent-uninstall': t('user.tasks.taskTypeAgentUninstall'),
+      'traffic-monitor-enable': t('user.tasks.taskTypeTrafficMonitorEnable'),
+      'traffic-monitor-disable': t('user.tasks.taskTypeTrafficMonitorDisable'),
+      'traffic-monitor-detect': t('user.tasks.taskTypeTrafficMonitorDetect'),
+      'provider-image-cleanup': t('user.tasks.taskTypeProviderImageCleanup'),
+      'provider-instance-sync': t('user.tasks.taskTypeProviderInstanceSync'),
+      'provider-orphan-cleanup': t('user.tasks.taskTypeProviderOrphanCleanup'),
+      'provider-health-check': t('user.tasks.taskTypeProviderHealthCheck'),
+      'provider-io-limit-sync': t('user.tasks.taskTypeProviderIOLimitSync'),
+      'provider-runtime-reload': t('user.tasks.taskTypeProviderRuntimeReload'),
+      'provider-delete': t('user.tasks.taskTypeProviderDelete')
+    }
+    return taskTypes[taskType] || t('user.instanceDetail.taskDefault')
+  }
+
+  const getTaskAlertType = (status) => {
+    const types = {
+      pending: 'info',
+      processing: 'warning',
+      running: 'warning',
+      completed: 'success',
+      failed: 'error',
+      cancelled: 'info'
+    }
+    return types[status] || 'info'
+  }
+
+  const getStatusType = (status) => {
+    const statusMap = {
+      'running': 'success',
+      'stopped': 'info',
+      'paused': 'warning',
+      'creating': 'warning',
+      'starting': 'warning',
+      'stopping': 'warning',
+      'restarting': 'warning',
+      'rebuilding': 'warning',
+      'resetting': 'warning',
+      'deleting': 'danger',
+      'deleted': 'info',
+      'processing': 'warning',
+      'unavailable': 'danger',
+      'error': 'danger',
+      'failed': 'danger'
+    }
+    return statusMap[status] || 'info'
+  }
+
+  const getStatusText = (status) => {
+    const statusMap = {
+      'running': t('user.instanceDetail.statusRunning'),
+      'stopped': t('user.instanceDetail.statusStopped'),
+      'paused': t('user.instanceDetail.statusPaused'),
+      'creating': t('user.instanceDetail.statusCreating'),
+      'starting': t('user.instanceDetail.statusStarting'),
+      'stopping': t('user.instanceDetail.statusStopping'),
+      'restarting': t('user.instanceDetail.statusRestarting'),
+      'rebuilding': t('user.instanceDetail.statusRebuilding'),
+      'resetting': t('user.instanceDetail.statusResetting'),
+      'deleting': t('user.instanceDetail.statusDeleting'),
+      'deleted': t('user.instanceDetail.statusDeleted'),
+      'processing': t('user.instanceDetail.statusProcessing'),
+      'unavailable': t('user.instanceDetail.statusUnavailable'),
+      'error': t('user.instanceDetail.statusError'),
+      'failed': t('user.instanceDetail.statusFailed')
+    }
+    return statusMap[status] || status
+  }
+
+  const getTrafficProgressColor = (percentage) => {
+    if (percentage < 70) return '#67c23a'
+    if (percentage < 90) return '#e6a23c'
+    return '#f56c6c'
+  }
+
+  const formatTraffic = (mb) => {
+    if (!mb || mb === 0) return '0 MB'
+    if (mb < 1024) return `${mb} MB`
+    if (mb < 1024 * 1024) return `${(mb / 1024).toFixed(1)} GB`
+    return `${(mb / (1024 * 1024)).toFixed(1)} TB`
+  }
+
+  const formatDate = (dateString) => {
+    if (!dateString) return t('user.instanceDetail.none')
+    return new Date(dateString).toLocaleString(locale.value)
+  }
+
+  // monitoring 作为参数传入以避免跨 composable 依赖
+  const getTrafficLimitTitle = (monitoring) => {
+    const limitType = monitoring?.trafficData?.limitType
+    switch (limitType) {
+      case 'user':   return t('user.instanceDetail.userTrafficWarning')
+      case 'provider': return t('user.instanceDetail.trafficWarning')
+      case 'both':   return t('user.instanceDetail.dualTrafficWarning')
+      default:       return t('user.instanceDetail.trafficWarning')
+    }
+  }
+
+  const getTrafficLimitType = (monitoring) => {
+    const limitType = monitoring?.trafficData?.limitType
+    switch (limitType) {
+      case 'provider':
+      case 'both': return 'error'
+      case 'user': return 'warning'
+      default:     return 'warning'
+    }
+  }
+
+  return {
+    getNetworkTypeFromLegacy,
+    getNetworkTypeDisplayName,
+    getNetworkTypeTagType,
+    getProviderTypeName,
+    getProviderTypeColor,
+    getTaskTitle,
+    getTaskTypeText,
+    getTaskAlertType,
+    getStatusType,
+    getStatusText,
+    getTrafficProgressColor,
+    formatTraffic,
+    formatDate,
+    getTrafficLimitTitle,
+    getTrafficLimitType
+  }
+}

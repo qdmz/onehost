@@ -1,0 +1,150 @@
+package router
+
+import (
+	"oneclickvirt/api/v1/auth"
+	productAPI "oneclickvirt/api/v1/product"
+	"oneclickvirt/api/v1/public"
+	"oneclickvirt/api/v1/traffic"
+	"oneclickvirt/api/v1/user"
+	"oneclickvirt/middleware"
+	authModel "oneclickvirt/model/auth"
+
+	"github.com/gin-gonic/gin"
+)
+
+// InitUserRouter 用户路由
+func InitUserRouter(Router *gin.RouterGroup) {
+	UserGroup := Router.Group("/v1")
+	UserGroup.Use(middleware.RequireAuth(authModel.AuthLevelUser))
+	UserGroup.Use(middleware.TaskPoolAdmissionGate())
+	{
+		// 用户管理
+		UserGroup.GET("/user/profile", user.GetUserInfo)
+		UserGroup.PUT("/user/profile", user.UpdateProfile)
+		UserGroup.PUT("/user/reset-password", user.UserResetPassword)
+		UserGroup.GET("/user/info", user.GetUserInfo)
+		UserGroup.GET("/user/dashboard", user.GetUserDashboard)
+		UserGroup.GET("/user/limits", user.GetUserLimits)
+
+		// 实例管理
+		UserGroup.GET("/user/instances", user.GetUserInstances)
+		UserGroup.POST("/user/instances", middleware.RequireKYCFor("create-instance"), user.CreateUserInstance)
+		UserGroup.GET("/user/instances/:id", user.GetUserInstanceDetail)
+		UserGroup.POST("/user/instances/:id/share-links", user.CreateUserInstanceShare)
+		UserGroup.GET("/user/instances/:id/monitoring", user.GetInstanceMonitoring)
+		UserGroup.GET("/user/instances/:id/monitoring/resources", user.GetInstanceResourceMonitoring)
+		UserGroup.GET("/user/instances/:id/monitoring/status", user.GetInstanceMonitoringStatus)
+		UserGroup.GET("/user/instances/:id/pmacct/summary", user.GetInstancePmacctSummary)
+		UserGroup.GET("/user/instances/:id/pmacct/query", user.QueryInstancePmacctData)
+		UserGroup.PUT("/user/instances/:id/reset-password", user.ResetInstancePassword)
+		UserGroup.GET("/user/instances/:id/password/:taskId", user.GetInstanceNewPassword)
+		UserGroup.GET("/user/instances/:id/ports", user.GetInstancePorts)
+		UserGroup.GET("/user/instances/:id/snapshots", user.GetUserInstanceSnapshots)
+		UserGroup.POST("/user/instances/:id/snapshots", user.CreateUserInstanceSnapshot)
+		UserGroup.POST("/user/instances/:id/snapshots/upload", user.UploadUserSnapshot)
+		UserGroup.POST("/user/snapshots/:id/restore", user.RestoreUserSnapshot)
+		UserGroup.DELETE("/user/snapshots/:id", user.DeleteUserSnapshot)
+		UserGroup.GET("/user/snapshots/:id/download", user.DownloadUserSnapshot)
+		UserGroup.GET("/user/instances/:id/ssh", user.SSHWebSocket) // WebSocket SSH连接
+		UserGroup.GET("/user/instances/:id/vnc", user.UserInstanceVNCInfo)
+		UserGroup.GET("/user/instances/:id/vnc/ws", user.UserInstanceVNCWebSocket)
+		UserGroup.GET("/user/instances/:id/exec", user.ExecWebSocket) // WebSocket Container Exec
+		UserGroup.GET("/user/instances/:id/sftp/list", user.UserSFTPList)
+		UserGroup.GET("/user/instances/:id/sftp/download", user.UserSFTPDownload)
+		UserGroup.POST("/user/instances/:id/sftp/upload", user.UserSFTPUpload)
+		UserGroup.GET("/user/instances/:id/sftp/upload/status", user.UserSFTPUploadStatus)
+		UserGroup.POST("/user/instances/:id/sftp/upload/abort", user.UserSFTPUploadAbort)
+		UserGroup.POST("/user/instances/action", user.InstanceAction)
+		UserGroup.POST("/user/instances/batch-action", user.BatchInstanceAction)
+
+		// 端口映射
+		UserGroup.GET("/user/port-mappings", user.GetUserPortMappings)
+
+		// 资源管理
+		UserGroup.GET("/user/resources/available", user.GetAvailableResources)
+		UserGroup.POST("/user/resources/claim", user.ClaimResource)
+		UserGroup.GET("/user/providers/available", user.GetAvailableProviders)
+		UserGroup.GET("/user/images", user.GetUserSystemImages)
+		UserGroup.GET("/user/images/filtered", user.GetFilteredSystemImages)
+		UserGroup.GET("/user/providers/:id/capabilities", user.GetProviderCapabilities)
+		UserGroup.GET("/user/providers/:id/gpus", user.GetProviderGPUs) // 获取Provider缓存的GPU/NPU设备列表
+		UserGroup.GET("/user/instance-type-permissions", user.GetInstanceTypePermissions)
+		UserGroup.GET("/user/instance-config", user.GetInstanceConfig)
+
+		// 任务管理
+		UserGroup.GET("/user/tasks", user.GetUserTasks)
+		UserGroup.POST("/user/tasks/:taskId/cancel", user.CancelUserTask)
+
+		// 流量统计API
+		trafficAPI := &traffic.UserTrafficAPI{}
+		UserGroup.GET("/user/traffic/overview", trafficAPI.GetTrafficOverview)
+		UserGroup.GET("/user/traffic/instance/:instanceId", trafficAPI.GetInstanceTrafficDetail)
+		UserGroup.GET("/user/traffic/instances", trafficAPI.GetInstancesTrafficSummary)
+		UserGroup.GET("/user/traffic/limit-status", trafficAPI.GetTrafficLimitStatus)
+		UserGroup.GET("/user/traffic/pmacct/:instanceId", trafficAPI.GetPmacctData)
+		UserGroup.GET("/user/traffic/history", trafficAPI.GetUserTrafficHistory)
+		UserGroup.GET("/user/instances/:id/traffic/history", trafficAPI.GetInstanceTrafficHistory)
+
+		// 仪表盘统计
+		UserGroup.GET("/dashboard/stats", public.GetDashboardStats)
+
+		// 兑换码兑换
+		UserGroup.POST("/user/redemption-codes/redeem", middleware.RequireKYCFor("redeem-code"), user.RedeemCode)
+
+		// 域名绑定
+		UserGroup.GET("/user/domains", user.GetUserDomains)
+		UserGroup.POST("/user/domains", middleware.RequireKYCFor("domain-bind"), user.CreateUserDomain)
+		UserGroup.PUT("/user/domains/:id", user.UpdateUserDomain)
+		UserGroup.DELETE("/user/domains/:id", user.DeleteUserDomain)
+
+		// KYC实名认证
+		UserGroup.GET("/user/kyc", user.GetUserKYC)
+		UserGroup.POST("/user/kyc", user.SubmitUserKYC)
+		UserGroup.POST("/user/kyc/alipay", user.SubmitAlipayKYC)
+		UserGroup.GET("/user/kyc/alipay/result", user.QueryAlipayKYCResult)
+
+		// 签到续期
+		UserGroup.GET("/user/checkin/eligible-instances", user.GetEligibleCheckinInstances)
+		UserGroup.POST("/user/checkin/code/:instance_id", user.GenerateCheckinCode)
+		UserGroup.POST("/user/checkin", user.DoCheckin)
+		UserGroup.GET("/user/checkin/records", user.GetCheckinRecords)
+		UserGroup.GET("/user/checkin/stats", user.GetCheckinStats)
+		UserGroup.POST("/user/checkin/batch", user.BatchCheckin)
+		UserGroup.POST("/user/checkin/batch-checkin", user.BatchCheckin)
+
+		// API Token管理
+		UserGroup.POST("/user/api-tokens", auth.CreateApiToken)
+		UserGroup.GET("/user/api-tokens", auth.GetApiTokenList)
+		UserGroup.DELETE("/user/api-tokens/:id", auth.DeleteApiToken)
+
+		// 用户工单管理
+		UserGroup.POST("/user/tickets", productAPI.CreateTicket)
+		UserGroup.GET("/user/tickets", productAPI.GetTicketList)
+		UserGroup.GET("/user/tickets/:id", productAPI.GetTicketDetail)
+		UserGroup.POST("/user/tickets/:id/reply", productAPI.ReplyTicket)
+		UserGroup.POST("/user/tickets/:id/close", productAPI.CloseTicket)
+
+		// 用户余额管理
+		UserGroup.GET("/user/balance", productAPI.GetUserBalance)
+		UserGroup.GET("/user/balance/logs", productAPI.GetBalanceLogs)
+
+		// 产品商城
+		UserGroup.GET("/products", productAPI.GetProductList)
+		UserGroup.GET("/products/:id", productAPI.GetProductDetail)
+		UserGroup.GET("/products/:id/images", productAPI.GetProductImages)
+
+		// 订单管理
+		UserGroup.POST("/orders", productAPI.CreateOrder)
+		UserGroup.GET("/orders", productAPI.GetOrderList)
+		UserGroup.GET("/orders/:id", productAPI.GetOrderDetail)
+		UserGroup.POST("/orders/pay", productAPI.PayOrderWithBalance)
+		UserGroup.GET("/orders/:id/pay-status", productAPI.GetOrderPayStatus)
+		UserGroup.POST("/orders/renew", productAPI.RenewOrder)
+		UserGroup.POST("/orders/cancel", productAPI.CancelOrder)
+		UserGroup.POST("/orders/:id/complete-renew", productAPI.CompleteRenewOrder)
+
+		// 支付充值
+		UserGroup.POST("/payments/yipay", productAPI.CreateYiPayOrder)
+		UserGroup.GET("/payments/recharge-list", productAPI.GetRechargeList)
+	}
+}

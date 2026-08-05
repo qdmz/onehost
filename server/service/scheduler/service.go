@@ -1,0 +1,632 @@
+package scheduler
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"oneclickvirt/constant"
+	"oneclickvirt/global"
+	adminModel "oneclickvirt/model/admin"
+	dashboardModel "oneclickvirt/model/dashboard"
+	"oneclickvirt/model/provider"
+	"oneclickvirt/service/maintenance"
+	"oneclickvirt/service/traffic"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+)
+
+// SchedulerService 全局任务调度器
+type SchedulerService struct {
+	taskService    TaskServiceInterface
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	running        bool
+	mu             sync.RWMutex
+	triggerChan    chan struct{} // 用于立即触发任务处理
+	trafficCheckMu sync.Mutex    // 防止并发流量限制检查
+	dataCleanupMu  sync.Mutex    // 防止数据库保留策略清理并发执行
+}
+
+// TaskServiceInterface 任务服务接口
+type TaskServiceInterface interface {
+	StartTask(taskID uint) error
+	CancelTaskByAdmin(taskID uint, reason string) error
+	CleanupTimeoutTasksWithLockRelease(timeoutThreshold time.Time) (int64, int64)
+}
+
+// NewSchedulerService 创建新的调度器服务
+func NewSchedulerService(taskService TaskServiceInterface) *SchedulerService {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &SchedulerService{
+		taskService: taskService,
+		ctx:         ctx,
+		cancel:      cancel,
+		running:     false,
+		triggerChan: make(chan struct{}, 1), // 缓冲通道，避免阻塞
+	}
+}
+
+// Start 启动调度器
+func (s *SchedulerService) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.running {
+		return fmt.Errorf("scheduler is already running")
+	}
+
+	// Recreate context so that a stopped scheduler can be restarted
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+
+	s.running = true
+	s.wg.Add(1)
+	go s.runTaskScheduler()
+
+	global.APP_LOG.Info("Task scheduler started")
+	return nil
+}
+
+// Stop 停止调度器
+func (s *SchedulerService) Stop() error {
+	s.mu.Lock()
+	if !s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("scheduler is not running")
+	}
+	s.cancel()
+	s.mu.Unlock() // 先释放锁，再等待goroutine结束，避免goroutine调用IsRunning()时死锁
+
+	s.wg.Wait()
+
+	s.mu.Lock()
+	s.running = false
+	s.mu.Unlock()
+
+	global.APP_LOG.Info("Task scheduler stopped")
+	return nil
+}
+
+// IsRunning 检查调度器是否运行中
+func (s *SchedulerService) IsRunning() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.running
+}
+
+// TriggerTaskProcessing 立即触发任务处理（非阻塞）
+func (s *SchedulerService) TriggerTaskProcessing() {
+	select {
+	case s.triggerChan <- struct{}{}:
+		// 成功发送触发信号
+	default:
+		// 通道已满，说明已有待处理的触发信号，忽略
+	}
+}
+
+// StartScheduler 启动调度器（实现global.Scheduler接口）
+func (s *SchedulerService) StartScheduler() {
+	s.Start()
+}
+
+// StopScheduler 停止调度器（实现global.Scheduler接口）
+func (s *SchedulerService) StopScheduler() {
+	s.Stop()
+}
+
+// Shutdown lifecycle compatibility adapter.
+func (s *SchedulerService) Shutdown() {
+	if err := s.Stop(); err != nil {
+		global.APP_LOG.Warn("SchedulerService 关闭失败", zap.Error(err))
+	}
+}
+
+// runTaskScheduler 主调度循环
+func (s *SchedulerService) runTaskScheduler() {
+	defer s.wg.Done()
+
+	// 创建定时器
+	taskTicker := time.NewTicker(10 * time.Second)         // 任务处理保持10秒
+	cleanupTicker := time.NewTicker(1 * time.Minute)       // 超时清理保持 1分钟
+	maintenanceTicker := time.NewTicker(10 * time.Minute)  // 系统维护保持 10分钟
+	trafficAggTicker := time.NewTicker(10 * time.Minute)   // 流量聚合保持 10分钟
+	expiryCheckTicker := time.NewTicker(1 * time.Hour)     // 过期检查保持 1小时
+	trafficLimitTicker := time.NewTicker(10 * time.Minute) // 流量限制检查保持 10分钟，与Provider默认配置对齐
+	agentVersionTicker := time.NewTicker(30 * time.Minute) // Agent版本检查保持 30分钟
+	dataCleanupTicker := time.NewTicker(s.dataCleanupInterval())
+
+	defer func() {
+		taskTicker.Stop()
+		cleanupTicker.Stop()
+		maintenanceTicker.Stop()
+		trafficAggTicker.Stop()
+		expiryCheckTicker.Stop()
+		trafficLimitTicker.Stop()
+		agentVersionTicker.Stop()
+		dataCleanupTicker.Stop()
+	}()
+
+	global.APP_LOG.Info("Task scheduler main loop started with traffic aggregation and expiry check")
+
+	// 启动时立即执行一次过期检查
+	s.checkExpiredResources()
+	go s.checkAndEnforceTrafficLimits()
+	go s.scheduleInitialRetentionDataCleanup()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			global.APP_LOG.Info("Task scheduler context cancelled, exiting")
+			return
+
+		case <-taskTicker.C:
+			s.processPendingTasks()
+
+		case <-s.triggerChan:
+			// 立即处理pending任务
+			global.APP_LOG.Debug("Scheduler triggered immediately")
+			s.processPendingTasks()
+
+		case <-cleanupTicker.C:
+			s.cleanupTimeoutTasks()
+
+		case <-maintenanceTicker.C:
+			s.performMaintenance()
+
+		case <-expiryCheckTicker.C:
+			// 定期检查过期资源并冻结
+			s.checkExpiredResources()
+
+		case <-trafficAggTicker.C:
+			// 定期聚合流量数据，更新缓存
+			s.aggregateTrafficData()
+
+		case <-trafficLimitTicker.C:
+			// 定期执行三层级流量限制检查（Provider > User > Instance）
+			s.checkAndEnforceTrafficLimits()
+
+		case <-agentVersionTicker.C:
+			// 定期检查Agent版本是否与主控兼容
+			s.checkAgentVersions()
+
+		case <-dataCleanupTicker.C:
+			// 定期清理数据库历史数据，避免审计/流量表无限增长
+			s.cleanupRetentionData()
+		}
+	}
+}
+
+// processPendingTasks 处理待处理任务
+func (s *SchedulerService) processPendingTasks() {
+	// 检查数据库是否已初始化
+	if global.APP_DB == nil {
+		global.APP_LOG.Debug("数据库未初始化，跳过任务处理")
+		return
+	}
+
+	// 获取所有待处理任务，按创建时间排序
+	// 优化：添加LIMIT限制，避免一次性加载过多任务，减少内存和数据库压力
+	var pendingTasks []adminModel.Task
+	err := global.APP_DB.Where("status = ?", "pending").
+		Order("created_at ASC").
+		Limit(50).
+		Find(&pendingTasks).Error
+
+	if err != nil {
+		global.APP_LOG.Error("Failed to fetch pending tasks", zap.Error(err))
+		return
+	}
+
+	if len(pendingTasks) == 0 {
+		return
+	}
+
+	// 只在有任务需要处理时记录一次日志
+	global.APP_LOG.Debug("处理待处理任务", zap.Int("count", len(pendingTasks)))
+
+	// 按顺序处理每个任务
+	for _, task := range pendingTasks {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+			s.tryStartTask(task)
+		}
+	}
+}
+
+// tryStartTask 尝试启动任务
+func (s *SchedulerService) tryStartTask(task adminModel.Task) {
+	// 检查数据库是否已初始化
+	if global.APP_DB == nil {
+		global.APP_LOG.Debug("数据库未初始化，跳过任务启动")
+		return
+	}
+
+	// 检查ProviderID是否为空
+	if task.ProviderID == nil {
+		global.APP_LOG.Error("Task has no provider ID", zap.Uint("task_id", task.ID))
+		s.taskService.CancelTaskByAdmin(task.ID, "No provider assigned")
+		return
+	}
+
+	// 检查Provider是否可用（基础检查）
+	var provider provider.Provider
+	err := global.APP_DB.Where("id = ?", *task.ProviderID).
+		First(&provider).Error
+
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// Provider不存在，取消任务
+			s.taskService.CancelTaskByAdmin(task.ID, "Provider not found")
+		} else {
+			global.APP_LOG.Error("Failed to fetch provider",
+				zap.Uint("provider_id", *task.ProviderID),
+				zap.Error(err))
+		}
+		return
+	}
+
+	// 检查Provider的实际状态，而不仅仅是allow_claim标志
+	// allow_claim可能因临时健康检查失败而被误设为false
+	// 但如果Provider实际上是active状态且未冻结，应该允许任务继续执行
+	// 删除、停止及管理员维护任务即使Provider不可用也要允许尝试连接和修复。
+	providerUnavailableAllowed := taskAllowedWhenProviderUnavailable(task.TaskType)
+	if provider.Status == "deleting" && !taskAllowedWhenProviderDeleting(task.TaskType) {
+		global.APP_LOG.Warn("Provider deletion is pending, cancelling non-delete task",
+			zap.Uint("provider_id", *task.ProviderID),
+			zap.String("provider_name", provider.Name),
+			zap.String("task_type", task.TaskType),
+			zap.Uint("task_id", task.ID))
+		s.taskService.CancelTaskByAdmin(task.ID, "Provider deletion is pending")
+		return
+	}
+	if provider.IsFrozen && !providerUnavailableAllowed {
+		global.APP_LOG.Warn("Provider is frozen, cancelling task",
+			zap.Uint("provider_id", *task.ProviderID),
+			zap.String("provider_name", provider.Name),
+			zap.String("task_type", task.TaskType),
+			zap.Uint("task_id", task.ID))
+		s.taskService.CancelTaskByAdmin(task.ID, "Provider is frozen")
+		return
+	}
+
+	// 允许受控维护任务在冻结节点上执行。
+	if provider.IsFrozen && providerUnavailableAllowed {
+		global.APP_LOG.Debug("Provider is frozen but allowing maintenance task to proceed",
+			zap.Uint("provider_id", *task.ProviderID),
+			zap.String("provider_name", provider.Name),
+			zap.String("task_type", task.TaskType),
+			zap.Uint("task_id", task.ID))
+	}
+
+	// 检查Provider是否过期
+	if provider.ExpiresAt != nil && provider.ExpiresAt.Before(time.Now()) {
+		// 受控维护任务在节点过期后仍允许执行。
+		if providerUnavailableAllowed {
+			global.APP_LOG.Debug("Provider has expired but allowing maintenance task to proceed",
+				zap.Uint("provider_id", *task.ProviderID),
+				zap.String("provider_name", provider.Name),
+				zap.String("task_type", task.TaskType),
+				zap.Uint("task_id", task.ID))
+		} else {
+			// 其他任务类型，取消执行
+			global.APP_LOG.Warn("Provider has expired, cancelling task",
+				zap.Uint("provider_id", *task.ProviderID),
+				zap.String("provider_name", provider.Name),
+				zap.String("task_type", task.TaskType),
+				zap.Uint("task_id", task.ID))
+			s.taskService.CancelTaskByAdmin(task.ID, "Provider has expired")
+			return
+		}
+	}
+
+	// 受控维护任务允许在inactive节点上尝试重新连接，其他任务仍需检查状态。
+	if provider.Status == "inactive" && !providerUnavailableAllowed {
+		global.APP_LOG.Warn("Provider is inactive, cancelling task",
+			zap.Uint("provider_id", *task.ProviderID),
+			zap.String("provider_name", provider.Name),
+			zap.String("ssh_status", provider.SSHStatus),
+			zap.String("api_status", provider.APIStatus),
+			zap.String("task_type", task.TaskType),
+			zap.Uint("task_id", task.ID))
+		s.taskService.CancelTaskByAdmin(task.ID, "Provider is inactive")
+		return
+	}
+
+	// GetProviderByID会为受控维护任务尝试重新连接。
+	if provider.Status == "inactive" && providerUnavailableAllowed {
+		global.APP_LOG.Debug("Provider is inactive but allowing maintenance task to proceed, will attempt reconnection",
+			zap.Uint("provider_id", *task.ProviderID),
+			zap.String("provider_name", provider.Name),
+			zap.String("task_type", task.TaskType),
+			zap.Uint("task_id", task.ID))
+	}
+
+	// 记录当前allow_claim状态，但不阻止任务执行
+	if !provider.AllowClaim {
+		global.APP_LOG.Debug("Provider allow_claim is false, but provider is active, allowing task to proceed",
+			zap.Uint("provider_id", *task.ProviderID),
+			zap.String("provider_name", provider.Name),
+			zap.String("status", provider.Status),
+			zap.Uint("task_id", task.ID))
+	}
+
+	// 尝试启动任务 - 让TaskService处理所有并发控制逻辑
+	err = s.taskService.StartTask(task.ID)
+	if err != nil {
+		// 如果启动失败，记录日志但不做其他处理
+		// TaskService会处理所有的错误情况
+		global.APP_LOG.Debug("Task start attempt failed (this is normal for concurrency control)",
+			zap.Uint("task_id", task.ID),
+			zap.Uint("provider_id", *task.ProviderID),
+			zap.String("reason", err.Error()))
+	} else {
+		global.APP_LOG.Debug("Task started successfully",
+			zap.Uint("task_id", task.ID),
+			zap.Uint("provider_id", *task.ProviderID))
+	}
+}
+
+func taskAllowedWhenProviderUnavailable(taskType string) bool {
+	switch taskType {
+	case "delete", "stop",
+		"provider-instance-sync", "provider-orphan-cleanup",
+		"provider-health-check", "provider-io-limit-sync", "provider-runtime-reload",
+		"provider-delete":
+		return true
+	default:
+		return false
+	}
+}
+
+func taskAllowedWhenProviderDeleting(taskType string) bool {
+	return taskType == "provider-delete"
+}
+
+// GetSchedulerStats 获取调度器统计信息
+func (s *SchedulerService) GetSchedulerStats() map[string]interface{} {
+	var stats map[string]interface{} = make(map[string]interface{})
+
+	// 统计各状态任务数量
+	var statusCounts []dashboardModel.TaskStatusCount
+
+	global.APP_DB.Model(&adminModel.Task{}).
+		Select("status, count(*) as count").
+		Group("status").
+		Find(&statusCounts)
+
+	taskStats := make(map[string]int64)
+	for _, sc := range statusCounts {
+		taskStats[sc.Status] = sc.Count
+	}
+
+	stats["task_counts"] = taskStats
+	stats["scheduler_running"] = s.IsRunning()
+	stats["last_update"] = time.Now()
+
+	return stats
+}
+
+// aggregateTrafficData 聚合流量数据到缓存表
+// 定期将 pmacct_traffic_records 原始数据聚合到 instance_traffic_histories 缓存表
+// 用于加速查询，避免每次都执行复杂的分段计算
+func (s *SchedulerService) aggregateTrafficData() {
+	// 检查数据库是否已初始化
+	if global.APP_DB == nil {
+		return
+	}
+
+	// 创建流量聚合服务
+	aggService := traffic.NewAggregationService()
+
+	// 聚合当月流量数据
+	err := aggService.AggregateCurrentMonth()
+	if err != nil {
+		global.APP_LOG.Error("流量聚合失败", zap.Error(err))
+		return
+	}
+
+	global.APP_LOG.Debug("流量聚合任务完成")
+}
+
+// checkExpiredResources 检查并冻结过期的资源（用户、节点、实例）
+func (s *SchedulerService) checkExpiredResources() {
+	// 检查数据库是否已初始化
+	if global.APP_DB == nil {
+		global.APP_LOG.Debug("数据库未初始化，跳过过期资源检查")
+		return
+	}
+
+	global.APP_LOG.Debug("开始检查过期资源")
+
+	// 创建过期冻结服务
+	expiryService := &ExpiryFreezeService{}
+
+	// 检查并冻结所有过期资源
+	if err := expiryService.CheckAndFreezeAll(); err != nil {
+		global.APP_LOG.Warn("检查过期资源失败", zap.Error(err))
+	} else {
+		global.APP_LOG.Debug("过期资源检查完成")
+	}
+}
+
+// checkAndEnforceTrafficLimits 执行三层级流量限制检查（Provider → User → Instance）
+// 使用 TryLock 防止并发执行，尶5层流量检查耐时超过 30 分钟时自动跳过
+func (s *SchedulerService) checkAndEnforceTrafficLimits() {
+	if global.APP_DB == nil {
+		return
+	}
+
+	// TryLock：如果上次检查尚未完成，跳过本次触发，避免两次检查并形模相互
+	if !s.trafficCheckMu.TryLock() {
+		global.APP_LOG.Debug("流量限制检查正在运行中，跳过本次触发")
+		return
+	}
+	defer s.trafficCheckMu.Unlock()
+
+	// 20 分钟超时：足够完成大规模检查，同时不会超过下次 ticker 30min 间隔
+	ctx, cancel := context.WithTimeout(s.ctx, 20*time.Minute)
+	defer cancel()
+
+	global.APP_LOG.Debug("开始自动流量限制检查")
+
+	threeTierService := traffic.NewThreeTierLimitService()
+	if err := threeTierService.CheckAllTrafficLimits(ctx); err != nil {
+		global.APP_LOG.Warn("自动流量限制检查失败", zap.Error(err))
+		return
+	}
+
+	global.APP_LOG.Debug("自动流量限制检查完成")
+}
+
+func (s *SchedulerService) dataCleanupInterval() time.Duration {
+	cfg := maintenance.NormalizeMaintenanceConfig(global.GetAppConfig().Maintenance)
+	return time.Duration(cfg.DataCleanupIntervalHours) * time.Hour
+}
+
+func (s *SchedulerService) scheduleInitialRetentionDataCleanup() {
+	timer := time.NewTimer(5 * time.Minute)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		s.cleanupRetentionData()
+	case <-s.ctx.Done():
+		return
+	}
+}
+
+func (s *SchedulerService) cleanupRetentionData() {
+	if global.APP_DB == nil {
+		return
+	}
+	cfg := maintenance.NormalizeMaintenanceConfig(global.GetAppConfig().Maintenance)
+	if !cfg.EnableDataCleanup {
+		return
+	}
+	if !s.dataCleanupMu.TryLock() {
+		global.APP_LOG.Debug("数据库保留策略清理正在运行中，跳过本次触发")
+		return
+	}
+	defer s.dataCleanupMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Minute)
+	defer cancel()
+
+	stats, err := maintenance.NewDataCleanupService().Run(ctx)
+	if err != nil {
+		global.APP_LOG.Warn("数据库保留策略清理失败", zap.Error(err))
+		return
+	}
+	if stats.AuditLogs > 0 ||
+		stats.InstanceTrafficHistories > 0 ||
+		stats.ProviderTrafficHistories > 0 ||
+		stats.UserTrafficHistories > 0 {
+		global.APP_LOG.Debug("数据库保留策略清理统计",
+			zap.Int64("auditLogs", stats.AuditLogs),
+			zap.Int64("instanceTrafficHistories", stats.InstanceTrafficHistories),
+			zap.Int64("providerTrafficHistories", stats.ProviderTrafficHistories),
+			zap.Int64("userTrafficHistories", stats.UserTrafficHistories))
+	}
+}
+
+// checkAgentVersions 检查所有agent模式节点的Agent版本是否与主控兼容
+// 仅在 Agent 版本明确低于最低兼容版本时发出警告，允许新版本和老版本（未上报版本号）正常工作。
+func (s *SchedulerService) checkAgentVersions() {
+	if global.APP_DB == nil {
+		return
+	}
+
+	minVersion := constant.CompatibleAgentVersion
+
+	// 查询所有 agent 模式的 provider
+	var providers []provider.Provider
+	if err := global.APP_DB.Where("connection_type = ? AND agent_status = ?", "agent", "online").
+		Select("id, name, agent_version").
+		Find(&providers).Error; err != nil {
+		global.APP_LOG.Warn("检查Agent版本时查询Provider失败", zap.Error(err))
+		return
+	}
+
+	for _, p := range providers {
+		if p.AgentVersion == "" {
+			// 旧版 agent 未上报版本号，视为兼容
+			continue
+		}
+		// 仅当 agent 版本明确低于最小兼容版本时才告警；
+		// 版本号格式不一致时跳过（如 date-based vs semver），避免误报。
+		cmp := compareVersions(p.AgentVersion, minVersion)
+		if cmp == -1 {
+			global.APP_LOG.Warn("Agent版本过低，与主控不兼容",
+				zap.Uint("providerID", p.ID),
+				zap.String("providerName", p.Name),
+				zap.String("agentVersion", p.AgentVersion),
+				zap.String("minCompatibleVersion", minVersion))
+		} else if cmp == -2 {
+			global.APP_LOG.Debug("Agent版本与主控版本格式不可比，跳过兼容性告警",
+				zap.Uint("providerID", p.ID),
+				zap.String("providerName", p.Name),
+				zap.String("agentVersion", p.AgentVersion),
+				zap.String("minCompatibleVersion", minVersion))
+		}
+	}
+}
+
+// compareVersions compares two version strings after normalising a leading "v".
+// Returns -1 if a < b, 0 if a == b, 1 if a > b, or -2 if the formats are
+// incomparable (e.g. semver vs date-based).
+// Supports both semver (X.Y.Z) and date-based (YYYYMMDD-HHMMSS) styles.
+func compareVersions(a, b string) int {
+	a = strings.TrimPrefix(a, "v")
+	b = strings.TrimPrefix(b, "v")
+
+	// If equal after normalisation, they are the same.
+	if a == b {
+		return 0
+	}
+
+	// Try semver-style comparison first: split by "." and compare numerically.
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+	if len(aParts) >= 2 && len(bParts) >= 2 {
+		maxLen := len(aParts)
+		if len(bParts) > maxLen {
+			maxLen = len(bParts)
+		}
+		for i := 0; i < maxLen; i++ {
+			var aNum, bNum int
+			if i < len(aParts) {
+				aNum, _ = strconv.Atoi(strings.Split(aParts[i], "-")[0])
+			}
+			if i < len(bParts) {
+				bNum, _ = strconv.Atoi(strings.Split(bParts[i], "-")[0])
+			}
+			if aNum < bNum {
+				return -1
+			}
+			if aNum > bNum {
+				return 1
+			}
+		}
+		return 0
+	}
+
+	// If one is semver and the other isn't, they are incomparable.
+	aIsSemver := len(aParts) >= 2
+	bIsSemver := len(bParts) >= 2
+	if aIsSemver != bIsSemver {
+		return -2 // incomparable
+	}
+
+	// Both are non-semver — try lexicographic (works for date-based).
+	if a < b {
+		return -1
+	}
+	return 1
+}

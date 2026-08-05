@@ -1,0 +1,568 @@
+.instance-detail {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.page-header {
+  margin-bottom: 24px;
+}
+
+.back-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-color-secondary);
+  font-size: 14px;
+}
+
+/* 概览卡片样式 */
+.instance-detail :deep(.overview-card) {
+  margin-bottom: 24px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.instance-detail :deep(.server-overview) {
+  display: flex;
+  gap: 40px;
+  align-items: flex-start;
+}
+
+.instance-detail :deep(.server-basic-info) {
+  flex: 1;
+}
+
+.instance-detail :deep(.server-header) {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 20px;
+}
+
+.instance-detail :deep(.server-name-section) {
+  flex: 1;
+}
+
+.instance-detail :deep(.server-name) {
+  margin: 0 0 8px 0;
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--text-color-primary);
+}
+
+.instance-detail :deep(.server-meta) {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.instance-detail :deep(.server-provider) {
+  color: var(--text-color-secondary);
+  font-size: 14px;
+}
+
+.instance-detail :deep(.server-status) {
+  flex-shrink: 0;
+}
+
+.instance-detail :deep(.control-actions) {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.instance-detail :deep(.server-hardware) {
+  flex-shrink: 0;
+  min-width: 250px;
+}
+
+.instance-detail :deep(.server-hardware h3) {
+  margin: 0 0 16px 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-color-primary);
+}
+
+.instance-detail :deep(.hardware-grid) {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.instance-detail :deep(.hardware-item) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--neutral-bg);
+  border-radius: 6px;
+}
+
+.instance-detail :deep(.hardware-item .label) {
+  color: var(--text-color-secondary);
+  font-size: 14px;
+}
+
+.instance-detail :deep(.hardware-item .value) {
+  color: var(--text-color-primary);
+  font-weight: 600;
+  font-size: 14px;
+}
+
+/* 标签页样式 */
+.tabs-card {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.tabs-card :deep(.el-tabs__header) {
+  margin: 0;
+}
+
+.tabs-card :deep(.el-tabs__content) {
+  padding: 24px;
+}
+
+/* 标签页切换 - 使用 GPU 加速 */
+.tabs-card :deep(.el-tab-pane) {
+  will-change: auto;
+  transform: translateZ(0);
+}
+
+/* 概览标签页内容（OverviewTab 为子组件，需使用 :deep） */
+.instance-detail :deep(.overview-content) {
+  display: grid;
+  gap: 32px;
+}
+
+.instance-detail :deep(.connection-section h3),
+.instance-detail :deep(.basic-info-section h3) {
+  margin: 0 0 20px 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-color-primary);
+}
+
+.instance-detail :deep(.connection-grid),
+.instance-detail :deep(.info-grid) {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.instance-detail :deep(.connection-item),
+.instance-detail :deep(.info-item) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px;
+  background: var(--neutral-bg);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+}
+
+.instance-detail :deep(.connection-item .label),
+.instance-detail :deep(.info-item .label) {
+  color: var(--text-color-secondary);
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.instance-detail :deep(.value-with-action) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.instance-detail :deep(.connection-item .value),
+.instance-detail :deep(.info-item .value) {
+  color: var(--text-color-primary);
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.instance-detail :deep(.ip-value) {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: help;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+/* 端口映射标签页（PortMappingsTab 为子组件，需使用 :deep） */
+.instance-detail :deep(.ports-content) {
+  min-height: 400px;
+}
+
+.instance-detail :deep(.ports-header) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding: 16px;
+  background: var(--neutral-bg);
+  border-radius: 8px;
+}
+
+.instance-detail :deep(.ports-summary) {
+  display: flex;
+  gap: 32px;
+}
+
+.instance-detail :deep(.summary-item) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.instance-detail :deep(.summary-item .label) {
+  font-size: 14px;
+  color: var(--text-color-secondary);
+  font-weight: 500;
+}
+
+.instance-detail :deep(.summary-item .value) {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-color-primary);
+}
+
+.instance-detail :deep(.ports-table) {
+  width: 100%;
+}
+
+.instance-detail :deep(.connection-commands) {
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+.instance-detail :deep(.command-text) {
+  font-size: 12px;
+  color: var(--text-color-primary);
+  background: #f3f4f6;
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin-right: 8px;
+  word-break: break-all;
+  max-width: 250px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: middle;
+  cursor: help;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+.instance-detail :deep(.ssh-command),
+.instance-detail :deep(.port-access) {
+  display: flex;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.instance-detail :deep(.no-ports) {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text-color-secondary);
+}
+
+/* 统计标签页（StatisticsTab 为子组件，需使用 :deep） */
+.instance-detail :deep(.stats-content) {
+  display: grid;
+  gap: 12px;
+}
+
+.instance-detail :deep(.section-header) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.instance-detail :deep(.section-header h3),
+.instance-detail :deep(.traffic-section h3) {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-color-primary);
+}
+
+.instance-detail :deep(.section-actions) {
+  display: flex;
+  gap: 8px;
+}
+
+.instance-detail :deep(.monitoring-grid) {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 20px;
+}
+
+.instance-detail :deep(.monitor-item) {
+  text-align: center;
+  padding: 20px;
+  background: var(--neutral-bg);
+  border-radius: 8px;
+}
+
+.instance-detail :deep(.monitor-label) {
+  color: var(--text-color-secondary);
+  font-size: 14px;
+  margin-bottom: 12px;
+  font-weight: 500;
+}
+
+.instance-detail :deep(.monitor-value) {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.instance-detail :deep(.traffic-usage) {
+  padding: 20px;
+  background: var(--neutral-bg);
+  border-radius: 8px;
+  margin-bottom: 0;
+}
+
+.instance-detail :deep(.usage-header) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.instance-detail :deep(.usage-label) {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-color-primary);
+}
+
+.instance-detail :deep(.usage-info) {
+  font-size: 14px;
+  color: var(--text-color-secondary);
+}
+
+.instance-detail :deep(.usage-details) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 12px;
+  font-size: 14px;
+}
+
+.instance-detail :deep(.limited-text) {
+  color: #f56c6c !important;
+  font-weight: 600;
+}
+
+.instance-detail :deep(.reset-info) {
+  color: var(--text-color-secondary);
+}
+
+.instance-detail :deep(.traffic-breakdown h4) {
+  margin: 0 0 16px 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-color-primary);
+}
+
+.instance-detail :deep(.history-list) {
+  display: grid;
+  gap: 8px;
+}
+
+.instance-detail :deep(.history-item) {
+  display: grid;
+  grid-template-columns: 100px 120px 1fr;
+  gap: 16px;
+  padding: 12px;
+  background: var(--neutral-bg);
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+.instance-detail :deep(.history-item .month) {
+  color: var(--text-color-secondary);
+  font-weight: 500;
+}
+
+.instance-detail :deep(.history-item .traffic) {
+  color: var(--text-color-primary);
+  font-weight: 600;
+}
+
+.instance-detail :deep(.history-item .breakdown) {
+  color: var(--text-color-secondary);
+}
+
+/* 响应式设计 */
+@media (max-width: 768px) {
+  .instance-detail {
+    padding: 16px;
+  }
+  
+  .instance-detail :deep(.server-overview) {
+    flex-direction: column;
+    gap: 24px;
+  }
+  
+  .instance-detail :deep(.server-header) {
+    flex-direction: column;
+    gap: 16px;
+    align-items: flex-start;
+  }
+  
+  .instance-detail :deep(.connection-grid),
+  .instance-detail :deep(.info-grid) {
+    grid-template-columns: 1fr;
+  }
+  
+  .instance-detail :deep(.ports-header) {
+    flex-direction: column;
+    gap: 16px;
+    align-items: flex-start;
+  }
+  
+  .instance-detail :deep(.ports-summary) {
+    flex-direction: column;
+    gap: 12px;
+  }
+  
+  .instance-detail :deep(.monitoring-grid) {
+    grid-template-columns: 1fr;
+  }
+  
+  .instance-detail :deep(.hardware-grid) {
+    grid-template-columns: 1fr;
+  }
+  
+  .instance-detail :deep(.history-item) {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  /* 移动端IP地址显示 */
+  .instance-detail :deep(.ip-value) {
+    max-width: 150px;
+  }
+  
+  .instance-detail :deep(.command-text) {
+    max-width: 200px;
+  }
+  
+  .instance-detail :deep(.connection-item) {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  
+  .instance-detail :deep(.value-with-action) {
+    width: 100%;
+    justify-content: space-between;
+  }
+}
+
+/* SSH终端对话框样式 */
+.ssh-terminal-dialog :deep(.el-dialog__header) {
+  padding: 0;
+  margin: 0;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.ssh-dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 20px;
+  background-color: var(--card-bg-solid);
+}
+
+.ssh-dialog-title {
+  color: #000000;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ssh-dialog-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.ssh-dialog-actions .el-button {
+  background-color: var(--card-bg-solid);
+  color: #000000;
+  border: 1px solid #d0d0d0;
+  font-weight: 500;
+}
+
+.ssh-dialog-actions .el-button:hover {
+  background-color: #f5f5f5;
+  border-color: #b0b0b0;
+}
+
+.ssh-dialog-content {
+  height: 600px;
+  background-color: #1e1e1e;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+/* 最小化SSH终端样式 - 右下角悬浮（使用Teleport到body） */
+.ssh-minimized-container {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 9999;
+  background-color: var(--card-bg-solid);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  cursor: pointer;
+  transition: all 0.3s ease;
+  border: 1px solid #e0e0e0;
+}
+
+.ssh-minimized-container:hover {
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+  transform: translateY(-2px);
+}
+
+.ssh-minimized-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  color: #000000;
+  font-size: 14px;
+  font-weight: 600;
+  min-width: 280px;
+  background-color: var(--card-bg-solid);
+  border-radius: 8px;
+}
+
+.ssh-minimized-header span {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 10px;
+}
+
+.ssh-minimized-header .close-btn {
+  color: #666666;
+  padding: 4px;
+}
+
+.ssh-minimized-header .close-btn:hover {
+  color: #000000;
+  background-color: #f0f0f0;
+}
+
+:deep(.el-dialog__body) {
+  padding: 0;
+}
+
+:deep(.el-dialog) {
+  border-radius: 8px;
+}

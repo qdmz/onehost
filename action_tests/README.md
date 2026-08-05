@@ -1,0 +1,449 @@
+# 集成测试框架
+
+本目录包含 OneClickVirt 平台的自动化集成测试框架，基于双节点架构，覆盖全部 API 接口的功能测试、权限测试、边界测试和安全测试。
+
+## 在线查看
+
+测试报告地址: [oneclickvirt.github.io/oneclickvirt](https://oneclickvirt.github.io/oneclickvirt/)
+
+报告支持中英双语切换、亮色/暗色主题切换，标题下方显示当前测试对应的主控版本、Agent 版本、Git ref/SHA、GitHub Actions run id 和 workflow 信息。
+
+## 架构设计
+
+测试采用双节点架构。单个虚拟化环境内的模块按顺序执行；选择 `all` 时默认最多并发运行 2 个相互隔离的环境，每个环境独占并清理自己的 Worker：
+
+| 节点 | 用途 | 说明 |
+|------|------|------|
+| Master 节点 | 运行 OneClickVirt 主控服务 | 在 CI Runner 本地从源码编译启动 |
+| Worker 节点 | 运行虚拟化环境 | 安装对应的虚拟化平台，作为被纳管节点 |
+
+Worker 节点通过云平台 API 自动创建和销毁，测试完成后自动清理资源。支持多云平台。
+
+## 目录结构
+
+```
+action_tests/
+  run_env_test.sh          # 主入口：环境集成测试编排器
+  run_module.sh            # 模块运行器：支持选择性运行
+  run_network_mode_test.sh # 网络模式专项测试入口
+  static_audit.py          # 静态路由/API 覆盖审计脚本
+  README.md                # 本文件
+  common/
+    test_framework.sh      # 测试框架核心（日志、断言、报告、状态管理、日志捕获）
+    platform_config.sh     # 多平台配置：启用开关、优先级、计费类型、认证方式
+    platform_interface.sh  # 平台调度层：自动降级、统一 SSH/创建/删除接口
+    aliceinit_api.sh       # AliceInit 云平台 API 封装（保留兼容）
+    node_manager.sh        # 节点生命周期管理（创建、部署、清理）
+    platforms/
+      alice_api.sh         # Alice/Ephemera 平台（SSH 密钥，按小时）
+      lightnode_api.sh     # LightNode 平台（SSH 密钥/密码，按小时，异步任务）
+      rackdog_api.sh       # RackDog 平台（SSH 密钥/密码，按小时）
+      vultr_api.sh         # Vultr 平台（SSH 密钥/密码，按小时）
+      hetzner_api.sh       # Hetzner Cloud 平台（SSH 密钥，按小时）
+      linode_api.sh        # Linode/Akamai 平台（SSH 密钥/密码，按小时）
+      cloudsigma_api.sh    # CloudSigma 平台（SSH 密钥/密码，按小时，非 root 用户）
+      skrime_api.sh        # Skrime 平台（仅密码，月付，优先重装系统）
+      prepaidhost_api.sh   # PrepaidHost 平台（仅密码，预付，优先重装系统）
+      cubepath_api.sh      # Cubepath 平台（SSH 密钥/密码，按小时）
+  modules/
+    01_init.sh             # 系统初始化与健康检查
+    02_auth.sh             # 认证系统（登录、注册、验证码、密码管理）
+    03_users.sh            # 用户管理（CRUD、批量操作、权限、登录身份切换）
+    04_invite_codes.sh     # 邀请码管理（生成、批量、导出、注册验证）
+    05_redemption.sh       # 兑换码管理（批量创建、兑换、状态验证）
+    06_announcements.sh    # 公告管理（CRUD、批量状态切换、类型筛选）
+    07_system_config.sh    # 系统配置（统一配置、等级限制、分组信息、反向测试）
+    08_system_images.sh    # 系统镜像管理（CRUD、批量删除、类型筛选）
+    09_providers.sh        # 节点管理（SSH 密码/密钥认证、创建、配置、健康检查、硬件报告、端口配置、IPv4 池、流量历史、反向测试）
+    10_instances.sh        # 实例生命周期（创建、单实例/批量操作、重建、密码重置、异步任务、转移、删除）
+    11_monitoring.sh       # 监控配置与代理部署（部署、卸载、同步、反向测试）
+    12_traffic.sh          # 流量管理（统计、限制、同步、清理、排行、反向测试）
+    13_port_mappings.sh    # 端口映射管理（CRUD、端口可用性检查、反向同步、数据库记录重建规则）
+    14_block_rules.sh      # 防火墙阻断规则（CRUD、应用、移除、IPv4/IPv6）
+    15_domains.sh          # 域名绑定管理（CRUD、多用户隔离）
+    16_freeze.sh           # 冻结管理（节点与实例的过期、手动冻结、级联冻结/解冻）
+    17_admin_isolation.sh  # 管理员隔离（普通管理员权限边界验证）
+    18_user_features.sh    # 用户侧功能（资料、仪表盘、实例列表、流量、密码重置）
+    19_speedtest.sh        # 速度测试与流量监控验证
+    20_oauth2.sh           # OAuth2 第三方登录管理（预设/自定义提供者、CRUD）
+    21_kyc.sh              # 实名认证（提交、审核、拒绝、支付宝接口、反向测试）
+    22_checkin.sh          # 签到系统（配置、签到码生成、签到、记录查询）
+    23_discovery.sh        # 实例发现与纳管（非纯净节点、孤儿实例检测、导入）
+    24_data_isolation.sh   # 多用户数据隔离验证
+    25_error_handling.sh   # 错误处理与边界测试（注入、越界、畸形请求、路径遍历）
+    26_instance_types.sh   # 实例类型测试（容器与虚拟机权限分离测试）
+    27_config_advanced.sh  # 高级配置与任务管理（导出、自动配置、硬件报告、版本信息）
+    28_instance_ssh_speedtest.sh # 实例 SSH 登录与测速验证
+    29_provider_images.sh  # Provider 镜像管理与清理验证
+    30_provider_agent_mode.sh # Agent 模式 Provider、反向控制与监控默认值验证
+  report/
+    generate_report.sh     # HTML 可视化报告生成器（中英双语、亮暗主题、历史对比）
+  reports/                 # 测试报告输出目录（运行时生成）
+```
+
+## 支持的虚拟化环境
+
+| 环境标识 | 平台 | 支持容器 | 支持虚拟机 | 自动纠正行为 |
+|---------|------|---------|-----------|------------|
+| `docker` | Docker | 是 | 否 | `both`/`vm` 自动纠正为 `container` |
+| `lxd` | LXD | 是 | 是 | 无需纠正 |
+| `incus` | Incus | 是 | 是 | 无需纠正 |
+| `podman` | Podman | 是 | 否 | `both`/`vm` 自动纠正为 `container` |
+| `containerd` | Containerd | 是 | 否 | `both`/`vm` 自动纠正为 `container` |
+| `proxmoxve` | Proxmox VE | 是 | 是 | 无需纠正 |
+| `kubevirt` | KubeVirt | 是 | 是 | 无需纠正 |
+| `qemu` | QEMU | 是 | 是 | 无需纠正 |
+
+实例类型自动纠正：测试框架会根据平台能力自动纠正 `instance_types` 参数。例如选择 `docker` 平台并指定 `both`，框架会自动纠正为 `container`。纠正逻辑同时在 GitHub Actions 工作流和测试脚本中双重验证。
+
+## 核心特性
+
+### 受控并发
+
+单个环境中的测试模块仍按编号顺序执行，避免状态互相污染。GitHub Actions 选择 `all` 时通过矩阵受控并发，默认并发度为 2；每个任务启用隔离实例模式，不会枚举后删除其他并发任务创建的节点。测试报告发布带并发重试，避免多个环境同时更新 `gh-pages` 时丢失结果。
+
+### 模块间状态管理
+
+每个测试模块执行前会保存系统基准状态（系统配置、实例列表、Provider ID、测试实例 ID），模块执行后自动恢复：
+- 删除测试过程中新增的实例
+- 重新登录所有测试用户，刷新 Token
+- 关键状态变量（`PROVIDER_ID`、`TEST_INSTANCE_ID`）在模块间正确传递
+- 防止上一模块的副作用影响下一模块
+
+所有 `run_module.sh`、`run_env_test.sh`、`run_network_mode_test.sh` 流程都会自动执行一组全局认证 guard：验证初始化后的公开配置 `captchaEnabled=false`、管理员配置中的 `captcha.enabled=false`、管理员登录默认无需图片验证码、忘记密码默认无需图片验证码。
+
+### 异步任务与基础设施失败识别
+
+实例创建任务会优先等待返回的 `task_id`/`taskId` 完成；启动、停止、重启、删除等实例操作 API 可能只返回“操作已提交”，此时测试框架会按实例 ID 轮询管理员任务列表，等待同一实例的活跃任务队列清空后再断言最终状态，避免操作刚提交就立刻触发下一步导致误判。
+
+LXD/Incus 等环境在 CI 中依赖远程镜像站、DNS 和 Worker 出网能力。测试框架会把 `Temporary failure resolving`、`curl: (6)`、`lookup images.lxd.canonical.com ... [::1]:53`、远程镜像下载失败、Worker SSH 不可达等明确的基础设施问题记录为 `SKIP`，并继续清理已创建的半成品实例；接口返回格式错误、权限错误、业务状态错误仍会记录为 `FAIL`。
+
+`26_instance_types.sh` 在创建 container/VM 类型实例前会等待同一 Provider 的活跃任务队列清空；创建任务默认最多等待 `INSTANCE_TYPE_TASK_MAX_WAIT=1800` 秒（不会低于 `INSTANCE_TASK_MAX_WAIT`）。如果任务在超时后仍处于 `pending`、`running`、`processing`、`queued` 或 `cancelling`，测试会先调用管理员取消接口并记录为可恢复的 `SKIP`，避免在创建任务仍运行时删除实例导致后续 `record not found`。
+
+`29_provider_images.sh` 将 `TEST_IMAGES` 视为操作系统家族过滤器。默认会为每个匹配的“操作系统家族 + 实例类型”只选择版本最高的稳定镜像，避免同一次环境测试把 Alpine/Debian 的全部历史版本逐一创建并耗尽 Action 时限。可通过 `PROVIDER_IMAGE_MAX_PER_FAMILY_TYPE` 调整每组样本数；设置为 `0` 时恢复完整镜像矩阵。该模块使用独立的 `PROVIDER_IMAGE_TASK_MAX_WAIT` 和 `PROVIDER_IMAGE_STATUS_MAX_WAIT`，不会继承面向安装/配置任务的超长通用等待预算。
+
+### 错误日志捕获
+
+当测试用例失败时，框架自动从 Master 节点的 OneClickVirt 服务容器中捕获时间相关的日志：
+- 使用 `--since` 参数按测试开始时间过滤日志
+- 日志记录在 JSON Lines 结果文件中，与失败用例关联
+- 支持在 HTML 报告中展开查看每个失败用例的服务端日志
+- 模块失败时自动保存完整模块日志到独立文件
+- HTML 报告头部保留 Git ref/SHA/run 元数据，便于将失败报告对应到具体提交和 CI 运行
+
+### EXIT Trap 兜底
+
+`run_env_test.sh` 注册了 EXIT trap，即使脚本异常退出也会：
+- 尝试生成 HTML 报告
+- 捕获 OneClickVirt 服务最后的日志
+- 保存崩溃诊断信息到 `reports/crash-*.log`
+
+## 使用方式
+
+### 通过 GitHub Actions 运行
+
+在仓库的 Actions 页面手动触发 `Integration Tests` 工作流，提供以下参数：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `environment` | 虚拟化环境类型（单选，每次一个平台） | `docker` |
+| `platform` | 云平台选择（`auto` = 按优先级自动降级） | `auto` |
+| `instance_types` | 测试的实例类型（会根据平台自动纠正） | `container` |
+| `modules` | 运行的模块（`all`/`01-10`/`01,03,05`） | `all` |
+| `node_hours` | 节点存续时间（小时） | `8` |
+| `skip_instance_delete` | 测试后保留实例不销毁（月付/预付平台建议开启） | `false` |
+| `max_parallel` | 选择 `all` 时的最大环境并发数 | `2` |
+
+### 本地运行
+
+从项目根目录执行：
+
+```bash
+export noninteractive=true
+
+# 使用 Alice 平台（默认）
+export PLATFORM_ALICE_ENABLED=true
+export ALICE_CLIENT_ID="your_client_id"
+export ALICE_CLIENT_SECRET="your_client_secret"
+export ALICE_PRIVATE_KEY="$(cat ~/.ssh/id_rsa)"
+bash action_tests/run_env_test.sh docker all container
+
+# 使用 LightNode 平台（Alice 失败时自动降级到 LightNode）
+export noninteractive=true
+export PLATFORM_ALICE_ENABLED=true
+export PLATFORM_LIGHTNODE_ENABLED=true
+export ALICE_CLIENT_ID="..."
+export LIGHTNODE_TOKEN="your_token"
+# LightNode 默认严格使用第 3 档 2C/4G；目标套餐不存在时直接失败，不会降级到低配。
+export LIGHTNODE_PACKAGE_TIER=3
+export LIGHTNODE_TARGET_CPU=2
+export LIGHTNODE_TARGET_MEMORY_MB=4096
+export LIGHTNODE_STRICT_RECOMMENDED_SPEC=true
+# 本地并发运行时，每个进程创建并只清理自己的 LightNode 实例。
+export ACTION_TEST_PARALLEL_LOCAL=true
+# 本地联调安装脚本改动时可覆盖远端 main 版本
+export INCUS_INSTALL_SCRIPT_LOCAL_PATH="/Volumes/Additional/个人数据/GitHub/incus/scripts/incus_install.sh"
+export PVE_INSTALL_SCRIPT_LOCAL_PATH="/Volumes/Additional/个人数据/GitHub/pve/scripts/install_pve.sh"
+export KUBEVIRT_INSTALL_SCRIPT_LOCAL_PATH="/Volumes/Additional/个人数据/GitHub/kubevirt/kubevirtinstall.sh"
+bash action_tests/run_env_test.sh docker all container
+
+# 强制只使用某个平台
+export noninteractive=true
+export PLATFORM_ALICE_ENABLED=false
+export PLATFORM_VULTR_ENABLED=true
+export VULTR_API_KEY="your_api_key"
+bash action_tests/run_env_test.sh docker all container
+
+# 月付平台：保留实例不销毁，下次重装系统
+export noninteractive=true
+export PLATFORM_ALICE_ENABLED=false
+export PLATFORM_SKRIME_ENABLED=true
+export SKRIME_API_KEY="your_api_key"
+export SKIP_INSTANCE_DELETE=true
+bash action_tests/run_env_test.sh docker all container
+
+# 仅运行部分模块（需要已启动的服务）
+export noninteractive=true
+export SERVER_URL="http://127.0.0.1:8888"
+export ADMIN_USER="admin"
+export ADMIN_PASS="Admin123!@#"
+bash action_tests/run_module.sh 01-05
+
+# 运行单个模块
+bash action_tests/run_module.sh 23
+
+# 运行指定模块组合
+bash action_tests/run_module.sh 01,03,09,23
+
+# 启用调试日志
+DEBUG=1 bash action_tests/run_env_test.sh docker all container
+
+# 显示成功接口响应（敏感字段会自动脱敏，默认不输出响应正文）
+ACTION_TEST_VERBOSE_RESPONSES=1 bash action_tests/run_module.sh 01-05
+
+# 运行静态审计（不访问真实服务，CI 使用 82% 路由覆盖门槛）
+python3 action_tests/static_audit.py --root . --output-dir action_tests/reports --strict --min-route-coverage 82
+```
+
+## 测试报告
+
+测试完成后生成以下报告：
+
+| 格式 | 文件 | 说明 |
+|------|------|------|
+| HTML | `reports/<env>-report.html` | 可视化报告，中英双语、亮暗主题、最近三次历史对比 |
+| Markdown | `reports/<env>-report.md` | 文本格式报告，包含每个测试用例的状态 |
+| JSON Lines | `reports/<env>-results.jsonl` | 机器可读的结构化测试结果 |
+| 日志 | `reports/full-output.log` | 完整控制台输出日志 |
+| 错误日志 | `reports/<env>-error-*.log` | 模块级的服务端错误日志 |
+| 静态审计 | `reports/static-audit.md` / `reports/static-audit.json` | API 路由覆盖、jq/pipe 风险、retry hygiene、workflow 配置审计 |
+
+### HTML 报告功能
+
+- 中英双语：支持中文和英文界面切换（快捷键 `L`）
+- 版本信息：标题下方显示当前测试对应的主控版本和 Agent 版本
+- CI 元数据：显示 Git ref/SHA、workflow、run id 和重试次数
+- 搜索：支持全文搜索测试名称、URL、详情（快捷键 `/`）
+- 状态筛选：按通过/失败/跳过筛选（快捷键 `1`-`4`）
+- 模块分组：按模块分组显示，失败模块自动展开
+- 错误日志：失败用例支持展开查看关联的服务端日志
+- 一键复制：复制测试摘要到剪贴板
+- 亮暗主题：支持亮色和暗色主题切换（快捷键 `T`），根据系统偏好自动选择
+- 历史对比：保留最近三次测试结果，支持通过率对比
+
+HTML 报告会通过 GitHub Actions 自动推送到 `gh-pages` 分支，可通过 GitHub Pages 在线查看。
+
+GitHub Actions 工作流设置了 `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`，用于提前切换 JavaScript actions 到 Node 24 运行时并避免 Node 20 弃用告警。
+
+## 测试覆盖范围
+
+### 功能测试（正向）
+
+- 全部 200+ API 接口的正向功能测试
+- 异步任务（实例创建、配置下发、实例操作提交后的活跃任务队列）的等待与状态验证
+- 容器和虚拟机实例的完整生命周期操作
+- 管理员批量实例操作 API 的参数校验和用户侧批量操作隔离校验
+- SSH 密码认证和密钥认证两种方式的节点录入
+
+### 反向测试（负向）
+
+- 缺失必填字段的请求（返回 400）
+- 不存在的资源操作（返回 404）
+- 无权限访问（返回 401/403）
+- 无效参数（端口越界、非法 URL、空数组等）
+- 硬件报告 URL 域名白名单验证
+
+### 权限测试
+
+- 三级权限隔离：超级管理员、普通管理员、普通用户
+- 普通管理员不可访问超级管理员专属接口（返回 403）
+- 普通用户不可访问管理员接口（返回 401/403）
+- 多用户间的数据隔离验证
+
+### 非纯净节点纳管测试
+
+测试对已有容器或实例的节点进行发现和纳管：
+
+1. 在 Worker 节点上预先创建容器或实例
+2. 通过 OneClickVirt 主控进行实例发现（discover）
+3. 导入（import）发现的实例
+4. 验证导入后实例的可管理性
+
+### 错误处理与安全测试
+
+- SQL 注入尝试
+- XSS 注入尝试
+- 超长字段提交
+- 畸形 JSON 请求
+- 负数和零值 ID
+- 非数字 ID
+- 分页边界值
+- Content-Type 校验
+- 路径遍历检测
+
+## 环境要求
+
+运行测试需要以下条件：
+
+- 至少一个已启用云平台的 API 凭证（见下方密钥配置）
+- `curl`、`jq`、`sshpass` 命令行工具
+- 网络能够访问对应云平台 API 和测试节点
+
+GitHub Actions 会自动安装所需依赖。
+
+## 配置说明
+
+### 密钥配置
+
+在仓库 Settings > Secrets and variables > Actions 中配置。各平台默认不启用，配置对应密钥后通过工作流参数 `platform` 或环境变量启用。
+
+> **关于 `SKIP_INSTANCE_DELETE`**：启用后，无论平台计费类型如何，实例**永远不会被删除**。下次运行时若需要干净环境，框架会对已有实例执行重装系统（OS Reinstall）操作，而非新建实例。月付/预付平台（Skrime、PrepaidHost）默认也是此行为。
+
+**通用**
+
+| 密钥名称 | 值格式 | 必需 |
+|---------|--------|------|
+| `TEST_ADMIN_PASS` | 任意字符串密码，默认 `Admin123!@#` | 否 |
+
+**Alice/Ephemera**（默认平台）
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `ALICE_CLIENT_ID` | AliceInit 控制台获取的 Client ID 字符串 |
+| `ALICE_CLIENT_SECRET` | AliceInit 控制台获取的 Client Secret 字符串 |
+| `ALICE_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾 |
+| `ALICE_PUBLIC_KEY` | SSH 公钥完整内容，格式 `ssh-rsa AAAA... comment`（用于匹配账户密钥 ID） |
+
+**LightNode**（Alice 自动降级首选）
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `LIGHTNODE_TOKEN` | LightNode OpenAPI 控制台生成的 Token 字符串 |
+| `LIGHTNODE_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾 |
+| `LIGHTNODE_SSH_KEY_UUID` | LightNode 账户中已上传 SSH 公钥的 UUID（在 LightNode 控制台 SSH Keys 页面查看） |
+| `LIGHTNODE_PACKAGE_TIER` | 默认 `3`，自动选套餐时优先使用第 3 档 |
+| `LIGHTNODE_TARGET_CPU` | 默认 `2`，优先匹配 2 核套餐 |
+| `LIGHTNODE_TARGET_MEMORY_MB` | 默认 `4096`，优先匹配 4G 内存套餐 |
+| `LIGHTNODE_PACKAGE_CODE` | 可选，指定后直接使用该 LightNode 套餐 code |
+| `PVE_USE_PRIVATE_IP` | PVE 安装脚本参数；LightNode + ProxmoxVE 测试默认 `false`，避免双网卡宿主重启后写入私网地址和公网网关的组合 |
+| `PVE_MAIN_INTERFACE` | PVE 安装脚本参数；LightNode + ProxmoxVE 测试默认 `eth1`，对应 LightNode 公网默认路由网口 |
+| `PVE_NAT_SUBNET` | 可选的 ProxmoxVE NAT `/24` 网段（必须以 `.0/24` 结尾）；未设置时安装脚本会避开宿主机现有路由自动选择，并将结果持久化供 Provider 与 PVE 创建脚本复用 |
+| `PVE_INSTALL_SCRIPT_LOCAL_PATH` | 可选，本地 ProxmoxVE installer 调试路径；未设置时自动探测同级 `pve` 仓库 |
+| `INCUS_INSTALL_SCRIPT_LOCAL_PATH` | 可选，本地 Incus installer 调试路径；未设置时自动探测同级 `incus` 仓库 |
+| `KUBEVIRT_INSTALL_SCRIPT_LOCAL_PATH` | 可选，本地 KubeVirt installer 调试路径；未设置时自动探测同级 `kubevirt` 仓库 |
+
+**Action 实例规格**
+
+| 变量 | 默认值 |
+|------|--------|
+| `ACTION_TEST_CONTAINER_CPU` | `2` |
+| `ACTION_TEST_CONTAINER_MEMORY` | `2048` |
+| `ACTION_TEST_CONTAINER_DISK` | `20` |
+| `ACTION_TEST_VM_CPU` | `2` |
+| `ACTION_TEST_VM_MEMORY` | `4096` |
+| `ACTION_TEST_VM_DISK` | `20` |
+| `ACTION_TEST_KUBEVIRT_VM_CPU` | `1`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_CPU`） |
+| `ACTION_TEST_KUBEVIRT_VM_MEMORY` | `512`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_MEMORY`；2C/4G LightNode Worker 上更容易调度） |
+| `ACTION_TEST_KUBEVIRT_VM_DISK` | `8`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_LXD_VM_CPU` | `1`（仅 LXD，覆盖 `ACTION_TEST_VM_CPU`） |
+| `ACTION_TEST_LXD_VM_MEMORY` | `1024`（仅 LXD，覆盖 `ACTION_TEST_VM_MEMORY`） |
+| `ACTION_TEST_LXD_VM_DISK` | `20`（仅 LXD，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_INCUS_VM_CPU` | `1`（仅 Incus，覆盖 `ACTION_TEST_VM_CPU`） |
+| `ACTION_TEST_INCUS_VM_MEMORY` | `1024`（仅 Incus，覆盖 `ACTION_TEST_VM_MEMORY`） |
+| `ACTION_TEST_INCUS_VM_DISK` | `20`（仅 Incus，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_PROXMOXVE_VM_CPU` | `1`（仅 ProxmoxVE，覆盖 `ACTION_TEST_VM_CPU`） |
+| `ACTION_TEST_PROXMOXVE_VM_MEMORY` | `1024`（仅 ProxmoxVE，覆盖 `ACTION_TEST_VM_MEMORY`） |
+| `ACTION_TEST_PROXMOXVE_VM_DISK` | `8`（仅 ProxmoxVE，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_QEMU_VM_CPU` | `1`（仅 QEMU，覆盖 `ACTION_TEST_VM_CPU`） |
+| `ACTION_TEST_QEMU_VM_MEMORY` | `1024`（仅 QEMU，覆盖 `ACTION_TEST_VM_MEMORY`） |
+| `ACTION_TEST_QEMU_VM_DISK` | `8`（仅 QEMU，覆盖 `ACTION_TEST_VM_DISK`） |
+
+**Vultr**
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `VULTR_API_KEY` | Vultr 控制台 Account > API 生成的 API Key |
+| `VULTR_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾 |
+| `VULTR_SSH_KEY_ID` | Vultr 账户中已上传 SSH 公钥的 ID（可选，不填则用密码认证） |
+
+**Hetzner Cloud**
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `HETZNER_API_TOKEN` | Hetzner Cloud 项目 Security > API Tokens 生成的 Token |
+| `HETZNER_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾 |
+| `HETZNER_SSH_PUBLIC_KEY` | SSH 公钥完整内容，格式 `ssh-rsa AAAA... comment`（脚本自动上传到 Hetzner） |
+
+**Linode / Akamai**
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `LINODE_TOKEN` | Linode 控制台 Profile > API Tokens 生成的 Personal Access Token |
+| `LINODE_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾 |
+| `LINODE_SSH_PUBLIC_KEY` | SSH 公钥完整内容，格式 `ssh-rsa AAAA... comment`（随实例一起注入） |
+
+**RackDog**
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `RACKDOG_API_KEY` | RackDog 控制台获取的 API Key |
+| `RACKDOG_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾 |
+| `RACKDOG_SSH_PUBLIC_KEY` | SSH 公钥完整内容，格式 `ssh-rsa AAAA... comment`（创建实例时注入） |
+
+**Skrime**（月付，默认不销毁实例，重装系统复用）
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `SKRIME_API_KEY` | Skrime 控制台获取的 API Key |
+| `SKRIME_ROOT_PASSWORD` | 期望设置的 root 密码（重装系统时使用，建议固定值方便复用） |
+
+**PrepaidHost**（预付，默认不销毁实例，重装系统复用）
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `PREPAIDHOST_API_KEY` | PrepaidHost 控制台获取的 API Key |
+| `PREPAIDHOST_ROOT_PASSWORD` | 期望设置的 root 密码（重装系统时使用，建议固定值方便复用） |
+
+**Cubepath**
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `CUBEPATH_API_KEY` | Cubepath 控制台获取的 API Key |
+| `CUBEPATH_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾（可选） |
+| `CUBEPATH_SSH_PUBLIC_KEY` | SSH 公钥完整内容，格式 `ssh-rsa AAAA... comment`（可选，不填则用密码认证） |
+
+**CloudSigma**
+
+| 密钥名称 | 值格式 |
+|---------|--------|
+| `CLOUDSIGMA_EMAIL` | CloudSigma 账户邮箱地址 |
+| `CLOUDSIGMA_PASSWORD` | CloudSigma 账户密码 |
+| `CLOUDSIGMA_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾（可选） |
+
+### 报告发布
+
+HTML 报告通过 GitHub Actions 自动推送到本仓库的 `gh-pages` 分支：
+
+1. 在仓库 Settings > Pages 中启用 GitHub Pages，源选择 `gh-pages` 分支
+2. 默认使用 `GITHUB_TOKEN` 推送，无需额外配置
+3. 报告按平台和时间戳组织：`reports/<env>/<timestamp>/`

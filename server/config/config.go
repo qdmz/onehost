@@ -1,0 +1,178 @@
+package config
+
+type Server struct {
+	JWT         JWT         `mapstructure:"jwt" json:"jwt" yaml:"jwt"`
+	Zap         Zap         `mapstructure:"zap" json:"zap" yaml:"zap"`
+	System      System      `mapstructure:"system" json:"system" yaml:"system"`
+	Mysql       Mysql       `mapstructure:"mysql" json:"mysql" yaml:"mysql"`
+	Auth        Auth        `mapstructure:"auth" json:"auth" yaml:"auth"`
+	Quota       Quota       `mapstructure:"quota" json:"quota" yaml:"quota"`
+	InviteCode  InviteCode  `mapstructure:"invite-code" json:"invite-code" yaml:"invite-code"`
+	Captcha     Captcha     `mapstructure:"captcha" json:"captcha" yaml:"captcha"`
+	Cors        CORS        `mapstructure:"cors" json:"cors" yaml:"cors"`
+	Redis       Redis       `mapstructure:"redis" json:"redis" yaml:"redis"`
+	CDN         CDN         `mapstructure:"cdn" json:"cdn" yaml:"cdn"`
+	Task        Task        `mapstructure:"task" json:"task" yaml:"task"`
+	Upload      Upload      `mapstructure:"upload" json:"upload" yaml:"upload"`
+	Other       Other       `mapstructure:"other" json:"other" yaml:"other"`
+	KYC         KYC         `mapstructure:"kyc" json:"kyc" yaml:"kyc"`
+	Maintenance Maintenance `mapstructure:"maintenance" json:"maintenance" yaml:"maintenance"`
+}
+
+type Maintenance struct {
+	EnableDataCleanup           bool `mapstructure:"enable-data-cleanup" json:"enable-data-cleanup" yaml:"enable-data-cleanup"`
+	DataCleanupIntervalHours    int  `mapstructure:"data-cleanup-interval-hours" json:"data-cleanup-interval-hours" yaml:"data-cleanup-interval-hours"`
+	AuditLogRetentionDays       int  `mapstructure:"audit-log-retention-days" json:"audit-log-retention-days" yaml:"audit-log-retention-days"`
+	TrafficHistoryRetentionDays int  `mapstructure:"traffic-history-retention-days" json:"traffic-history-retention-days" yaml:"traffic-history-retention-days"`
+	CleanupBatchSize            int  `mapstructure:"cleanup-batch-size" json:"cleanup-batch-size" yaml:"cleanup-batch-size"`
+	OptimizeAfterCleanup        bool `mapstructure:"optimize-after-cleanup" json:"optimize-after-cleanup" yaml:"optimize-after-cleanup"`
+}
+
+type Other struct {
+	DefaultLanguage string `mapstructure:"default-language" json:"default-language" yaml:"default-language"` // 默认语言
+	LogoURL         string `mapstructure:"logo-url" json:"logo-url" yaml:"logo-url"`                         // 自定义 Logo 图片 URL
+	SiteName        string `mapstructure:"site-name" json:"site-name" yaml:"site-name"`                      // 自定义网站名称
+}
+
+type CORS struct {
+	Mode      string   `mapstructure:"mode" json:"mode" yaml:"mode"`
+	Whitelist []string `mapstructure:"whitelist" json:"whitelist" yaml:"whitelist"`
+}
+
+type Auth struct {
+	EnableEmail              bool   `mapstructure:"enable-email" json:"enable-email" yaml:"enable-email"`
+	EnableTelegram           bool   `mapstructure:"enable-telegram" json:"enable-telegram" yaml:"enable-telegram"`
+	EnableQQ                 bool   `mapstructure:"enable-qq" json:"enable-qq" yaml:"enable-qq"`
+	EnableOAuth2             bool   `mapstructure:"enable-oauth2" json:"enable-oauth2" yaml:"enable-oauth2"`                                        // 是否启用OAuth2登录（全局开关）
+	EnablePublicRegistration bool   `mapstructure:"enable-public-registration" json:"enable-public-registration" yaml:"enable-public-registration"` // 是否启用公开注册（无需邀请码）
+	EnableKYC                bool   `mapstructure:"enable-kyc" json:"enable-kyc" yaml:"enable-kyc"`                                                 // 是否启用KYC实名认证功能（全局开关）
+	EnableDomain             bool   `mapstructure:"enable-domain" json:"enable-domain" yaml:"enable-domain"`                                        // 是否启用域名绑定功能（全局开关）
+	EnableCheckin            bool   `mapstructure:"enable-checkin" json:"enable-checkin" yaml:"enable-checkin"`                                     // 是否启用签到续期功能（全局开关）
+	EmailSMTPHost            string `mapstructure:"email-smtp-host" json:"email-smtp-host" yaml:"email-smtp-host"`
+	EmailSMTPPort            int    `mapstructure:"email-smtp-port" json:"email-smtp-port" yaml:"email-smtp-port"`
+	EmailUsername            string `mapstructure:"email-username" json:"email-username" yaml:"email-username"`
+	EmailPassword            string `mapstructure:"email-password" json:"email-password" yaml:"email-password"`
+	TelegramBotToken         string `mapstructure:"telegram-bot-token" json:"telegram-bot-token" yaml:"telegram-bot-token"`
+	QQAppID                  string `mapstructure:"qq-app-id" json:"qq-app-id" yaml:"qq-app-id"`
+	QQAppKey                 string `mapstructure:"qq-app-key" json:"qq-app-key" yaml:"qq-app-key"`
+}
+
+type Quota struct {
+	DefaultLevel            int                     `mapstructure:"default-level" json:"default-level" yaml:"default-level"`
+	LevelLimits             map[int]LevelLimitInfo  `mapstructure:"level-limits" json:"level-limits" yaml:"level-limits"`
+	InstanceTypePermissions InstanceTypePermissions `mapstructure:"instance-type-permissions" json:"instance-type-permissions" yaml:"instance-type-permissions"`
+}
+
+type InstanceTypePermissions struct {
+	MinLevelForContainer       int `mapstructure:"min-level-for-container" json:"min-level-for-container" yaml:"min-level-for-container"`
+	MinLevelForVM              int `mapstructure:"min-level-for-vm" json:"min-level-for-vm" yaml:"min-level-for-vm"`
+	MinLevelForDeleteContainer int `mapstructure:"min-level-for-delete-container" json:"min-level-for-delete-container" yaml:"min-level-for-delete-container"`
+	MinLevelForDeleteVM        int `mapstructure:"min-level-for-delete-vm" json:"min-level-for-delete-vm" yaml:"min-level-for-delete-vm"`
+	MinLevelForResetContainer  int `mapstructure:"min-level-for-reset-container" json:"min-level-for-reset-container" yaml:"min-level-for-reset-container"`
+	MinLevelForResetVM         int `mapstructure:"min-level-for-reset-vm" json:"min-level-for-reset-vm" yaml:"min-level-for-reset-vm"`
+}
+
+type LevelLimitInfo struct {
+	MaxInstances int                    `mapstructure:"max-instances" json:"max-instances" yaml:"max-instances"`
+	MaxResources map[string]interface{} `mapstructure:"max-resources" json:"max-resources" yaml:"max-resources"`
+	MaxTraffic   int64                  `mapstructure:"max-traffic" json:"max-traffic" yaml:"max-traffic"`       // 最大流量限制（MB）
+	ExpiryDays   int                    `mapstructure:"expiry-days" json:"expiry-days" yaml:"expiry-days"`       // 新注册用户的默认过期天数，0表示不过期
+	MaxSnapshots int                    `mapstructure:"max-snapshots" json:"max-snapshots" yaml:"max-snapshots"` // 每个实例允许保留的最大快照数，0表示不允许
+}
+
+type System struct {
+	Env                     string `mapstructure:"env" json:"env" yaml:"env"`                                                                      // 环境值
+	Addr                    int    `mapstructure:"addr" json:"addr" yaml:"addr"`                                                                   // 端口值
+	DbType                  string `mapstructure:"db-type" json:"db-type" yaml:"db-type"`                                                          // 数据库类型:mysql(默认)|mariadb
+	OssType                 string `mapstructure:"oss-type" json:"oss-type" yaml:"oss-type"`                                                       // Oss类型
+	UseMultipoint           bool   `mapstructure:"use-multipoint" json:"use-multipoint" yaml:"use-multipoint"`                                     // 多点登录拦截
+	UseRedis                bool   `mapstructure:"use-redis" json:"use-redis" yaml:"use-redis"`                                                    // 使用redis
+	LimitCountIP            int    `mapstructure:"iplimit-count" json:"iplimit-count" yaml:"iplimit-count"`                                        // IP限流计数
+	LimitTimeIP             int    `mapstructure:"iplimit-time" json:"iplimit-time" yaml:"iplimit-time"`                                           // IP限流时间
+	FrontendURL             string `mapstructure:"frontend-url" json:"frontend-url" yaml:"frontend-url"`                                           // 前端URL，用于OAuth2回调跳转
+	ProviderInactiveHours   int    `mapstructure:"provider-inactive-hours" json:"provider-inactive-hours" yaml:"provider-inactive-hours"`          // Provider不活动阈值（小时），默认72小时
+	OAuth2StateTokenMinutes int    `mapstructure:"oauth2-state-token-minutes" json:"oauth2-state-token-minutes" yaml:"oauth2-state-token-minutes"` // OAuth2 State令牌有效期（分钟），默认15分钟
+
+	// 实例同步配置
+	EnableInstanceSync    bool `mapstructure:"enable-instance-sync" json:"enable-instance-sync" yaml:"enable-instance-sync"`          // 是否启用实例同步检查，默认false
+	InstanceSyncInterval  int  `mapstructure:"instance-sync-interval" json:"instance-sync-interval" yaml:"instance-sync-interval"`    // 实例同步检查间隔（分钟），默认30分钟
+	ImportedInstanceOwner uint `mapstructure:"imported-instance-owner" json:"imported-instance-owner" yaml:"imported-instance-owner"` // 导入实例的默认所有者用户ID，默认1（管理员）
+}
+
+type JWT struct {
+	SigningKey  string `mapstructure:"signing-key" json:"signing-key" yaml:"signing-key"`    // jwt签名
+	ExpiresTime string `mapstructure:"expires-time" json:"expires-time" yaml:"expires-time"` // 过期时间
+	BufferTime  string `mapstructure:"buffer-time" json:"buffer-time" yaml:"buffer-time"`    // 缓冲时间
+	Issuer      string `mapstructure:"issuer" json:"issuer" yaml:"issuer"`                   // 签发者
+}
+
+// Database 数据库配置，支持MySQL和MariaDB
+type Mysql struct {
+	Path         string `mapstructure:"path" json:"path" yaml:"path"`                               // 服务器地址:端口
+	Port         string `mapstructure:"port" json:"port" yaml:"port"`                               //:端口
+	Config       string `mapstructure:"config" json:"config" yaml:"config"`                         // 高级配置
+	Dbname       string `mapstructure:"db-name" json:"db-name" yaml:"db-name"`                      // 数据库名
+	Username     string `mapstructure:"username" json:"username" yaml:"username"`                   // 数据库用户名
+	Password     string `mapstructure:"password" json:"password" yaml:"password"`                   // 数据库密码
+	Prefix       string `mapstructure:"prefix" json:"prefix" yaml:"prefix"`                         //全局表前缀，单独定义TableName则不生效
+	Singular     bool   `mapstructure:"singular" json:"singular" yaml:"singular"`                   //是否开启全局禁用复数，true表示开启
+	Engine       string `mapstructure:"engine" json:"engine" yaml:"engine" default:"InnoDB"`        //数据库引擎，默认InnoDB
+	MaxIdleConns int    `mapstructure:"max-idle-conns" json:"max-idle-conns" yaml:"max-idle-conns"` // 空闲中的最大连接数
+	MaxOpenConns int    `mapstructure:"max-open-conns" json:"max-open-conns" yaml:"max-open-conns"` // 打开到数据库的最大连接数
+	LogMode      string `mapstructure:"log-mode" json:"log-mode" yaml:"log-mode"`                   // 是否开启Gorm全局日志
+	LogZap       bool   `mapstructure:"log-zap" json:"log-zap" yaml:"log-zap"`                      // 是否通过zap写入日志文件
+	MaxLifetime  int    `mapstructure:"max-lifetime" json:"max-lifetime" yaml:"max-lifetime"`       // 连接最大生存时间（秒）
+	AutoCreate   bool   `mapstructure:"auto-create" json:"auto-create" yaml:"auto-create"`          // 是否自动创建数据库
+}
+
+type InviteCode struct {
+	Enabled  bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`    // 是否启用邀请码
+	Required bool `mapstructure:"required" json:"required" yaml:"required"` // 是否必须邀请码
+}
+
+type Captcha struct {
+	Enabled    bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`             // 是否启用验证码
+	Width      int  `mapstructure:"width" json:"width" yaml:"width"`                   // 验证码宽度
+	Height     int  `mapstructure:"height" json:"height" yaml:"height"`                // 验证码高度
+	Length     int  `mapstructure:"length" json:"length" yaml:"length"`                // 验证码长度
+	ExpireTime int  `mapstructure:"expire-time" json:"expire-time" yaml:"expire-time"` // 过期时间(分钟)
+}
+
+// Redis 配置
+type Redis struct {
+	Addr     string `mapstructure:"addr" json:"addr" yaml:"addr"`             // Redis服务器地址
+	Password string `mapstructure:"password" json:"password" yaml:"password"` // Redis密码
+	DB       int    `mapstructure:"db" json:"db" yaml:"db"`                   // Redis数据库
+}
+
+// CDN 配置
+type CDN struct {
+	Endpoints    []string `mapstructure:"endpoints" json:"endpoints" yaml:"endpoints"`             // CDN端点列表
+	BaseEndpoint string   `mapstructure:"base-endpoint" json:"base-endpoint" yaml:"base-endpoint"` // 基础CDN端点
+}
+
+// Task 任务配置
+type Task struct {
+	DeleteRetryCount int `mapstructure:"delete-retry-count" json:"delete-retry-count" yaml:"delete-retry-count"` // 删除实例重试次数，默认3
+	DeleteRetryDelay int `mapstructure:"delete-retry-delay" json:"delete-retry-delay" yaml:"delete-retry-delay"` // 删除实例重试延迟（秒），默认2
+}
+
+// Upload 上传配置
+type Upload struct {
+	// 头像上传功能已移除
+}
+
+// KYC 实名认证配置
+type KYC struct {
+	EnableRealName   bool   `mapstructure:"enable-real-name" json:"enable-real-name" yaml:"enable-real-name"`       // 是否启用实名认证功能
+	RequireRealName  bool   `mapstructure:"require-real-name" json:"require-real-name" yaml:"require-real-name"`    // 是否强制实名后才可操作(默认false)
+	AlipayAppID      string `mapstructure:"alipay-app-id" json:"alipay-app-id" yaml:"alipay-app-id"`                // 支付宝应用ID
+	AlipayPrivateKey string `mapstructure:"alipay-private-key" json:"alipay-private-key" yaml:"alipay-private-key"` // 支付宝应用私钥
+	AlipayPublicKey  string `mapstructure:"alipay-public-key" json:"alipay-public-key" yaml:"alipay-public-key"`    // 支付宝公钥
+	// 认证方式: manual(手动审核), alipay(支付宝人脸), both(两者都启用)
+	Method string `mapstructure:"method" json:"method" yaml:"method"`
+	// 细粒度限制: 未实名用户禁止的操作
+	RestrictCreateInstance bool `mapstructure:"restrict-create-instance" json:"restrict-create-instance" yaml:"restrict-create-instance"` // 禁止创建实例
+	RestrictRedeemCode     bool `mapstructure:"restrict-redeem-code" json:"restrict-redeem-code" yaml:"restrict-redeem-code"`             // 禁止兑换码
+	RestrictDomainBind     bool `mapstructure:"restrict-domain-bind" json:"restrict-domain-bind" yaml:"restrict-domain-bind"`             // 禁止域名绑定
+}

@@ -1,0 +1,73 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: deploy/nginx.dockerfile
+    container_name: web
+    ports:
+      - "8888:80"
+    networks:
+      - default
+    depends_on:
+      - api
+    logging: *default-logging
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/server.dockerfile
+    container_name: api
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: oneclickvirt
+      DB_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env before running docker compose}
+      DB_NAME: oneclickvirt
+      DB_TYPE: mariadb
+    volumes:
+      - ./data/app/:/app/storage
+      - ./server/config.yaml:/app/config.yaml:rw
+    networks:
+      - default
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: on-failure
+    logging: *default-logging
+
+  mysql:
+    image: mariadb:10.11
+    container_name: mysql
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env before running docker compose}
+      MYSQL_DATABASE: oneclickvirt
+      MYSQL_USER: oneclickvirt
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env before running docker compose}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./deploy/my.cnf:/etc/mysql/conf.d/custom.cnf
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    logging: *default-logging
+
+volumes:
+  mysql_data:
+
+networks:
+  default:
+    driver: bridge

@@ -1,0 +1,491 @@
+package traffic
+
+import (
+	"fmt"
+	"strconv"
+	"time"
+
+	"oneclickvirt/global"
+	"oneclickvirt/middleware"
+	"oneclickvirt/model/common"
+	providerModel "oneclickvirt/model/provider"
+	"oneclickvirt/service/traffic"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+)
+
+// AdminTrafficAPI 管理员流量API
+type AdminTrafficAPI struct{}
+
+// checkProviderOwnership 检查普通管理员是否拥有指定Provider
+func (api *AdminTrafficAPI) checkProviderOwnership(c *gin.Context, providerID uint) bool {
+	ownerAdminID := middleware.GetOwnerAdminID(c)
+	if ownerAdminID == 0 {
+		return true // 超级管理员
+	}
+	var count int64
+	global.APP_DB.Model(&providerModel.Provider{}).
+		Where("id = ? AND owner_admin_id = ?", providerID, ownerAdminID).
+		Count(&count)
+	return count > 0
+}
+
+// checkUserOwnership checks whether a normal administrator owns at least one
+// active instance of the target user through one of the administrator's
+// providers. Super administrators are not filtered.
+func (api *AdminTrafficAPI) checkUserOwnership(c *gin.Context, userID uint) bool {
+	ownerAdminID := middleware.GetOwnerAdminID(c)
+	if ownerAdminID == 0 {
+		return true
+	}
+	var count int64
+	err := global.APP_DB.Table("instances").
+		Joins("INNER JOIN providers ON providers.id = instances.provider_id").
+		Where("instances.user_id = ? AND instances.deleted_at IS NULL AND providers.owner_admin_id = ?", userID, ownerAdminID).
+		Count(&count).Error
+	return err == nil && count > 0
+}
+
+func (api *AdminTrafficAPI) checkUsersOwnership(c *gin.Context, userIDs []uint) bool {
+	ownerAdminID := middleware.GetOwnerAdminID(c)
+	if ownerAdminID == 0 {
+		return true
+	}
+	uniqueIDs := make(map[uint]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		if id != 0 {
+			uniqueIDs[id] = struct{}{}
+		}
+	}
+	if len(uniqueIDs) == 0 {
+		return false
+	}
+	var ownedIDs []uint
+	err := global.APP_DB.Table("instances").
+		Joins("INNER JOIN providers ON providers.id = instances.provider_id").
+		Where("instances.user_id IN ? AND instances.deleted_at IS NULL AND providers.owner_admin_id = ?", userIDs, ownerAdminID).
+		Distinct("instances.user_id").
+		Pluck("instances.user_id", &ownedIDs).Error
+	if err != nil || len(ownedIDs) != len(uniqueIDs) {
+		return false
+	}
+	return true
+}
+
+func normalizeUserIDs(userIDs []uint) []uint {
+	uniqueIDs := make([]uint, 0, len(userIDs))
+	seen := make(map[uint]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID == 0 {
+			continue
+		}
+		if _, exists := seen[userID]; exists {
+			continue
+		}
+		seen[userID] = struct{}{}
+		uniqueIDs = append(uniqueIDs, userID)
+	}
+	return uniqueIDs
+}
+
+// GetSystemTrafficOverview 获取系统流量概览
+// @Summary 获取系统流量概览
+// @Description 获取整个系统的流量使用情况概览
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/overview [get]
+func (api *AdminTrafficAPI) GetSystemTrafficOverview(c *gin.Context) {
+	trafficLimitService := traffic.NewLimitService()
+
+	// 获取系统全局流量统计
+	systemStats, err := trafficLimitService.GetSystemTrafficStats(middleware.GetOwnerAdminID(c))
+	if err != nil {
+		global.APP_LOG.Error("获取系统流量统计失败", zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	common.ResponseSuccess(c, systemStats, "获取系统流量概览成功")
+}
+
+// GetProviderTrafficStats 获取Provider流量统计
+// @Summary 获取Provider流量统计
+// @Description 获取指定Provider的流量使用情况
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Param providerId path int true "Provider ID"
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/provider/{providerId} [get]
+func (api *AdminTrafficAPI) GetProviderTrafficStats(c *gin.Context) {
+	providerIDStr := c.Param("providerId")
+	providerID, err := strconv.ParseUint(providerIDStr, 10, 32)
+	if err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "Provider ID格式错误"))
+		return
+	}
+
+	// 普通管理员权限检查
+	if !api.checkProviderOwnership(c, uint(providerID)) {
+		common.ResponseWithError(c, common.NewError(common.CodeForbidden, "无权访问该Provider"))
+		return
+	}
+
+	trafficLimitService := traffic.NewLimitService()
+
+	// 获取Provider流量使用情况
+	providerUsage, err := trafficLimitService.GetProviderTrafficUsageWithPmacct(uint(providerID))
+	if err != nil {
+		global.APP_LOG.Error("获取Provider流量统计失败",
+			zap.Uint("providerID", uint(providerID)),
+			zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	common.ResponseSuccess(c, providerUsage, "获取Provider流量统计成功")
+}
+
+// GetUserTrafficStats 获取用户流量统计
+// @Summary 获取用户流量统计
+// @Description 获取指定用户的流量使用情况
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Param userId path int true "用户ID"
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/user/{userId} [get]
+func (api *AdminTrafficAPI) GetUserTrafficStats(c *gin.Context) {
+	userIDStr := c.Param("userId")
+	userID, err := strconv.ParseUint(userIDStr, 10, 32)
+	if err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "用户ID格式错误"))
+		return
+	}
+	if middleware.GetOwnerAdminID(c) > 0 {
+		common.ResponseWithError(c, common.NewError(common.CodeForbidden, "用户级流量详情仅限超级管理员查看"))
+		return
+	}
+
+	trafficLimitService := traffic.NewLimitService()
+	if !api.checkUserOwnership(c, uint(userID)) {
+		common.ResponseWithError(c, common.NewError(common.CodeForbidden, "无权访问该用户的流量信息"))
+		return
+	}
+
+	// 获取用户流量使用情况
+	userUsage, err := trafficLimitService.GetUserTrafficUsageWithPmacct(uint(userID))
+	if err != nil {
+		global.APP_LOG.Error("获取用户流量统计失败",
+			zap.Uint("userID", uint(userID)),
+			zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	common.ResponseSuccess(c, userUsage, "获取用户流量统计成功")
+}
+
+// GetAllUsersTrafficRank 获取所有用户流量排行
+// @Summary 获取用户流量排行榜
+// @Description 获取系统中所有用户的流量使用排行榜，支持分页和搜索
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Param page query int false "页码，默认1"
+// @Param pageSize query int false "每页数量，默认10"
+// @Param username query string false "按用户名搜索"
+// @Param nickname query string false "按昵称搜索"
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/users/rank [get]
+func (api *AdminTrafficAPI) GetAllUsersTrafficRank(c *gin.Context) {
+	// 获取分页参数
+	pageStr := c.DefaultQuery("page", "1")
+	pageSizeStr := c.DefaultQuery("pageSize", "10")
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page <= 0 {
+		page = 1
+	}
+	pageSize, err := strconv.Atoi(pageSizeStr)
+	if err != nil || pageSize <= 0 || pageSize > 100 {
+		pageSize = 10
+	}
+
+	// 获取搜索参数
+	username := c.Query("username")
+	nickname := c.Query("nickname")
+
+	trafficLimitService := traffic.NewLimitService()
+
+	// 获取用户流量排行榜
+	userRankings, total, err := trafficLimitService.GetUsersTrafficRanking(page, pageSize, username, nickname, middleware.GetOwnerAdminID(c))
+	if err != nil {
+		global.APP_LOG.Error("获取用户流量排行榜失败", zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	common.ResponseSuccess(c, map[string]interface{}{
+		"rankings": userRankings,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	}, "获取用户流量排行榜成功")
+}
+
+// ManageTrafficLimits 管理流量限制
+// @Summary 管理流量限制
+// @Description 手动设置或解除用户/Provider的流量限制
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Param request body ManageTrafficLimitRequest true "流量限制管理请求"
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/manage [post]
+func (api *AdminTrafficAPI) ManageTrafficLimits(c *gin.Context) {
+	var req ManageTrafficLimitRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "请求参数错误: "+err.Error()))
+		return
+	}
+
+	trafficLimitService := traffic.NewLimitService()
+
+	var err error
+	var result string
+
+	switch req.Type {
+	case "user":
+		if middleware.GetOwnerAdminID(c) > 0 {
+			common.ResponseWithError(c, common.NewError(common.CodeForbidden, "用户级流量限制仅限超级管理员操作"))
+			return
+		}
+		if !api.checkUserOwnership(c, req.TargetID) {
+			common.ResponseWithError(c, common.NewError(common.CodeForbidden, "无权管理该用户的流量"))
+			return
+		}
+		if req.Action == "limit" {
+			err = trafficLimitService.SetUserTrafficLimit(req.TargetID, req.Reason)
+			result = "设置用户流量限制"
+		} else if req.Action == "unlimit" {
+			err = trafficLimitService.RemoveUserTrafficLimit(req.TargetID)
+			result = "解除用户流量限制"
+		} else {
+			common.ResponseWithError(c, common.NewError(common.CodeValidationError, "不支持的操作类型"))
+			return
+		}
+	case "provider":
+		if !api.checkProviderOwnership(c, req.TargetID) {
+			common.ResponseWithError(c, common.NewError(common.CodeForbidden, "无权管理该Provider的流量"))
+			return
+		}
+		if req.Action == "limit" {
+			err = trafficLimitService.SetProviderTrafficLimit(req.TargetID, req.Reason)
+			result = "设置Provider流量限制"
+		} else if req.Action == "unlimit" {
+			err = trafficLimitService.RemoveProviderTrafficLimit(req.TargetID)
+			result = "解除Provider流量限制"
+		} else {
+			common.ResponseWithError(c, common.NewError(common.CodeValidationError, "不支持的操作类型"))
+			return
+		}
+	default:
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "不支持的目标类型"))
+		return
+	}
+
+	if err != nil {
+		global.APP_LOG.Error("管理流量限制失败",
+			zap.String("type", req.Type),
+			zap.String("action", req.Action),
+			zap.Uint("targetID", req.TargetID),
+			zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	common.ResponseSuccess(c, map[string]interface{}{
+		"type":      req.Type,
+		"action":    req.Action,
+		"target_id": req.TargetID,
+		"reason":    req.Reason,
+	}, result+"成功")
+}
+
+// ManageTrafficLimitRequest 流量限制管理请求
+type ManageTrafficLimitRequest struct {
+	Type     string `json:"type" binding:"required"`      // "user" 或 "provider"
+	Action   string `json:"action" binding:"required"`    // "limit" 或 "unlimit"
+	TargetID uint   `json:"target_id" binding:"required"` // 目标用户ID或Provider ID
+	Reason   string `json:"reason"`                       // 限制原因（仅在action为limit时需要）
+}
+
+// BatchManageTrafficLimits 批量管理流量限制
+// @Summary 批量管理流量限制
+// @Description 批量设置或解除用户的流量限制
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Param request body BatchManageTrafficLimitRequest true "批量流量限制管理请求"
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/batch-manage [post]
+func (api *AdminTrafficAPI) BatchManageTrafficLimits(c *gin.Context) {
+	var req BatchManageTrafficLimitRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "请求参数错误: "+err.Error()))
+		return
+	}
+
+	userIDs := normalizeUserIDs(req.UserIDs)
+	if len(userIDs) == 0 {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "用户ID列表不能为空"))
+		return
+	}
+	if len(userIDs) > 100 {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "单次最多处理100个用户"))
+		return
+	}
+	if !api.checkUsersOwnership(c, userIDs) {
+		common.ResponseWithError(c, common.NewError(common.CodeForbidden, "包含无权管理的用户"))
+		return
+	}
+
+	trafficLimitService := traffic.NewLimitService()
+
+	successCount := 0
+	failCount := 0
+	var errors []string
+
+	for _, userID := range userIDs {
+		var err error
+		if req.Action == "limit" {
+			err = trafficLimitService.SetUserTrafficLimit(userID, req.Reason)
+		} else if req.Action == "unlimit" {
+			err = trafficLimitService.RemoveUserTrafficLimit(userID)
+		} else {
+			errors = append(errors, fmt.Sprintf("用户ID %d: 不支持的操作类型", userID))
+			failCount++
+			continue
+		}
+
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("用户ID %d: %s", userID, err.Error()))
+			failCount++
+		} else {
+			successCount++
+		}
+	}
+
+	result := "批量" + map[string]string{"limit": "限制", "unlimit": "解除限制"}[req.Action] + "流量"
+
+	common.ResponseSuccess(c, map[string]interface{}{
+		"success_count": successCount,
+		"fail_count":    failCount,
+		"errors":        errors,
+	}, fmt.Sprintf("%s完成，成功: %d, 失败: %d", result, successCount, failCount))
+}
+
+// BatchSyncUserTraffic 批量同步用户流量
+// @Summary 批量同步用户流量
+// @Description 批量触发用户流量数据同步
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Param request body BatchSyncTrafficRequest true "批量同步流量请求"
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/batch-sync [post]
+func (api *AdminTrafficAPI) BatchSyncUserTraffic(c *gin.Context) {
+	var req BatchSyncTrafficRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "请求参数错误: "+err.Error()))
+		return
+	}
+
+	userIDs := normalizeUserIDs(req.UserIDs)
+	if len(userIDs) == 0 {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "用户ID列表不能为空"))
+		return
+	}
+	if len(userIDs) > 100 {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "单次最多同步100个用户"))
+		return
+	}
+	if !api.checkUsersOwnership(c, userIDs) {
+		common.ResponseWithError(c, common.NewError(common.CodeForbidden, "包含无权同步的用户"))
+		return
+	}
+
+	// 远程采集和流量检查必须在事务外异步执行，避免阻塞HTTP请求和持有数据库锁。
+	syncTrigger := traffic.NewSyncTriggerService()
+	for _, userID := range userIDs {
+		syncTrigger.TriggerUserTrafficSync(userID, "管理员批量手动触发")
+	}
+	go func() {
+		_ = syncTrigger.Shutdown(30 * time.Minute)
+	}()
+
+	common.ResponseSuccess(c, map[string]interface{}{
+		"user_ids": userIDs,
+	}, fmt.Sprintf("已触发 %d 个用户的流量同步任务", len(userIDs)))
+}
+
+// BatchManageTrafficLimitRequest 批量流量限制管理请求
+type BatchManageTrafficLimitRequest struct {
+	Action  string `json:"action" binding:"required"` // "limit" 或 "unlimit"
+	UserIDs []uint `json:"user_ids" binding:"required"`
+	Reason  string `json:"reason"` // 限制原因（仅在action为limit时需要）
+}
+
+// BatchSyncTrafficRequest 批量同步流量请求
+type BatchSyncTrafficRequest struct {
+	UserIDs []uint `json:"user_ids" binding:"required"`
+}
+
+// ClearUserTrafficRecords 清空用户流量记录
+// @Summary 清空用户流量记录
+// @Description 删除指定用户的所有历史流量记录，用于重新计数
+// @Tags 管理员流量
+// @Accept json
+// @Produce json
+// @Security ApiKeyAuth
+// @Param userId path int true "用户ID"
+// @Success 200 {object} common.Response
+// @Router /admin/traffic/user/{userId}/clear [delete]
+func (api *AdminTrafficAPI) ClearUserTrafficRecords(c *gin.Context) {
+	userIDStr := c.Param("userId")
+	userID, err := strconv.ParseUint(userIDStr, 10, 32)
+	if err != nil {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "用户ID格式错误"))
+		return
+	}
+	if !api.checkUserOwnership(c, uint(userID)) {
+		common.ResponseWithError(c, common.NewError(common.CodeForbidden, "无权清空该用户的流量记录"))
+		return
+	}
+
+	clearService := traffic.NewClearService()
+
+	deletedCount, err := clearService.ClearUserTrafficRecords(uint(userID))
+	if err != nil {
+		global.APP_LOG.Error("清空用户流量记录失败",
+			zap.Uint("userID", uint(userID)),
+			zap.Error(err))
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+
+	common.ResponseSuccess(c, map[string]interface{}{
+		"user_id":       userID,
+		"deleted_count": deletedCount,
+	}, "清空用户流量记录成功")
+}

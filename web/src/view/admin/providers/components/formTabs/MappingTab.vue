@@ -1,0 +1,855 @@
+<template>
+  <el-form
+    :model="modelValue"
+    label-width="120px"
+    class="server-form"
+  >
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.portMappingConfig') }}</span>
+    </el-divider>
+
+    <el-form-item
+      :label="$t('admin.providers.defaultPortCount')"
+      prop="defaultPortCount"
+    >
+      <el-input-number
+        v-model="modelValue.defaultPortCount"
+        :min="1"
+        :max="50"
+        :step="1"
+        :controls="false"
+        placeholder="10"
+        style="width: 200px"
+      />
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.defaultPortCountTip') }}
+      </el-text>
+    </div>
+
+    <el-form-item
+      :label="$t('admin.providers.fixedPorts')"
+      prop="fixedPorts"
+    >
+      <div class="fixed-port-config">
+        <el-checkbox-group
+          v-model="modelValue.fixedPorts"
+          @change="handleFixedPortsChange"
+        >
+          <el-checkbox
+            v-for="option in fixedPortOptions"
+            :key="option.value"
+            :label="option.value"
+            :disabled="option.value === REQUIRED_FIXED_PORT"
+          >
+            {{ option.label }}
+          </el-checkbox>
+        </el-checkbox-group>
+        <div class="fixed-port-summary">
+          <el-tag size="small">
+            {{ $t('admin.providers.fixedPortSummary', { fixed: fixedPortCount, ordinary: ordinaryPortCount, total: modelValue.defaultPortCount || 10, limit: modelValue.defaultPortCount || 10 }) }}
+          </el-tag>
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.fixedPortsTip') }}
+          </el-text>
+        </div>
+        <el-alert
+          v-if="fixedPortsOverflow"
+          :title="$t('admin.providers.fixedPortOverflow')"
+          type="error"
+          :closable="false"
+          show-icon
+          style="margin-top: 8px;"
+        />
+      </div>
+    </el-form-item>
+
+    <el-row :gutter="20">
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.portRangeStart')"
+          prop="portRangeStart"
+        >
+          <el-input-number
+            v-model="modelValue.portRangeStart"
+            :min="1024"
+            :max="65535"
+            :step="1"
+            :controls="false"
+            placeholder="10000"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.portRangeStartTip') }}
+          </el-text>
+        </div>
+      </el-col>
+      <el-col :span="12">
+        <el-form-item
+          :label="$t('admin.providers.portRangeEnd')"
+          prop="portRangeEnd"
+        >
+          <el-input-number
+            v-model="modelValue.portRangeEnd"
+            :min="1024"
+            :max="65535"
+            :step="1"
+            :controls="false"
+            placeholder="65535"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.portRangeEndTip') }}
+          </el-text>
+        </div>
+      </el-col>
+    </el-row>
+
+    <el-form-item
+      :label="$t('admin.providers.networkType')"
+      prop="networkType"
+    >
+      <el-select
+        v-model="modelValue.networkType"
+        :placeholder="$t('admin.providers.networkTypePlaceholder')"
+        style="width: 100%"
+      >
+        <el-option
+          :label="$t('admin.providers.natIPv4')"
+          value="nat_ipv4"
+        />
+        <el-option
+          :label="$t('admin.providers.natIPv4IPv6')"
+          value="nat_ipv4_ipv6"
+        />
+        <el-option
+          :label="$t('admin.providers.dedicatedIPv4')"
+          value="dedicated_ipv4"
+        />
+        <el-option
+          :label="$t('admin.providers.dedicatedIPv4IPv6')"
+          value="dedicated_ipv4_ipv6"
+        />
+        <el-option
+          :label="$t('admin.providers.ipv6Only')"
+          value="ipv6_only"
+        />
+        <el-option
+          :label="$t('admin.providers.noPortMapping')"
+          value="no_port_mapping"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.networkTypeTip') }}
+      </el-text>
+    </div>
+    <!-- 无端口映射模式特殊提示 -->
+    <div
+      v-if="modelValue.networkType === 'no_port_mapping'"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-alert
+        :title="$t('admin.providers.noPortMappingTip')"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
+    </div>
+
+    <!-- Proxmox 节点安装类型 -->
+    <template v-if="modelValue.type === 'proxmox'">
+      <el-divider content-position="left">
+        <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.proxmoxInstallType') }}</span>
+      </el-divider>
+
+      <el-form-item
+        :label="$t('admin.providers.nodeInstallType')"
+        prop="nodeInstallType"
+      >
+        <el-radio-group v-model="modelValue.nodeInstallType">
+          <el-radio value="script">
+            {{ $t('admin.providers.nodeInstallScript') }}
+          </el-radio>
+          <el-radio value="third_party">
+            <span>{{ $t('admin.providers.nodeInstallThirdParty') }}</span>
+            <el-tag
+              type="warning"
+              size="small"
+              style="margin-left: 8px;"
+            >
+              {{ $t('admin.providers.nodeInstallThirdPartyTag') }}
+            </el-tag>
+          </el-radio>
+        </el-radio-group>
+      </el-form-item>
+      <div
+        class="form-tip"
+        style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+      >
+        <el-text
+          size="small"
+          type="info"
+        >
+          {{ $t('admin.providers.nodeInstallTypeTip') }}
+          <a
+            href="https://github.com/oneclickvirt/pve"
+            target="_blank"
+            rel="noopener noreferrer"
+            style="color: #409eff; text-decoration: none; font-weight: 600;"
+          >
+            github.com/oneclickvirt/pve
+          </a>
+        </el-text>
+      </div>
+
+      <!-- 第三方安装时显示网桥配置 -->
+      <template v-if="modelValue.nodeInstallType === 'third_party'">
+        <el-alert
+          :title="$t('admin.providers.thirdPartyBridgeAlert')"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 16px;"
+        />
+
+        <el-form-item
+          :label="$t('admin.providers.bridgeNAT')"
+          prop="bridgeNAT"
+        >
+          <el-input
+            v-model="modelValue.bridgeNAT"
+            :placeholder="$t('admin.providers.bridgeNATPlaceholder')"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.bridgeNATTip') }}
+          </el-text>
+        </div>
+
+        <el-form-item
+          :label="$t('admin.providers.bridgeDedicatedV4')"
+          prop="bridgeDedicatedV4"
+        >
+          <el-input
+            v-model="modelValue.bridgeDedicatedV4"
+            :placeholder="$t('admin.providers.bridgeDedicatedV4Placeholder')"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.bridgeDedicatedV4Tip') }}
+          </el-text>
+        </div>
+
+        <el-form-item
+          :label="$t('admin.providers.bridgeDedicatedV6')"
+          prop="bridgeDedicatedV6"
+        >
+          <el-input
+            v-model="modelValue.bridgeDedicatedV6"
+            :placeholder="$t('admin.providers.bridgeDedicatedV6Placeholder')"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.bridgeDedicatedV6Tip') }}
+          </el-text>
+        </div>
+
+        <el-form-item
+          :label="$t('admin.providers.natSubnet')"
+          prop="natSubnet"
+        >
+          <el-input
+            v-model="modelValue.natSubnet"
+            :placeholder="$t('admin.providers.natSubnetPlaceholder')"
+            style="width: 100%"
+          />
+        </el-form-item>
+        <div
+          class="form-tip"
+          style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+        >
+          <el-text
+            size="small"
+            type="info"
+          >
+            {{ $t('admin.providers.natSubnetTip') }}
+          </el-text>
+        </div>
+      </template>
+    </template>
+
+    <!-- Docker/Podman/Containerd/Orbstack 端口映射方式（固定为 native，不可选择） -->
+    <el-form-item
+      v-if="CONTAINER_ONLY_PROVIDER_TYPES.includes(modelValue.type)"
+      :label="$t('admin.providers.portMappingMethod')"
+    >
+      <el-input
+        :value="$t('admin.providers.nativePortMapping')"
+        disabled
+        style="width: 100%"
+      />
+    </el-form-item>
+    <div
+      v-if="CONTAINER_ONLY_PROVIDER_TYPES.includes(modelValue.type)"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.dockerNativeMappingTip') }}
+      </el-text>
+    </div>
+
+    <!-- IPv4端口映射方式 -->
+    <el-form-item
+      v-if="(modelValue.type === 'lxd' || modelValue.type === 'incus') && modelValue.networkType !== 'ipv6_only' && modelValue.networkType !== 'no_port_mapping'"
+      :label="$t('admin.providers.ipv4PortMappingMethod')"
+      prop="ipv4PortMappingMethod"
+    >
+      <el-select
+        v-model="modelValue.ipv4PortMappingMethod"
+        :placeholder="$t('admin.providers.ipv4PortMappingMethodPlaceholder')"
+        style="width: 100%"
+      >
+        <el-option
+          :label="$t('admin.providers.deviceProxyRecommended')"
+          value="device_proxy"
+        />
+        <el-option
+          label="Iptables"
+          value="iptables"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      v-if="(modelValue.type === 'lxd' || modelValue.type === 'incus') && modelValue.networkType !== 'ipv6_only' && modelValue.networkType !== 'no_port_mapping'"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.ipv4PortMappingMethodTip') }}
+      </el-text>
+    </div>
+
+    <!-- IPv6端口映射方式 -->
+    <el-form-item
+      v-if="(modelValue.type === 'lxd' || modelValue.type === 'incus') && (modelValue.networkType === 'nat_ipv4_ipv6' || modelValue.networkType === 'dedicated_ipv4_ipv6' || modelValue.networkType === 'ipv6_only')"
+      :label="$t('admin.providers.ipv6PortMappingMethod')"
+      prop="ipv6PortMappingMethod"
+    >
+      <el-select
+        v-model="modelValue.ipv6PortMappingMethod"
+        :placeholder="$t('admin.providers.ipv6PortMappingMethodPlaceholder')"
+        style="width: 100%"
+      >
+        <el-option
+          :label="$t('admin.providers.deviceProxyRecommended')"
+          value="device_proxy"
+        />
+        <el-option
+          label="Iptables"
+          value="iptables"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      v-if="(modelValue.type === 'lxd' || modelValue.type === 'incus') && (modelValue.networkType === 'nat_ipv4_ipv6' || modelValue.networkType === 'dedicated_ipv4_ipv6' || modelValue.networkType === 'ipv6_only')"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.ipv6PortMappingMethodTip') }}
+      </el-text>
+    </div>
+
+    <!-- Proxmox IPv4端口映射方式 -->
+    <el-form-item
+      v-if="modelValue.type === 'proxmox' && modelValue.networkType !== 'ipv6_only' && modelValue.networkType !== 'no_port_mapping'"
+      :label="$t('admin.providers.ipv4PortMappingMethod')"
+      prop="ipv4PortMappingMethod"
+    >
+      <el-select
+        v-model="modelValue.ipv4PortMappingMethod"
+        :placeholder="$t('admin.providers.ipv4PortMappingMethodPlaceholder')"
+        style="width: 100%"
+      >
+        <el-option
+          v-if="modelValue.networkType === 'dedicated_ipv4' || modelValue.networkType === 'dedicated_ipv4_ipv6'"
+          :label="$t('admin.providers.nativeRecommended')"
+          value="native"
+        />
+        <el-option
+          label="Iptables"
+          value="iptables"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      v-if="modelValue.type === 'proxmox' && modelValue.networkType !== 'ipv6_only' && modelValue.networkType !== 'no_port_mapping'"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.proxmoxIPv4MappingTip') }}
+      </el-text>
+    </div>
+
+    <!-- Proxmox IPv6端口映射方式 -->
+    <el-form-item
+      v-if="modelValue.type === 'proxmox' && (modelValue.networkType === 'nat_ipv4_ipv6' || modelValue.networkType === 'dedicated_ipv4_ipv6' || modelValue.networkType === 'ipv6_only')"
+      :label="$t('admin.providers.ipv6PortMappingMethod')"
+      prop="ipv6PortMappingMethod"
+    >
+      <el-select
+        v-model="modelValue.ipv6PortMappingMethod"
+        :placeholder="$t('admin.providers.ipv6PortMappingMethodPlaceholder')"
+        style="width: 100%"
+      >
+        <el-option
+          :label="$t('admin.providers.nativeRecommended')"
+          value="native"
+        />
+        <el-option
+          label="Iptables"
+          value="iptables"
+        />
+      </el-select>
+    </el-form-item>
+    <div
+      v-if="modelValue.type === 'proxmox' && (modelValue.networkType === 'nat_ipv4_ipv6' || modelValue.networkType === 'dedicated_ipv4_ipv6' || modelValue.networkType === 'ipv6_only')"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.proxmoxIPv6MappingTip') }}
+      </el-text>
+    </div>
+
+    <!-- VM-only provider port mapping method (fixed to iptables) -->
+    <el-form-item
+      v-if="(VM_ONLY_PROVIDER_TYPES.includes(modelValue.type) || modelValue.type === 'qemu' || modelValue.type === 'kubevirt')"
+      :label="$t('admin.providers.portMappingMethod')"
+    >
+      <el-input
+        value="Iptables"
+        disabled
+        style="width: 100%"
+      />
+    </el-form-item>
+    <div
+      v-if="(VM_ONLY_PROVIDER_TYPES.includes(modelValue.type) || modelValue.type === 'qemu' || modelValue.type === 'kubevirt')"
+      class="form-tip"
+      style="margin-top: -10px; margin-bottom: 15px; margin-left: 120px;"
+    >
+      <el-text
+        size="small"
+        type="info"
+      >
+        {{ $t('admin.providers.qemuIptablesMappingTip') }}
+      </el-text>
+    </div>
+
+    <el-alert
+      class="mapping-help-alert"
+      :title="$t('admin.providers.mappingTypeDescription')"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-top: 20px;"
+    >
+      <ul class="mapping-help-list">
+        <li><strong>{{ $t('admin.providers.natMapping') }}:</strong> {{ $t('admin.providers.natMappingDesc') }}</li>
+        <li><strong>{{ $t('admin.providers.dedicatedMapping') }}:</strong> {{ $t('admin.providers.dedicatedMappingDesc') }}</li>
+        <li><strong>{{ $t('admin.providers.ipv6Support') }}:</strong> {{ $t('admin.providers.ipv6SupportDesc') }}</li>
+        <li><strong>Docker/Orbstack:</strong> {{ $t('admin.providers.dockerMappingDesc') }}</li>
+        <li><strong>LXD/Incus:</strong> {{ $t('admin.providers.lxdIncusMappingDesc') }}</li>
+        <li><strong>Proxmox VE:</strong> {{ $t('admin.providers.proxmoxMappingDesc') }}</li>
+        <li><strong>QEMU/KubeVirt/VMware/VirtualBox/Multipass/Vagrant:</strong> {{ $t('admin.providers.qemuMappingDesc') }}</li>
+      </ul>
+    </el-alert>
+
+    <!-- IPv4 地址池管理（仅对 dedicated_ipv4 / dedicated_ipv4_ipv6 显示） -->
+    <template v-if="modelValue.networkType === 'dedicated_ipv4' || modelValue.networkType === 'dedicated_ipv4_ipv6'">
+      <el-divider
+        content-position="left"
+        style="margin-top: 24px;"
+      >
+        <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.ipv4Pool.management') }}</span>
+      </el-divider>
+
+      <!-- 新提供商提示 -->
+      <el-alert
+        v-if="!modelValue.id"
+        type="info"
+        :closable="false"
+        :title="$t('admin.providers.ipv4Pool.newProviderNote')"
+        style="margin-bottom: 16px;"
+      />
+
+      <template v-else>
+        <!-- 池统计 -->
+        <el-row
+          :gutter="16"
+          style="margin-bottom: 16px;"
+        >
+          <el-col :span="8">
+            <el-statistic
+              :title="$t('admin.providers.ipv4Pool.total')"
+              :value="poolStats.total"
+            />
+          </el-col>
+          <el-col :span="8">
+            <el-statistic
+              :title="$t('admin.providers.ipv4Pool.allocated')"
+              :value="poolStats.allocated"
+            />
+          </el-col>
+          <el-col :span="8">
+            <el-statistic
+              :title="$t('admin.providers.ipv4Pool.available')"
+              :value="poolStats.available"
+            />
+          </el-col>
+        </el-row>
+
+        <!-- 添加地址 -->
+        <el-form-item :label="$t('admin.providers.ipv4Pool.addresses')">
+          <div style="width: 100%;">
+            <el-input
+              v-model="newAddresses"
+              type="textarea"
+              :rows="4"
+              :placeholder="$t('admin.providers.ipv4Pool.addressesPlaceholder')"
+              style="width: 100%; margin-bottom: 8px;"
+            />
+            <el-space>
+              <el-button
+                type="primary"
+                :loading="saving"
+                @click="addToPool"
+              >
+                {{ $t('admin.providers.ipv4Pool.addBtn') }}
+              </el-button>
+              <el-popconfirm
+                :title="$t('admin.providers.ipv4Pool.clearConfirm')"
+                @confirm="clearPool"
+              >
+                <template #reference>
+                  <el-button
+                    type="danger"
+                    plain
+                  >
+                    {{ $t('admin.providers.ipv4Pool.clearBtn') }}
+                  </el-button>
+                </template>
+              </el-popconfirm>
+            </el-space>
+          </div>
+        </el-form-item>
+
+        <!-- 当前地址列表 -->
+        <el-form-item :label="$t('admin.providers.ipv4Pool.list')">
+          <el-table
+            v-loading="poolLoading"
+            :data="poolEntries"
+            style="width: 100%"
+            size="small"
+            max-height="240"
+          >
+            <el-table-column
+              :label="$t('admin.providers.ipv4Pool.address')"
+              prop="address"
+              min-width="140"
+            />
+            <el-table-column
+              :label="$t('admin.providers.ipv4Pool.status')"
+              min-width="100"
+            >
+              <template #default="{ row }">
+                <el-tag
+                  :type="row.is_allocated ? 'warning' : 'success'"
+                  size="small"
+                >
+                  {{ row.is_allocated ? $t('admin.providers.ipv4Pool.statusAllocated') : $t('admin.providers.ipv4Pool.statusFree') }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column
+              :label="$t('admin.providers.ipv4Pool.instance')"
+              prop="instance_id"
+              min-width="110"
+            >
+              <template #default="{ row }">
+                <span>{{ row.instance_id || '-' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column
+              width="80"
+              align="center"
+            >
+              <template #default="{ row }">
+                <el-popconfirm
+                  v-if="!row.is_allocated"
+                  :title="$t('admin.providers.ipv4Pool.deleteConfirm')"
+                  @confirm="deleteEntry(row.id)"
+                >
+                  <template #reference>
+                    <el-button
+                      type="danger"
+                      link
+                      size="small"
+                    >
+                      {{ $t('common.delete') }}
+                    </el-button>
+                  </template>
+                </el-popconfirm>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-form-item>
+      </template>
+    </template>
+  </el-form>
+</template>
+
+<script setup>
+import { computed, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { useIPv4Pool } from './composables/useIPv4Pool'
+import { CONTAINER_ONLY_PROVIDER_TYPES, VM_ONLY_PROVIDER_TYPES } from '@/utils/providerTypes'
+
+const props = defineProps({
+  modelValue: {
+    type: Object,
+    required: true
+  }
+})
+
+const { t } = useI18n()
+const REQUIRED_FIXED_PORT = 22
+const commonFixedPorts = [22, 80, 443, 8080, 8443, 3306, 5432, 6379, 27017]
+
+const normalizeFixedPorts = (ports = []) => {
+  const values = Array.isArray(ports) ? ports : []
+  const normalized = Array.from(new Set([REQUIRED_FIXED_PORT, ...values.map(port => Number(port)).filter(port => Number.isInteger(port) && port >= 1 && port <= 65535)]))
+  return normalized.sort((a, b) => {
+    if (a === REQUIRED_FIXED_PORT) return -1
+    if (b === REQUIRED_FIXED_PORT) return 1
+    return a - b
+  })
+}
+
+const arraysEqual = (a, b) => a.length === b.length && a.every((value, index) => value === b[index])
+
+const ensureFixedPorts = () => {
+  const normalized = normalizeFixedPorts(props.modelValue.fixedPorts)
+  if (!Array.isArray(props.modelValue.fixedPorts) || !arraysEqual(props.modelValue.fixedPorts, normalized)) {
+    props.modelValue.fixedPorts = normalized
+  }
+}
+
+const fixedPortOptions = computed(() => commonFixedPorts.map((port) => ({
+  value: port,
+  label: port === REQUIRED_FIXED_PORT
+    ? t('admin.providers.fixedPortOptionSsh')
+    : t(`admin.providers.fixedPortOption${port}`)
+})))
+const fixedPortCount = computed(() => normalizeFixedPorts(props.modelValue.fixedPorts).length)
+const ordinaryPortCount = computed(() => Math.max((props.modelValue.defaultPortCount || 10) - fixedPortCount.value, 0))
+const fixedPortsOverflow = computed(() => fixedPortCount.value > (props.modelValue.defaultPortCount || 10))
+const handleFixedPortsChange = () => ensureFixedPorts()
+
+const {
+  poolEntries,
+  poolStats,
+  poolLoading,
+  newAddresses,
+  saving,
+  addToPool,
+  clearPool,
+  deleteEntry,
+} = useIPv4Pool(props)
+
+watch(() => props.modelValue.fixedPorts, ensureFixedPorts, { immediate: true, deep: true })
+
+// 监听节点类型变化，自动更新端口映射方式
+watch(() => props.modelValue.type, (newType) => {
+  if (!newType) return
+
+  if (CONTAINER_ONLY_PROVIDER_TYPES.includes(newType)) {
+    // Docker/Podman/Containerd/Orbstack: IPv4和IPv6都固定使用 native
+    props.modelValue.ipv4PortMappingMethod = 'native'
+    props.modelValue.ipv6PortMappingMethod = 'native'
+  } else if (VM_ONLY_PROVIDER_TYPES.includes(newType) || newType === 'qemu' || newType === 'kubevirt') {
+    // 本地虚拟化/KubeVirt 类型：IPv4和IPv6都默认使用 iptables
+    props.modelValue.ipv4PortMappingMethod = 'iptables'
+    props.modelValue.ipv6PortMappingMethod = 'iptables'
+  } else if (newType === 'proxmox') {
+    // Proxmox: 根据网络类型设置
+    const isNATMode = props.modelValue.networkType === 'nat_ipv4' || props.modelValue.networkType === 'nat_ipv4_ipv6'
+    // IPv4: NAT模式默认iptables，独立IP模式默认native
+    props.modelValue.ipv4PortMappingMethod = isNATMode ? 'iptables' : 'native'
+    // IPv6: 默认native（Proxmox IPv6始终推荐native）
+    props.modelValue.ipv6PortMappingMethod = 'native'
+  } else if (newType === 'lxd' || newType === 'incus') {
+    // LXD/Incus: IPv4和IPv6都默认使用 device_proxy
+    props.modelValue.ipv4PortMappingMethod = 'device_proxy'
+    props.modelValue.ipv6PortMappingMethod = 'device_proxy'
+  }
+})
+
+// 监听网络类型变化，自动调整端口映射方式
+watch(() => [props.modelValue.type, props.modelValue.networkType], ([type, networkType]) => {
+  if (!type || !networkType) return
+
+  if (type === 'proxmox') {
+    const isNATMode = networkType === 'nat_ipv4' || networkType === 'nat_ipv4_ipv6'
+    const isDedicatedIPv4Mode = networkType === 'dedicated_ipv4' || networkType === 'dedicated_ipv4_ipv6'
+    const hasIPv6 = networkType === 'nat_ipv4_ipv6' || networkType === 'dedicated_ipv4_ipv6' || networkType === 'ipv6_only'
+
+    // IPv4 端口映射方式处理（仅在网络类型支持IPv4时处理）
+    if (networkType !== 'ipv6_only') {
+      if (isNATMode) {
+        // NAT 模式只能使用 iptables
+        props.modelValue.ipv4PortMappingMethod = 'iptables'
+      } else if (isDedicatedIPv4Mode) {
+        // 独立IP模式：如果当前值不是有效选项（native或iptables），则设为native
+        if (props.modelValue.ipv4PortMappingMethod !== 'native' &&
+            props.modelValue.ipv4PortMappingMethod !== 'iptables') {
+          props.modelValue.ipv4PortMappingMethod = 'native'
+        }
+      }
+    }
+
+    // IPv6 端口映射方式处理（仅在网络类型支持IPv6时处理）
+    if (hasIPv6) {
+      // Proxmox IPv6默认使用native，但也支持iptables
+      if (props.modelValue.ipv6PortMappingMethod !== 'native' &&
+          props.modelValue.ipv6PortMappingMethod !== 'iptables') {
+        props.modelValue.ipv6PortMappingMethod = 'native'
+      }
+    }
+  }
+  // LXD/Incus不需要额外处理，它们的IPv4和IPv6都是device_proxy或iptables
+  // Docker不需要额外处理，它们固定是native
+})
+</script>
+
+<style scoped>
+.server-form {
+  max-height: 500px;
+  overflow-y: auto;
+  padding-right: 10px;
+}
+
+.form-tip {
+  margin-top: 5px;
+}
+
+.fixed-port-config {
+  width: 100%;
+}
+
+.fixed-port-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.mapping-help-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+@media (max-width: 768px) {
+  .mapping-help-alert :deep(.el-alert__content),
+  .mapping-help-alert :deep(.el-alert__title),
+  .mapping-help-alert :deep(.el-alert__description) {
+    max-width: 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .mapping-help-list {
+    max-width: 100%;
+    padding-left: 16px;
+    overflow-wrap: anywhere;
+  }
+}
+</style>

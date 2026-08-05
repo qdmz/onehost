@@ -1,0 +1,258 @@
+<template>
+  <el-dialog 
+    v-model="dialogVisible" 
+    :title="$t('admin.providers.autoConfigAPI')" 
+    width="900px"
+    :close-on-click-modal="false"
+    :close-on-press-escape="false"
+    @close="handleClose"
+  >
+    <div v-if="provider">
+      <!-- 历史记录视图 -->
+      <div v-if="showHistory">
+        <el-alert
+          :title="$t('admin.providers.configHistory', { type: provider.type.toUpperCase() })"
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 20px;"
+        >
+          <template #default>
+            <p v-if="historyTasks.length > 0 || runningTask">
+              {{ $t('admin.providers.configHistoryMessage') }}
+            </p>
+            <p v-else>
+              {{ $t('admin.providers.noConfigHistory') }}
+            </p>
+          </template>
+        </el-alert>
+
+        <!-- 正在运行的任务 -->
+        <div
+          v-if="runningTask"
+          style="margin-bottom: 20px;"
+        >
+          <el-alert
+            :title="$t('admin.providers.runningConfigTask')"
+            type="warning"
+            :closable="false"
+            show-icon
+          >
+            <template #default>
+              <p>{{ $t('admin.providers.taskID') }}: {{ runningTask.id }}</p>
+              <p>{{ $t('admin.providers.startTime') }}: {{ new Date(runningTask.startedAt).toLocaleString() }}</p>
+              <p>{{ $t('admin.providers.executor') }}: {{ runningTask.executorName }}</p>
+            </template>
+          </el-alert>
+        </div>
+
+        <!-- 历史任务列表 -->
+        <div v-if="historyTasks.length > 0">
+          <h4>{{ $t('admin.providers.configHistoryRecords') }}</h4>
+          <el-table
+            :data="historyTasks"
+            size="small"
+            style="margin-bottom: 20px;"
+          >
+            <el-table-column
+              prop="id"
+              :label="$t('admin.providers.taskID')"
+              min-width="100"
+            />
+            <el-table-column
+              :label="$t('admin.providers.status')"
+              min-width="90"
+            >
+              <template #default="{ row }">
+                <el-tag 
+                  :type="getTaskStatusType(row.status)"
+                  size="small"
+                >
+                  {{ getTaskStatusText(row.status) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column
+              :label="$t('admin.providers.executionTime')"
+              min-width="160"
+            >
+              <template #default="{ row }">
+                {{ new Date(row.createdAt).toLocaleString() }}
+              </template>
+            </el-table-column>
+            <el-table-column
+              prop="executorName"
+              :label="$t('admin.providers.executor')"
+              min-width="110"
+            />
+            <el-table-column
+              prop="duration"
+              :label="$t('admin.providers.duration')"
+              min-width="110"
+            />
+            <el-table-column
+              :label="$t('admin.providers.result')"
+              show-overflow-tooltip
+            >
+              <template #default="{ row }">
+                <span
+                  v-if="row.success"
+                  style="color: #67C23A;"
+                >✅ {{ $t('common.success') }}</span>
+                <span
+                  v-else-if="row.status === 'failed'"
+                  style="color: #F56C6C;"
+                >❌ {{ row.errorMessage || $t('common.failed') }}</span>
+                <span v-else>{{ row.logSummary || '-' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column
+              :label="$t('common.actions')"
+              width="100"
+            >
+              <template #default="{ row }">
+                <el-button 
+                  type="primary" 
+                  size="small"
+                  @click="handleViewTaskLog(row.id)"
+                >
+                  {{ $t('admin.providers.viewLog') }}
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <el-pagination
+            v-if="pagination.total > 0"
+            v-model:current-page="pagination.page"
+            v-model:page-size="pagination.pageSize"
+            :page-sizes="[5, 10, 20, 50]"
+            :small="false"
+            :background="true"
+            layout="total, sizes, prev, pager, next, jumper"
+            :total="pagination.total"
+            style="justify-content: center; margin-top: 12px;"
+            @size-change="$emit('pageSizeChange', $event)"
+            @current-change="$emit('pageChange', $event)"
+          />
+        </div>
+
+        <!-- 操作按钮 -->
+        <div class="action-buttons">
+          <el-button 
+            v-if="runningTask"
+            type="primary"
+            @click="handleViewRunningTask"
+          >
+            {{ $t('admin.providers.viewRunningTaskLog') }}
+          </el-button>
+          <el-button 
+            type="warning"
+            @click="handleRerunConfiguration"
+          >
+            {{ historyTasks.length > 0 ? $t('admin.providers.rerunConfig') : $t('admin.providers.startConfig') }}
+          </el-button>
+          <el-button @click="handleClose">
+            {{ $t('common.close') }}
+          </el-button>
+        </div>
+      </div>
+    </div>
+  </el-dialog>
+</template>
+
+<script setup>
+import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
+
+const props = defineProps({
+  visible: {
+    type: Boolean,
+    required: true
+  },
+  provider: {
+    type: Object,
+    default: null
+  },
+  showHistory: {
+    type: Boolean,
+    default: false
+  },
+  runningTask: {
+    type: Object,
+    default: null
+  },
+  historyTasks: {
+    type: Array,
+    default: () => []
+  },
+  pagination: {
+    type: Object,
+    default: () => ({ page: 1, pageSize: 10, total: 0 })
+  }
+})
+
+const emit = defineEmits(['update:visible', 'close', 'viewTaskLog', 'viewRunningTask', 'rerunConfiguration', 'pageChange', 'pageSizeChange'])
+
+const dialogVisible = computed({
+  get: () => props.visible,
+  set: (val) => emit('update:visible', val)
+})
+
+const handleClose = () => {
+  emit('close')
+}
+
+const handleViewTaskLog = (taskId) => {
+  emit('viewTaskLog', taskId)
+}
+
+const handleViewRunningTask = () => {
+  emit('viewRunningTask')
+}
+
+const handleRerunConfiguration = () => {
+  emit('rerunConfiguration')
+}
+
+const getTaskStatusType = (status) => {
+  const statusMap = {
+    'pending': 'info',
+    'running': 'primary',
+    'completed': 'success',
+    'failed': 'danger',
+    'cancelled': 'warning'
+  }
+  return statusMap[status] || 'info'
+}
+
+const getTaskStatusText = (status) => {
+  const statusTextMap = {
+    'pending': t('admin.providers.taskStatusPending'),
+    'running': t('admin.providers.taskStatusRunning'),
+    'completed': t('admin.providers.taskStatusCompleted'),
+    'failed': t('admin.providers.taskStatusFailed'),
+    'cancelled': t('admin.providers.taskStatusCancelled')
+  }
+  return statusTextMap[status] || status
+}
+</script>
+
+<style scoped>
+h4 {
+  margin: 16px 0 12px 0;
+  color: var(--text-color-primary);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 20px;
+}
+</style>

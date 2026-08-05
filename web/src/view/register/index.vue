@@ -1,0 +1,742 @@
+<template>
+  <div class="register-container">
+    <!-- 顶部栏 -->
+    <header class="auth-header">
+      <div class="header-content">
+        <div class="logo">
+          <img
+            :src="siteStore.logoSrc"
+            alt="OneClickVirt Logo"
+            class="logo-image"
+          >
+          <h1>{{ siteStore.displaySiteName }}</h1>
+        </div>
+        <nav class="nav-actions">
+          <button
+            class="nav-link theme-btn"
+            :title="themeStore.isDark ? t('navbar.lightMode') : t('navbar.darkMode')"
+            @click="toggleTheme"
+          >
+            <el-icon><component :is="themeStore.isDark ? Sunny : Moon" /></el-icon>
+          </button>
+          <button
+            class="nav-link language-btn"
+            @click="switchLanguage"
+          >
+            <el-icon><Operation /></el-icon>
+            {{ languageStore.currentLanguage === 'zh-CN' ? 'English' : '中文' }}
+          </button>
+          <router-link
+            to="/"
+            class="nav-link home-btn"
+          >
+            <el-icon><HomeFilled /></el-icon>
+            {{ t('common.backToHome') }}
+          </router-link>
+        </nav>
+      </div>
+    </header>
+
+    <!-- 注册被禁用的提示 -->
+    <div
+      v-if="!registrationEnabled"
+      class="registration-disabled"
+    >
+      <el-card>
+        <div class="disabled-content">
+          <el-icon
+            size="60"
+            color="var(--warning-color)"
+          >
+            <Warning />
+          </el-icon>
+          <h2>{{ t('register.disabled.title') }}</h2>
+          <p>{{ t('register.disabled.message') }}</p>
+          <el-button
+            type="primary"
+            @click="router.push('/login')"
+          >
+            {{ t('register.disabled.backToLogin') }}
+          </el-button>
+        </div>
+      </el-card>
+    </div>
+
+    <!-- 正常注册表单 -->
+    <div
+      v-else
+      class="register-form"
+    >
+      <div class="register-header">
+        <h2>{{ t('register.title') }}</h2>
+        <p>{{ t('register.subtitle') }}</p>
+      </div>
+
+      <el-form 
+        ref="registerFormRef"
+        :model="registerForm"
+        :rules="registerRules"
+        :label-width="locale === 'en-US' ? '140px' : '80px'"
+        size="large"
+      >
+        <el-form-item
+          :label="t('register.username')"
+          prop="username"
+        >
+          <el-input 
+            v-model="registerForm.username"
+            :placeholder="t('register.pleaseEnterUsername')"
+          />
+        </el-form-item>
+
+        <el-form-item
+          :label="t('register.password')"
+          prop="password"
+        >
+          <el-input 
+            v-model="registerForm.password"
+            type="password"
+            :placeholder="t('register.pleaseEnterPassword')"
+            show-password
+          />
+          <div class="password-hint">
+            <el-text
+              size="small"
+              type="info"
+            >
+              {{ t('register.passwordHint') }}
+            </el-text>
+          </div>
+        </el-form-item>
+
+        <el-form-item
+          :label="t('register.confirmPassword')"
+          prop="confirmPassword"
+        >
+          <el-input 
+            v-model="registerForm.confirmPassword"
+            type="password"
+            :placeholder="t('register.pleaseConfirmPassword')"
+            show-password
+          />
+        </el-form-item>
+
+        <el-form-item
+          v-if="captchaEnabled"
+          :label="t('register.captcha')"
+          prop="captcha"
+        >
+          <div class="captcha-container">
+            <el-input 
+              v-model="registerForm.captcha"
+              :placeholder="t('register.pleaseEnterCaptcha')"
+              style="width: 60%"
+            />
+            <div
+              class="captcha-image"
+              @click="refreshCaptcha"
+            >
+              <img
+                v-if="captchaImage"
+                :src="captchaImage"
+                :alt="t('login.captchaAlt')"
+              >
+              <div
+                v-else
+                class="captcha-loading"
+              >
+                {{ t('common.loading') }}
+              </div>
+            </div>
+          </div>
+        </el-form-item>
+
+        <el-form-item
+          v-if="showInviteCode"
+          :label="t('register.inviteCode')"
+          prop="inviteCode"
+        >
+          <el-input 
+            v-model="registerForm.inviteCode"
+            :placeholder="t('register.pleaseEnterInviteCode')"
+          />
+        </el-form-item>
+
+        <el-form-item>
+          <el-button 
+            type="primary" 
+            :loading="loading" 
+            style="width: 100%;"
+            @click="handleRegister"
+          >
+            {{ t('register.registerButton') }}
+          </el-button>
+        </el-form-item>
+
+        <div class="form-footer">
+          <p>
+            {{ t('register.hasAccount') }}<router-link to="/login">
+              {{ t('register.loginNow') }}
+            </router-link>
+          </p>
+        </div>
+      </el-form>
+    </div>
+    <AppFooter />
+  </div>
+</template>
+
+<script setup>
+import { ref, reactive, onMounted, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { getCaptcha, register } from '@/api/auth'
+import { getRegisterConfig } from '@/api/config'
+import { useErrorHandler } from '@/composables/useErrorHandler'
+import { Warning, Operation, HomeFilled, Sunny, Moon } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { useLanguageStore } from '@/pinia/modules/language'
+import { useThemeStore } from '@/pinia/modules/theme'
+import { useSiteStore } from '@/pinia/modules/site'
+import { containsUnsafeUsernameContent } from '@/utils/validate'
+import AppFooter from '@/view/layout/components/AppFooter.vue'
+
+const router = useRouter()
+const { t, locale } = useI18n()
+const { executeAsync, handleSubmit } = useErrorHandler()
+const languageStore = useLanguageStore()
+const themeStore = useThemeStore()
+const siteStore = useSiteStore()
+const registerFormRef = ref()
+const loading = ref(false)
+const showInviteCode = ref(false)
+const inviteCodeRequired = ref(false)
+const captchaImage = ref('')
+const captchaEnabled = ref(false)
+const registrationEnabled = ref(true)
+
+const registerForm = reactive({
+  username: '',
+  password: '',
+  confirmPassword: '',
+  captcha: '',
+  captchaId: '',
+  inviteCode: '',
+  registerType: 'normal'
+})
+
+const validateConfirmPassword = (rule, value, callback) => {
+  if (value !== registerForm.password) {
+    callback(new Error(t('register.passwordMismatch')))
+  } else {
+    callback()
+  }
+}
+
+const validateInviteCode = (rule, value, callback) => {
+  if (inviteCodeRequired.value && (!value || value.trim() === '')) {
+    callback(new Error(t('register.pleaseEnterInviteCode')))
+  } else {
+    callback()
+  }
+}
+
+const validateUsernameSafety = (rule, value, callback) => {
+  if (!value) {
+    callback()
+    return
+  }
+
+  if (containsUnsafeUsernameContent(value)) {
+    callback(new Error(t('validation.usernameUnsafe')))
+    return
+  }
+
+  callback()
+}
+
+const registerRules = computed(() => ({
+  username: [
+    { required: true, message: t('register.pleaseEnterUsername'), trigger: 'blur' },
+    { min: 3, max: 20, message: t('validation.usernameLength', { min: 3, max: 20 }), trigger: 'blur' },
+    { validator: validateUsernameSafety, trigger: 'blur' }
+  ],
+  password: [
+    { required: true, message: t('register.pleaseEnterPassword'), trigger: 'blur' },
+    { min: 8, message: t('validation.passwordLength'), trigger: 'blur' }
+  ],
+  confirmPassword: [
+    { required: true, message: t('register.pleaseConfirmPassword'), trigger: 'blur' },
+    { validator: validateConfirmPassword, trigger: 'blur' }
+  ],
+  ...(captchaEnabled.value ? {
+    captcha: [
+      { required: true, message: t('register.pleaseEnterCaptcha'), trigger: 'blur' }
+    ]
+  } : {}),
+  inviteCode: [
+    { validator: validateInviteCode, trigger: 'blur' }
+  ]
+}))
+
+const refreshCaptcha = async () => {
+  if (!captchaEnabled.value) {
+    captchaImage.value = ''
+    registerForm.captchaId = ''
+    registerForm.captcha = ''
+    return
+  }
+
+  await executeAsync(async () => {
+    const response = await getCaptcha()
+    captchaImage.value = response.data.imageData
+    registerForm.captchaId = response.data.captchaId
+    registerForm.captcha = ''
+  }, {
+    showError: false, // 静默处理验证码错误
+    showLoading: false
+  })
+}
+
+const handleRegister = async () => {
+  if (!registerFormRef.value) return
+  
+  // 防止重复提交
+  if (loading.value) return
+
+  await registerFormRef.value.validate(async (valid) => {
+    if (!valid) return
+    
+    // 再次检查loading状态，防止表单验证期间的重复点击
+    if (loading.value) return
+
+    loading.value = true
+    try {
+      const result = await handleSubmit(async () => {
+        return await register({
+          username: registerForm.username,
+          password: registerForm.password,
+          ...(captchaEnabled.value ? {
+            captcha: registerForm.captcha,
+            captchaId: registerForm.captchaId
+          } : {}),
+          inviteCode: showInviteCode.value ? registerForm.inviteCode : undefined,
+          registerType: registerForm.registerType
+        })
+      }, {
+        successMessage: t('register.registerSuccess'),
+        showLoading: false // 使用组件自己的loading
+      })
+
+      if (result.success && result.data) {
+        // 注册成功，直接设置用户登录状态
+        // 兼容不同的响应结构：result.data.data 或 result.data
+        const responseData = result.data.data || result.data
+        
+        // 检查是否有token和user数据
+        const hasToken = responseData && (responseData.token || responseData.accessToken)
+        const hasUser = responseData && responseData.user
+        
+        if (hasToken && hasUser) {
+          // 导入用户store
+          const { useUserStore } = await import('@/pinia/modules/user')
+          const userStore = useUserStore()
+          
+          // 获取token（兼容不同字段名）
+          const token = responseData.token || responseData.accessToken
+          
+          // 设置用户登录状态
+          userStore.setToken(token)
+          userStore.setUser(responseData.user)
+          
+          // 保存token到localStorage和sessionStorage
+          localStorage.setItem('token', token)
+          sessionStorage.setItem('token', token)
+          
+          // 获取用户信息确保完整性
+          try {
+            await userStore.fetchUserInfo()
+          } catch (err) {
+            console.warn('获取用户详细信息失败，但仍然跳转:', err)
+          }
+          
+          // 根据用户类型跳转到对应的dashboard
+          const userType = responseData.user.userType || 'user'
+          if (userType === 'admin') {
+            router.push('/admin/dashboard')
+          } else {
+            router.push('/user/dashboard')
+          }
+        } else {
+          console.error('注册响应数据不完整. hasToken:', hasToken, 'hasUser:', hasUser, 'responseData:', responseData, 'result.data:', result.data)
+          if (captchaEnabled.value) {
+            refreshCaptcha()
+          }
+        }
+      } else {
+        console.error('注册失败. result.success:', result.success, 'result.data:', result.data)
+        if (captchaEnabled.value) {
+          refreshCaptcha() // 注册失败刷新验证码
+        }
+      }
+    } finally {
+      loading.value = false
+    }
+  })
+}
+
+const checkRegistrationEnabled = async () => {
+  const result = await executeAsync(async () => {
+    const response = await getRegisterConfig()
+    const config = response.data
+    
+    // 新逻辑：如果启用公开注册，或者启用邀请码系统但不强制要求邀请码
+    const enablePublicRegistration = config.auth?.enablePublicRegistration ?? false
+    const inviteCodeEnabled = config.inviteCode?.enabled ?? false
+    
+    // 如果启用公开注册，或者启用了邀请码系统，则允许注册
+    const canRegister = enablePublicRegistration || inviteCodeEnabled
+    
+    // 显示邀请码输入框的条件：启用了邀请码系统
+    showInviteCode.value = inviteCodeEnabled
+    
+    // 邀请码必填的条件：启用邀请码系统且未启用公开注册
+    inviteCodeRequired.value = inviteCodeEnabled && !enablePublicRegistration
+    
+    // 验证码开关
+    captchaEnabled.value = config.captchaEnabled || false
+    
+    return canRegister
+  }, {
+    showError: false, // 不显示错误消息
+    showLoading: false
+  })
+  
+  // 如果成功获取配置，使用返回的值；否则默认允许注册
+  registrationEnabled.value = result.success ? result.data : true
+}
+
+// 切换语言
+const switchLanguage = () => {
+  const newLang = languageStore.toggleLanguage()
+  locale.value = newLang
+  ElMessage.success(t('navbar.languageSwitched'))
+}
+
+const toggleTheme = () => {
+  themeStore.toggleTheme()
+}
+
+onMounted(async () => {
+  await checkRegistrationEnabled()
+  if (registrationEnabled.value && captchaEnabled.value) {
+    refreshCaptcha()
+  }
+})
+</script>
+
+<style scoped>
+.register-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--auth-page-bg);
+}
+
+/* 顶部栏样式 */
+.auth-header {
+  background: var(--auth-header-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: var(--box-shadow-light);
+  border-bottom: 1px solid var(--border-color);
+  padding-top: env(safe-area-inset-top);
+}
+
+.header-content {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  min-height: 60px;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-image {
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+}
+
+.logo h1 {
+  font-size: 24px;
+  color: var(--primary-color);
+  margin: 0;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.nav-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.nav-link.theme-btn {
+  padding: 8px 10px;
+  min-width: 38px;
+  justify-content: center;
+}
+
+.nav-link {
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border-radius: 22px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-color-primary);
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.nav-link:hover {
+  background: var(--primary-color-bg-hover);
+  color: var(--accent-text-color);
+  transform: translateY(-2px);
+}
+
+.nav-link.home-btn {
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  color: white;
+  border: none;
+  box-shadow: 0 4px 15px var(--primary-color-shadow);
+}
+
+.nav-link.home-btn:hover {
+  background: linear-gradient(135deg, var(--primary-color-dark), var(--primary-color));
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px var(--primary-color-shadow-hover);
+}
+
+.register-form {
+  margin: 32px auto;
+  width: min(500px, calc(100% - 32px));
+  padding: 36px 38px;
+  background: var(--card-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: 20px;
+  box-shadow: var(--box-shadow-heavy);
+  border: 1px solid var(--border-color);
+}
+
+.registration-disabled {
+  width: min(500px, calc(100% - 32px));
+  margin: 32px auto;
+}
+
+.registration-disabled :deep(.el-card) {
+  background: var(--card-bg);
+  border-color: var(--border-color);
+  box-shadow: var(--box-shadow-heavy);
+}
+
+.disabled-content {
+  text-align: center;
+  padding: 40px;
+}
+
+.disabled-content h2 {
+  color: var(--warning-color);
+  margin: 20px 0;
+  font-size: 24px;
+}
+
+.disabled-content p {
+  color: var(--text-color-secondary);
+  margin-bottom: 30px;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.register-header {
+  text-align: center;
+  margin-bottom: 30px;
+}
+
+.register-header h2 {
+  font-size: 26px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  background: linear-gradient(135deg, var(--primary-color), var(--primary-color-light));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.register-header p {
+  font-size: 14px;
+  color: var(--text-color-secondary);
+}
+
+.form-footer {
+  text-align: center;
+  margin-top: 20px;
+  color: var(--text-color-secondary);
+}
+
+.form-footer a {
+  color: var(--accent-text-color);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.form-footer a:hover {
+  color: var(--accent-text-color-hover);
+}
+
+.captcha-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.captcha-image {
+  width: 38%;
+  height: 40px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.captcha-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.captcha-loading {
+  font-size: 12px;
+  color: var(--text-color-tertiary);
+}
+
+.password-hint {
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+@media (max-width: 768px) {
+  .header-content {
+    min-height: 56px;
+    padding: 8px 16px;
+    gap: 10px;
+  }
+
+  .logo {
+    gap: 8px;
+  }
+
+  .logo-image {
+    width: 38px;
+    height: 38px;
+  }
+
+  .logo h1 {
+    font-size: 21px;
+  }
+
+  .nav-actions {
+    gap: 6px;
+  }
+
+  .nav-link {
+    padding: 8px 10px;
+    font-size: 14px;
+  }
+
+  .register-form {
+    width: calc(100% - 24px);
+    margin: 24px auto;
+    padding: 24px;
+  }
+
+  .registration-disabled {
+    width: calc(100% - 24px);
+    margin: 24px auto;
+  }
+
+  .register-form :deep(.el-form-item) {
+    display: block;
+  }
+
+  .register-form :deep(.el-form-item__label) {
+    width: 100% !important;
+    justify-content: flex-start;
+    margin-bottom: 6px;
+  }
+
+  .register-form :deep(.el-form-item__content) {
+    margin-left: 0 !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .header-content {
+    justify-content: center;
+    padding: 8px 12px;
+  }
+
+  .logo {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .logo-image {
+    width: 34px;
+    height: 34px;
+  }
+
+  .logo h1 {
+    font-size: 20px;
+  }
+
+  .nav-actions {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .nav-link {
+    padding: 7px 9px;
+    font-size: 13px;
+    border-radius: 18px;
+  }
+
+  .register-form {
+    padding: 22px 18px;
+  }
+}
+</style>
