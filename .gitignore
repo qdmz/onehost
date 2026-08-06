@@ -41,3 +41,9 @@ oneclickvirt-linux-amd64
 # 本地部署脚本（含服务器凭据，禁止提交）
 deploy/deploy.py
 deploy/rexec.py
+deploy/deploy_dist.py
+deploy/verify.py
+deploy/switch_db.awk
+# 前端构建临时产物
+web/dist.old.*/
+web/dist.upload.*.tar.gz

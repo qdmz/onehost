@@ -46,10 +46,13 @@ function stringifyResponseData(data) {
 function createNormalizedError(errorInfo, response, originalError) {
   const displayMessage = errorInfo.details || errorInfo.message
   const rawResponseText = stringifyResponseData(response?.data)
+  // fullMessage 仅用于调试排查（控制台 / 显式读取 error.fullMessage），
+  // 不能作为 Error.message，否则各页面 ElMessage.error(err.message) 会把
+  // 原始 JSON 响应体直接弹给用户，例如 “参数错误 {"code":400,...}”。
   const fullMessage = rawResponseText && rawResponseText !== displayMessage
     ? `${displayMessage || '请求失败'}\n${rawResponseText}`
     : (displayMessage || rawResponseText || '请求失败')
-  const normalizedError = new Error(fullMessage)
+  const normalizedError = new Error(displayMessage || '请求失败')
   normalizedError.code = errorInfo.code
   normalizedError.status = response?.status
   normalizedError.details = errorInfo.details

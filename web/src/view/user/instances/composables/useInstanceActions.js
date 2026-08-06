@@ -34,7 +34,8 @@ export function useInstanceActions(instance, monitoring, loadInstanceDetail, sha
   const showTrafficDetail = ref(false)
 
   const getErrorMessage = (error, fallback) => {
-    return error?.fullMessage || error?.userMessage || error?.message || fallback
+    // 优先展示可读信息；fullMessage 含原始 JSON 响应体，仅供调试，不直接展示给用户
+    return error?.userMessage || error?.details || error?.message || fallback
   }
 
   const getTrafficOperationLockMessage = () => {
