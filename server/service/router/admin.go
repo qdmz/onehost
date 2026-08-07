@@ -48,6 +48,8 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		NormalAdminGroup.PUT("/snapshot-schedules/:id", admin.UpdateSnapshotSchedule)
 		NormalAdminGroup.DELETE("/snapshot-schedules/:id", admin.DeleteSnapshotSchedule)
 		NormalAdminGroup.GET("/instances/:id/ssh", admin.AdminSSHWebSocket)
+		NormalAdminGroup.GET("/instances/:id/vnc", admin.AdminInstanceVNCInfo)
+		NormalAdminGroup.GET("/instances/:id/vnc/ws", admin.AdminInstanceVNCWebSocket)
 		NormalAdminGroup.GET("/instances/:id/sftp/list", admin.AdminInstanceSFTPList)
 		NormalAdminGroup.GET("/instances/:id/sftp/download", admin.AdminInstanceSFTPDownload)
 		NormalAdminGroup.POST("/instances/:id/sftp/upload", admin.AdminInstanceSFTPUpload)

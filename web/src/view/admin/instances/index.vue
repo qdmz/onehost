@@ -597,6 +597,16 @@
           <el-icon><RefreshRight /></el-icon>
           {{ $t('admin.instances.resetSystem') }}
         </el-button>
+        <el-button
+          type="success"
+          :disabled="isInstanceBusy(actionInstance) || actionInstance.status !== 'running'"
+          :loading="actionLoading"
+          style="width: 100%; margin-bottom: 10px;"
+          @click="performAction('vnc')"
+        >
+          <el-icon><Monitor /></el-icon>
+          {{ $t('admin.instances.vncConsole') || 'VNC控制台' }}
+        </el-button>
         <el-divider />
         <el-button
           type="info"
@@ -605,6 +615,14 @@
           @click="performAction('setExpiry')"
         >
           {{ $t('admin.instances.setExpiry') }}
+        </el-button>
+        <el-button
+          type="primary"
+          :disabled="isInstanceBusy(actionInstance)"
+          style="width: 100%; margin-bottom: 10px;"
+          @click="performAction('renew')"
+        >
+          {{ $t('admin.instances.renew') || '续期' }}
         </el-button>
         <el-button
           v-if="!actionInstance.isFrozen"
@@ -682,6 +700,48 @@
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- 重装系统镜像选择对话框 -->
+    <el-dialog
+      v-model="resetImageDialogVisible"
+      :title="$t('admin.instances.selectImage') || '选择系统镜像'"
+      width="500px"
+    >
+      <div v-loading="loadingResetImages">
+        <el-select
+          v-model="selectedResetImage"
+          :placeholder="$t('admin.instances.selectImage') || '请选择系统镜像'"
+          style="width: 100%"
+        >
+          <el-option
+            v-for="img in resetImageList"
+            :key="img.id"
+            :label="img.name"
+            :value="img.url || img.name"
+          />
+        </el-select>
+      </div>
+      <template #footer>
+        <el-button @click="resetImageDialogVisible = false">
+          {{ $t('common.cancel') }}
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="actionLoading"
+          @click="confirmResetWithImage"
+        >
+          {{ $t('admin.instances.confirmReset') || '确认重装' }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- VNC 控制台对话框 -->
+    <VNCDialog
+      v-model="vncDialogVisible"
+      :instance-id="vncInstanceId"
+      :instance-name="vncInstanceName"
+      admin-mode
+    />
   </div>
 </template>
 
@@ -694,9 +754,11 @@ import {
   RefreshRight, 
   Lock, 
   Delete,
-  Link
+  Link,
+  Monitor
 } from '@element-plus/icons-vue'
 import { useInstanceManagement } from './composables/useInstanceManagement'
+import VNCDialog from '@/components/VNCDialog.vue'
 
 const {
   instances, loading, detailDialogVisible, actionDialogVisible,
@@ -709,7 +771,9 @@ const {
   isExpired, isExpiringSoon, openSSHTerminal,
   handleSelectionChange, batchDeleteInstances, batchStartInstances, batchStopInstances,
   showTransferDialog, confirmTransfer, handleWindowResize,
-  searchUsers, searchingUsers, userOptions, canOpenInstanceDetail, isInstanceBusy, createShareLink
+  searchUsers, searchingUsers, userOptions, canOpenInstanceDetail, isInstanceBusy, createShareLink,
+  resetImageDialogVisible, resetImageList, selectedResetImage, loadingResetImages, confirmResetWithImage,
+  vncDialogVisible, vncInstanceId, vncInstanceName
 } = useInstanceManagement()
 
 onMounted(() => {

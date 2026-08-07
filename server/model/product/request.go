@@ -90,6 +90,8 @@ type CreateProductRequest struct {
 	PeriodValue int     `json:"periodValue" binding:"required,min=1"` // 周期值
 	MaxSnapshots int    `json:"maxSnapshots" binding:"min=0"`         // 最大快照数
 	MaxPorts    int     `json:"maxPorts" binding:"min=0"`             // 最大端口映射数
+	Stock       int     `json:"stock"`                                // 库存数量，-1为不限
+	MaxPerUser  int     `json:"maxPerUser"`                           // 每人限购数量，0为不限
 	Status      int     `json:"status" binding:"oneof=0 1"`           // 状态
 	SortOrder   int     `json:"sortOrder"`                              // 排序
 	Icon        string  `json:"icon" binding:"max=256"`               // 图标URL
@@ -113,6 +115,8 @@ type UpdateProductRequest struct {
 	PeriodValue  int     `json:"periodValue" binding:"required,min=1"`
 	MaxSnapshots int     `json:"maxSnapshots" binding:"min=0"`
 	MaxPorts     int     `json:"maxPorts" binding:"min=0"`
+	Stock        int     `json:"stock"`           // 库存数量，-1为不限
+	MaxPerUser   int     `json:"maxPerUser"`      // 每人限购数量，0为不限
 	Status       int     `json:"status" binding:"oneof=0 1"`
 	SortOrder    int     `json:"sortOrder"`
 	Icon         string  `json:"icon" binding:"max=256"`

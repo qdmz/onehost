@@ -153,5 +153,9 @@ export default {
   shareLinkCopied: "分享链接已复制",
   shareLinkCreateFailed: "创建分享链接失败",
   shareLinkTip: "点击链接区域可全选；也可以点击复制按钮",
-  acceleratorConfig: "加速设备配置"
+  acceleratorConfig: "加速设备配置",
+  vncConsole: "VNC控制台",
+  renew: "续期",
+  selectImage: "选择系统镜像",
+  confirmReset: "确认重装"
 }

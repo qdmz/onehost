@@ -242,7 +242,7 @@ func (s *Service) ClaimResource(userID uint, req userModel.ClaimResourceRequest)
 			ReservedContainers int64
 			ReservedVMs        int64
 		}
-		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Model(&resourceModel.ResourceReservation{}).
 			Select("COALESCE(SUM(CASE WHEN instance_type = 'vm' THEN 0 ELSE 1 END), 0) AS reserved_containers, COALESCE(SUM(CASE WHEN instance_type = 'vm' THEN 1 ELSE 0 END), 0) AS reserved_vms").
 			Where("provider_id = ? AND expires_at > ?", provider.ID, time.Now()).

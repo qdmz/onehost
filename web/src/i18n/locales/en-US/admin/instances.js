@@ -153,5 +153,9 @@ export default {
   shareLinkCopied: "Share link copied",
   shareLinkCreateFailed: "Failed to create share link",
   shareLinkTip: "Click the link area to select all, or use the Copy button",
-  acceleratorConfig: "Accelerator Config"
+  acceleratorConfig: "Accelerator Config",
+  vncConsole: "VNC Console",
+  renew: "Renew",
+  selectImage: "Select System Image",
+  confirmReset: "Confirm Reset"
 }

@@ -31,11 +31,13 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import RFB from '@novnc/novnc/lib/rfb.js'
 import { getUserInstanceVNCInfo, getUserInstanceVNCWsUrl } from '@/api/user'
+import { getAdminInstanceVNCInfo, getAdminInstanceVNCWsUrl } from '@/api/admin/instances'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   instanceId: { type: [Number, String], required: true },
-  instanceName: { type: String, default: '' }
+  instanceName: { type: String, default: '' },
+  adminMode: { type: Boolean, default: false }
 })
 
 const emit = defineEmits(['update:modelValue'])
@@ -92,14 +94,19 @@ async function connect() {
   status.value = 'connecting'
   statusMessage.value = ''
   try {
-    const res = await getUserInstanceVNCInfo(props.instanceId)
-    const info = res.data || {}
+    const vncInfo = props.adminMode
+      ? await getAdminInstanceVNCInfo(props.instanceId)
+      : await getUserInstanceVNCInfo(props.instanceId)
+    const info = vncInfo.data || {}
     if (!info.enabled) {
       status.value = 'error'
       statusMessage.value = info.reason || t('user.instanceDetail.vncUnavailable')
       return
     }
-    const client = new RFB(screenRef.value, getUserInstanceVNCWsUrl(props.instanceId))
+    const wsUrl = props.adminMode
+      ? getAdminInstanceVNCWsUrl(props.instanceId)
+      : getUserInstanceVNCWsUrl(props.instanceId)
+    const client = new RFB(screenRef.value, wsUrl)
     client.scaleViewport = true
     client.resizeSession = false
     client.clipViewport = true

@@ -190,6 +190,21 @@
         <el-form-item :label="t('admin.products.providerIds')" prop="providerIds">
           <el-input v-model="form.providerIds" :placeholder="t('admin.products.providerIdsPlaceholder')" />
         </el-form-item>
+
+        <el-row :gutter="20">
+          <el-col :span="12">
+            <el-form-item :label="t('admin.products.stock')" prop="stock">
+              <el-input-number v-model="form.stock" :min="-1" :step="1" />
+              <div style="color: #999; font-size: 12px;">{{ t('admin.products.stockHint') }}</div>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item :label="t('admin.products.maxPerUser')" prop="maxPerUser">
+              <el-input-number v-model="form.maxPerUser" :min="0" :step="1" />
+              <div style="color: #999; font-size: 12px;">{{ t('admin.products.maxPerUserHint') }}</div>
+            </el-form-item>
+          </el-col>
+        </el-row>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
@@ -237,7 +252,9 @@ const form = ref({
   periodType: 'month',
   periodValue: 1,
   providerIds: '',
-  imageIds: ''
+  imageIds: '',
+  stock: -1,
+  maxPerUser: 0
 })
 
 const formRules = {
@@ -327,7 +344,9 @@ const handleAdd = () => {
     periodType: 'month',
     periodValue: 1,
     providerIds: '',
-    imageIds: ''
+    imageIds: '',
+    stock: -1,
+    maxPerUser: 0
   }
   dialogVisible.value = true
 }
@@ -340,7 +359,9 @@ const handleEdit = (row) => {
     category: row.category || '',
     periodType: row.periodType || 'month',
     periodValue: row.periodValue || 1,
-    providerIds: row.providerIds || ''
+    providerIds: row.providerIds || '',
+    stock: row.stock !== undefined && row.stock !== null ? row.stock : -1,
+    maxPerUser: row.maxPerUser !== undefined && row.maxPerUser !== null ? row.maxPerUser : 0
   }
   dialogVisible.value = true
 }

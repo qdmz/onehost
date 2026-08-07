@@ -226,7 +226,7 @@ func (s *QuotaService) getCurrentResourceUsageWithPending(tx *gorm.DB, userID ui
 
 	// 稳定状态：running、stopped、error
 	var stableUsage quotaUsageAggregate
-	err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Model(&provider.Instance{}).
 		Select("COUNT(*) AS count, COALESCE(SUM(cpu), 0) AS cpu, COALESCE(SUM(memory), 0) AS memory, COALESCE(SUM(disk), 0) AS disk, COALESCE(SUM(bandwidth), 0) AS bandwidth").
 		Where("user_id = ? AND deleted_at IS NULL AND status IN (?)", userID, stableStatuses).
@@ -237,7 +237,7 @@ func (s *QuotaService) getCurrentResourceUsageWithPending(tx *gorm.DB, userID ui
 
 	// 待确认状态：creating、resetting
 	var pendingUsage quotaUsageAggregate
-	err = tx.Clauses(clause.Locking{Strength: "SHARE"}).
+	err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Model(&provider.Instance{}).
 		Select("COUNT(*) AS count, COALESCE(SUM(cpu), 0) AS cpu, COALESCE(SUM(memory), 0) AS memory, COALESCE(SUM(disk), 0) AS disk, COALESCE(SUM(bandwidth), 0) AS bandwidth").
 		Where("user_id = ? AND deleted_at IS NULL AND status IN (?)", userID, transitionalStatuses).
@@ -248,7 +248,7 @@ func (s *QuotaService) getCurrentResourceUsageWithPending(tx *gorm.DB, userID ui
 
 	// 活跃预留也会在稍后生成实例，必须计入待确认配额，避免并发超配。
 	var reservationUsage quotaUsageAggregate
-	err = tx.Clauses(clause.Locking{Strength: "SHARE"}).
+	err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Model(&resource.ResourceReservation{}).
 		Select("COUNT(*) AS count, COALESCE(SUM(cpu), 0) AS cpu, COALESCE(SUM(memory), 0) AS memory, COALESCE(SUM(disk), 0) AS disk, COALESCE(SUM(bandwidth), 0) AS bandwidth").
 		Where("user_id = ? AND expires_at > ?", userID, time.Now()).
@@ -281,8 +281,8 @@ func (s *QuotaService) getCurrentResourceUsageWithPending(tx *gorm.DB, userID ui
 func (s *QuotaService) getCurrentProviderInstanceCount(tx *gorm.DB, userID uint, providerID uint) (int, error) {
 	var count int64
 
-	// 使用 FOR SHARE 共享锁，防止幻读。创建中/重置中实例和活跃预留都要计入。
-	err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+	// 使用 FOR UPDATE 排他锁，防止幻读。创建中/重置中实例和活跃预留都要计入。
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Model(&provider.Instance{}).
 		Where("user_id = ? AND provider_id = ? AND deleted_at IS NULL AND status NOT IN (?)",
 			userID, providerID, constant.GetTerminalStatuses()).
@@ -293,7 +293,7 @@ func (s *QuotaService) getCurrentProviderInstanceCount(tx *gorm.DB, userID uint,
 	}
 
 	var reservedCount int64
-	if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Model(&resource.ResourceReservation{}).
 		Where("user_id = ? AND provider_id = ? AND expires_at > ?", userID, providerID, time.Now()).
 		Count(&reservedCount).Error; err != nil {

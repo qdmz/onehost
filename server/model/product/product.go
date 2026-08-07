@@ -34,6 +34,10 @@ type Product struct {
 	MaxSnapshots int `json:"maxSnapshots" gorm:"default:1"`  // 最大快照数
 	MaxPorts     int `json:"maxPorts" gorm:"default:0"`      // 最大端口映射数(0=不限)
 
+	// 库存与限购配置
+	Stock      int `json:"stock" gorm:"default:-1"` // 库存数量，-1为不限
+	MaxPerUser int `json:"maxPerUser" gorm:"default:0"` // 每人限购数量，0为不限
+
 	// 状态
 	Status      int    `json:"status" gorm:"default:1;index"`  // 0=下架 1=上架
 	SortOrder   int    `json:"sortOrder" gorm:"default:0"`      // 排序

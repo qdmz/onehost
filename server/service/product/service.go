@@ -143,6 +143,25 @@ func (s *Service) CreateOrder(userID uint, req productModel.CreateOrderRequest) 
 		return nil, common.NewError(common.CodeBadRequest, "该产品已下架")
 	}
 
+	// 检查库存：stock = -1 表示不限，stock <= 0 表示库存不足
+	if product.Stock != -1 && product.Stock <= 0 {
+		return nil, common.NewError(common.CodeBadRequest, "产品库存不足")
+	}
+
+	// 检查限购：max_per_user = 0 表示不限，否则查询用户已购买该产品的数量
+	if product.MaxPerUser > 0 {
+		var purchaseCount int64
+		if err := global.APP_DB.Model(&productModel.ProductOrder{}).
+			Where("user_id = ? AND product_id = ? AND is_renewal = ? AND payment_status = ?",
+				userID, req.ProductID, false, 1).
+			Count(&purchaseCount).Error; err != nil {
+			return nil, common.NewError(common.CodeDatabaseError, err.Error())
+		}
+		if purchaseCount >= int64(product.MaxPerUser) {
+			return nil, common.NewError(common.CodeBadRequest, "超过该产品的限购数量")
+		}
+	}
+
 	// 获取镜像信息
 	var image systemModel.SystemImage
 	if err := global.APP_DB.First(&image, req.ImageID).Error; err != nil {
@@ -303,6 +322,27 @@ func (s *Service) PayOrderWithBalance(userID uint, orderID uint) error {
 			"paid_at":        &now,
 		}).Error; err != nil {
 			return err
+		}
+
+		// 扣减产品库存（仅限非续费订单且库存有限时）
+		if !order.IsRenewal {
+			result := tx.Model(&productModel.Product{}).
+				Where("id = ? AND stock > 0", order.ProductID).
+				UpdateColumn("stock", gorm.Expr("stock - 1"))
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				// 库存可能为-1(不限)或<=0(不足)，需要判断
+				var checkProduct productModel.Product
+				if err := tx.Select("stock").First(&checkProduct, order.ProductID).Error; err != nil {
+					return err
+				}
+				if checkProduct.Stock != -1 {
+					return fmt.Errorf("产品库存不足")
+				}
+				// stock == -1 表示不限，无需扣减
+			}
 		}
 
 		// 记录余额变动日志
@@ -910,6 +950,8 @@ func (s *Service) CreateAdminProduct(req productModel.CreateProductRequest) (*pr
 		PeriodValue:  req.PeriodValue,
 		MaxSnapshots: req.MaxSnapshots,
 		MaxPorts:     req.MaxPorts,
+		Stock:        req.Stock,
+		MaxPerUser:   req.MaxPerUser,
 		Status:       req.Status,
 		SortOrder:    req.SortOrder,
 		Icon:         req.Icon,
@@ -949,6 +991,8 @@ func (s *Service) UpdateAdminProduct(productID uint, req productModel.UpdateProd
 		"period_value":  req.PeriodValue,
 		"max_snapshots": req.MaxSnapshots,
 		"max_ports":     req.MaxPorts,
+		"stock":         req.Stock,
+		"max_per_user":  req.MaxPerUser,
 		"status":        req.Status,
 		"sort_order":    req.SortOrder,
 		"icon":          req.Icon,

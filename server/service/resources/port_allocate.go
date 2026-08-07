@@ -175,7 +175,7 @@ func (s *PortMappingService) allocateHostPort(providerID uint, rangeStart, range
 		// 二次确认端口未被占用（使用 LOCK IN SHARE MODE 防止并发幻读）
 		// 不过滤status：unique index 在 (provider_id, host_port) 上，任何status的记录都占用该端口
 		var existingPort provider.Port
-		err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("provider_id = ? AND host_port <= ?", providerID, candidatePort).
 			Where("mapping_type IS NULL OR mapping_type = '' OR mapping_type <> 'controller'").
 			Where("CASE WHEN host_port_end > 0 THEN host_port_end WHEN port_count > 1 THEN host_port + port_count - 1 ELSE host_port END >= ?", candidatePort).

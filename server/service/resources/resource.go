@@ -213,7 +213,7 @@ type providerReservationAggregate struct {
 
 func (s *ResourceService) applyActiveReservationsInTx(tx *gorm.DB, provider *providerModel.Provider) error {
 	var aggregates []providerReservationAggregate
-	if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Model(&resource.ResourceReservation{}).
 		Select("instance_type, COUNT(*) AS count, COALESCE(SUM(cpu), 0) AS cpu, COALESCE(SUM(memory), 0) AS memory, COALESCE(SUM(disk), 0) AS disk").
 		Where("provider_id = ? AND expires_at > ?", provider.ID, time.Now()).
