@@ -759,6 +759,21 @@ func (s *Service) CreateYiPayOrder(userID uint, req productModel.CreateYiPayOrde
 			fmt.Sprintf("充值金额必须在 %.2f 到 %.2f 之间", config.MinAmount, config.MaxAmount))
 	}
 
+	// 验证支付方式是否启用
+	if config.EnabledPayTypes != "" {
+		enabledTypes := strings.Split(config.EnabledPayTypes, ",")
+		typeAllowed := false
+		for _, t := range enabledTypes {
+			if strings.TrimSpace(t) == req.PayType {
+				typeAllowed = true
+				break
+			}
+		}
+		if !typeAllowed {
+			return nil, common.NewError(common.CodeBadRequest, "该支付方式未启用")
+		}
+	}
+
 	// 生成充值订单号
 	rechargeNo := s.yiPayService.GenerateOrderNo()
 
@@ -957,6 +972,8 @@ func (s *Service) CreateAdminProduct(req productModel.CreateProductRequest) (*pr
 		Icon:         req.Icon,
 		ImageIDs:     req.ImageIDs,
 		ProviderIDs:  req.ProviderIDs,
+		DefaultProviderID: req.DefaultProviderID,
+		DefaultImageID:    req.DefaultImageID,
 	}
 
 	if err := global.APP_DB.Create(&product).Error; err != nil {
@@ -998,6 +1015,8 @@ func (s *Service) UpdateAdminProduct(productID uint, req productModel.UpdateProd
 		"icon":          req.Icon,
 		"image_ids":     req.ImageIDs,
 		"provider_ids":  req.ProviderIDs,
+		"default_provider_id": req.DefaultProviderID,
+		"default_image_id":    req.DefaultImageID,
 	}
 
 	if err := global.APP_DB.Model(&product).Updates(updates).Error; err != nil {

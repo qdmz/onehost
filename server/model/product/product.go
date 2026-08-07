@@ -48,6 +48,10 @@ type Product struct {
 
 	// 节点限制(逗号分隔的Provider ID列表,空则所有节点可用)
 	ProviderIDs string `json:"providerIds" gorm:"type:text"`
+
+	// 默认节点和默认镜像(用户购买时可预选)
+	DefaultProviderID uint `json:"defaultProviderId" gorm:"default:0"` // 默认节点ID(0=不指定)
+	DefaultImageID    uint `json:"defaultImageId" gorm:"default:0"`   // 默认镜像ID(0=不指定)
 }
 
 // ProductOrder 产品订单表
@@ -234,7 +238,10 @@ type YiPayConfig struct {
 	Key         string `json:"key" gorm:"size:256"`              // 商户密钥
 	NotifyURL   string `json:"notifyUrl" gorm:"size:512"`        // 异步通知地址
 	ReturnURL   string `json:"returnUrl" gorm:"size:512"`        // 同步跳转地址
-	PayType     string `json:"payType" gorm:"size:32;default:alipay"` // alipay/wxpay/qqpay
+	PayType     string `json:"payType" gorm:"size:32;default:alipay"` // alipay/wxpay/qqpay (默认支付方式)
+
+	// 启用的支付方式(逗号分隔,如 "alipay,wxpay,qqpay",空则全部启用)
+	EnabledPayTypes string `json:"enabledPayTypes" gorm:"size:128;default:alipay,wxpay,qqpay"`
 
 	// 费率配置
 	FeePercent  float64 `json:"feePercent" gorm:"default:0"`     // 手续费百分比

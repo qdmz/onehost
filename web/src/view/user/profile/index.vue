@@ -125,6 +125,45 @@
               name="password"
             >
               <div class="password-section">
+                <!-- 修改密码 -->
+                <div class="password-change-section" style="margin-bottom: 30px;">
+                  <h3>修改密码</h3>
+                  <el-form label-width="100px" style="max-width: 500px;">
+                    <el-form-item label="旧密码">
+                      <el-input
+                        v-model="changePasswordForm.oldPassword"
+                        type="password"
+                        show-password
+                        placeholder="请输入当前密码"
+                      />
+                    </el-form-item>
+                    <el-form-item label="新密码">
+                      <el-input
+                        v-model="changePasswordForm.newPassword"
+                        type="password"
+                        show-password
+                        placeholder="请输入新密码（至少6位）"
+                      />
+                    </el-form-item>
+                    <el-form-item label="确认密码">
+                      <el-input
+                        v-model="changePasswordForm.confirmPassword"
+                        type="password"
+                        show-password
+                        placeholder="请再次输入新密码"
+                      />
+                    </el-form-item>
+                    <el-form-item>
+                      <el-button
+                        type="primary"
+                        :loading="changingPassword"
+                        @click="handleChangePassword"
+                      >
+                        确认修改
+                      </el-button>
+                    </el-form-item>
+                  </el-form>
+                </div>
                 <!-- 自动重置密码 -->
                 <div class="password-reset-section">
                   <h3>{{ t('user.profile.autoResetPassword') }}</h3>
@@ -219,7 +258,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { copyToClipboard as copyToClipboardUtil } from '@/utils/clipboard'
 import { useUserStore } from '@/pinia/modules/user'
-import { updateProfile as updateProfileApi, resetPassword } from '@/api/user'
+import { updateProfile as updateProfileApi, resetPassword, changePassword } from '@/api/user'
 
 const { t } = useI18n()
 const userStore = useUserStore()
@@ -237,6 +276,14 @@ const resetPasswordLoading = ref(false)
 
 // 密码重置相关
 const generatedPassword = ref('')
+
+// 修改密码表单
+const changePasswordForm = reactive({
+  oldPassword: '',
+  newPassword: '',
+  confirmPassword: ''
+})
+const changingPassword = ref(false)
 
 // 个人信息表单
 const profileForm = reactive({
@@ -258,6 +305,14 @@ const profileRules = reactive({
     { pattern: /^1[3-9]\d{9}$/, message: () => t('user.profile.invalidPhoneFormat'), trigger: 'blur' }
   ]
 })
+
+const validateConfirmPassword = (rule, value, callback) => {
+  if (value !== changePasswordForm.newPassword) {
+    callback(new Error('两次输入的密码不一致'))
+  } else {
+    callback()
+  }
+}
 
 const getUserTypeTagType = () => {
   switch (userStore.userType) {
@@ -313,6 +368,41 @@ const updateProfile = async () => {
 
 const resetForm = () => {
   initForm()
+}
+
+const handleChangePassword = async () => {
+  if (!changePasswordForm.oldPassword || !changePasswordForm.newPassword) {
+    ElMessage.warning('请填写旧密码和新密码')
+    return
+  }
+  if (changePasswordForm.newPassword !== changePasswordForm.confirmPassword) {
+    ElMessage.warning('两次输入的密码不一致')
+    return
+  }
+  if (changePasswordForm.newPassword.length < 6) {
+    ElMessage.warning('新密码长度不能少于6位')
+    return
+  }
+
+  changingPassword.value = true
+  try {
+    const response = await changePassword({
+      oldPassword: changePasswordForm.oldPassword,
+      newPassword: changePasswordForm.newPassword
+    })
+    if (response.code === 200) {
+      ElMessage.success('密码修改成功')
+      changePasswordForm.oldPassword = ''
+      changePasswordForm.newPassword = ''
+      changePasswordForm.confirmPassword = ''
+    } else {
+      ElMessage.error(response.msg || '密码修改失败')
+    }
+  } catch (error) {
+    ElMessage.error(error?.message || '密码修改失败')
+  } finally {
+    changingPassword.value = false
+  }
 }
 
 // 确认密码重置

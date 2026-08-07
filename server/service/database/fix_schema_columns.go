@@ -123,5 +123,52 @@ func (ds *DatabaseService) FixSchemaColumns() error {
 		global.APP_LOG.Debug("users 表不存在，跳过用户等级修复（全新数据库）")
 	}
 
+	// === 5. 为 products 表添加 default_provider_id 和 default_image_id 列 ===
+	if db.Migrator().HasTable("products") {
+		columns, err := ds.getTableColumns(db, "products")
+		if err != nil {
+			return fmt.Errorf("获取 products 表列信息失败: %w", err)
+		}
+
+		// 添加 default_provider_id 列（默认节点ID）
+		if !columns["default_provider_id"] {
+			global.APP_LOG.Info("正在为 products 表添加 default_provider_id 列")
+			if _, err := sqlDB.Exec("ALTER TABLE `products` ADD COLUMN `default_provider_id` INT DEFAULT 0"); err != nil {
+				return fmt.Errorf("添加 products.default_provider_id 列失败: %w", err)
+			}
+			global.APP_LOG.Info("products.default_provider_id 列添加完成")
+		} else {
+			global.APP_LOG.Debug("products.default_provider_id 列已存在，跳过")
+		}
+
+		// 添加 default_image_id 列（默认镜像ID）
+		if !columns["default_image_id"] {
+			global.APP_LOG.Info("正在为 products 表添加 default_image_id 列")
+			if _, err := sqlDB.Exec("ALTER TABLE `products` ADD COLUMN `default_image_id` INT DEFAULT 0"); err != nil {
+				return fmt.Errorf("添加 products.default_image_id 列失败: %w", err)
+			}
+			global.APP_LOG.Info("products.default_image_id 列添加完成")
+		} else {
+			global.APP_LOG.Debug("products.default_image_id 列已存在，跳过")
+		}
+	}
+
+	// === 6. 为 yipay_configs 表添加 enabled_pay_types 列 ===
+	if db.Migrator().HasTable("yipay_configs") {
+		columns, err := ds.getTableColumns(db, "yipay_configs")
+		if err != nil {
+			global.APP_LOG.Warn("获取 yipay_configs 表列信息失败，跳过 enabled_pay_types 列添加", zap.Error(err))
+		} else if !columns["enabled_pay_types"] {
+			global.APP_LOG.Info("正在为 yipay_configs 表添加 enabled_pay_types 列")
+			if _, err := sqlDB.Exec("ALTER TABLE `yipay_configs` ADD COLUMN `enabled_pay_types` VARCHAR(128) DEFAULT 'alipay,wxpay,qqpay'"); err != nil {
+				global.APP_LOG.Warn("添加 yipay_configs.enabled_pay_types 列失败", zap.Error(err))
+			} else {
+				global.APP_LOG.Info("yipay_configs.enabled_pay_types 列添加完成")
+			}
+		} else {
+			global.APP_LOG.Debug("yipay_configs.enabled_pay_types 列已存在，跳过")
+		}
+	}
+
 	return nil
 }

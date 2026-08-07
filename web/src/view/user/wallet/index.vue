@@ -113,8 +113,9 @@
         <div class="pay-type-select">
           <span>{{ t('user.wallet.payType') }}:</span>
           <el-radio-group v-model="selectedPayType">
-            <el-radio label="alipay">{{ t('user.wallet.alipay') }}</el-radio>
-            <el-radio label="wxpay">{{ t('user.wallet.wxpay') }}</el-radio>
+            <el-radio v-if="enabledPayTypes.includes('alipay')" label="alipay">支付宝</el-radio>
+            <el-radio v-if="enabledPayTypes.includes('wxpay')" label="wxpay">微信支付</el-radio>
+            <el-radio v-if="enabledPayTypes.includes('qqpay')" label="qqpay">QQ钱包</el-radio>
           </el-radio-group>
         </div>
         <div class="recharge-summary">
@@ -138,6 +139,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import { getUserBalance, getBalanceLogs, createYiPayOrder } from '@/api/product'
+import request from '@/utils/request'
 
 const { t, locale } = useI18n()
 
@@ -152,6 +154,7 @@ const rechargeVisible = ref(false)
 const rechargeAmount = ref(50)
 const rechargeLoading = ref(false)
 const selectedPayType = ref('alipay')
+const enabledPayTypes = ref(['alipay', 'wxpay', 'qqpay']) // default to all
 
 const presetAmounts = [10, 30, 50, 100, 200, 500]
 
@@ -214,6 +217,25 @@ const handleSizeChange = (size) => {
   loadLogs()
 }
 
+// 加载启用的支付方式
+const loadEnabledPayTypes = async () => {
+  try {
+    const res = await request({
+      url: '/api/v1/public/site-config',
+      method: 'get'
+    })
+    if (res.code === 200 && res.data?.yipay_pay_types) {
+      enabledPayTypes.value = res.data.yipay_pay_types.split(',').map(t => t.trim()).filter(Boolean)
+      // 如果当前选中的支付方式不在启用列表中，则切换到第一个启用的方式
+      if (!enabledPayTypes.value.includes(selectedPayType.value) && enabledPayTypes.value.length > 0) {
+        selectedPayType.value = enabledPayTypes.value[0]
+      }
+    }
+  } catch (error) {
+    console.error('加载支付方式失败:', error)
+  }
+}
+
 // 充值
 const handleRecharge = async () => {
   if (!rechargeAmount.value || rechargeAmount.value < 1) {
@@ -243,6 +265,7 @@ const handleRecharge = async () => {
 onMounted(() => {
   loadBalance()
   loadLogs()
+  loadEnabledPayTypes()
 })
 </script>
 

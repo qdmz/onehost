@@ -21,6 +21,7 @@ func InitUserRouter(Router *gin.RouterGroup) {
 		// 用户管理
 		UserGroup.GET("/user/profile", user.GetUserInfo)
 		UserGroup.PUT("/user/profile", user.UpdateProfile)
+		UserGroup.PUT("/user/password", user.ChangePassword)
 		UserGroup.PUT("/user/reset-password", user.UserResetPassword)
 		UserGroup.GET("/user/info", user.GetUserInfo)
 		UserGroup.GET("/user/dashboard", user.GetUserDashboard)

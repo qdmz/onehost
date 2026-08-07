@@ -97,6 +97,8 @@ type CreateProductRequest struct {
 	Icon        string  `json:"icon" binding:"max=256"`               // 图标URL
 	ImageIDs    string  `json:"imageIds"`                               // 关联镜像ID列表
 	ProviderIDs string  `json:"providerIds"`                            // 节点限制
+	DefaultProviderID uint `json:"defaultProviderId"`                   // 默认节点ID(0=不指定)
+	DefaultImageID    uint `json:"defaultImageId"`                     // 默认镜像ID(0=不指定)
 }
 
 // UpdateProductRequest 更新产品请求
@@ -122,6 +124,8 @@ type UpdateProductRequest struct {
 	Icon         string  `json:"icon" binding:"max=256"`
 	ImageIDs     string  `json:"imageIds"`
 	ProviderIDs  string  `json:"providerIds"`
+	DefaultProviderID uint `json:"defaultProviderId"`   // 默认节点ID(0=不指定)
+	DefaultImageID    uint `json:"defaultImageId"`     // 默认镜像ID(0=不指定)
 }
 
 // UpdateProductStatusRequest 更新产品状态请求

@@ -61,12 +61,17 @@
             <span class="price-text">¥{{ row.price }}</span>
           </template>
         </el-table-column>
-        <el-table-column :label="t('admin.products.status')" width="100">
+        <el-table-column :label="t('admin.products.status')" width="130">
           <template #default="{ row }">
-            <el-switch
-              :model-value="row.status === 1"
-              @change="(val) => toggleStatus(row, val)"
-            />
+            <div class="status-cell">
+              <el-switch
+                :model-value="row.status === 1"
+                @change="(val) => toggleStatus(row, val)"
+              />
+              <el-tag size="small" :type="row.status === 1 ? 'success' : 'info'" style="margin-left: 8px;">
+                {{ row.status === 1 ? '已上架' : '已下架' }}
+              </el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column :label="t('admin.products.actions')" width="180" fixed="right">
@@ -99,7 +104,7 @@
     <el-dialog
       v-model="dialogVisible"
       :title="isEdit ? t('admin.products.editProduct') : t('admin.products.addProduct')"
-      width="700px"
+      width="800px"
       :close-on-click-modal="false"
     >
       <el-form
@@ -116,10 +121,13 @@
           </el-col>
           <el-col :span="12">
             <el-form-item :label="t('admin.products.type')" prop="type">
-              <el-select v-model="form.type" style="width: 100%;">
-                <el-option :label="t('admin.products.typeVM')" value="vm" />
-                <el-option :label="t('admin.products.typeContainer')" value="container" />
-                <el-option :label="t('admin.products.typeGPU')" value="gpu" />
+              <el-select v-model="form.type" style="width: 100%;" filterable allow-create default-first-option>
+                <el-option
+                  v-for="item in typeOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
               </el-select>
             </el-form-item>
           </el-col>
@@ -193,6 +201,35 @@
 
         <el-row :gutter="20">
           <el-col :span="12">
+            <el-form-item label="默认节点" prop="defaultProviderId">
+              <el-select v-model="form.defaultProviderId" style="width: 100%;" filterable>
+                <el-option label="无默认" :value="0" />
+                <el-option
+                  v-for="item in providerList"
+                  :key="item.id"
+                  :label="`${item.name}（${getTypeLabel(item.type)}）`"
+                  :value="item.id"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="默认镜像" prop="defaultImageId">
+              <el-select v-model="form.defaultImageId" style="width: 100%;" filterable>
+                <el-option label="无默认" :value="0" />
+                <el-option
+                  v-for="item in imageList"
+                  :key="item.id"
+                  :label="item.name"
+                  :value="item.id"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-row :gutter="20">
+          <el-col :span="12">
             <el-form-item :label="t('admin.products.stock')" prop="stock">
               <el-input-number v-model="form.stock" :min="-1" :step="1" />
               <div style="color: #999; font-size: 12px;">{{ t('admin.products.stockHint') }}</div>
@@ -217,12 +254,14 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search } from '@element-plus/icons-vue'
 import { formatMemorySize, formatDiskSize } from '@/utils/unit-formatter'
 import { getAdminProductList, createAdminProduct, updateAdminProduct, deleteAdminProduct, updateAdminProductStatus } from '@/api/admin'
+import { getSystemImages } from '@/api/user'
+import request from '@/utils/request'
 
 const { t } = useI18n()
 
@@ -237,6 +276,11 @@ const dialogVisible = ref(false)
 const isEdit = ref(false)
 const submitting = ref(false)
 const formRef = ref(null)
+
+// 节点(Provider)与镜像相关数据
+const providerList = ref([])
+const providerTypes = ref([])
+const imageList = ref([])
 
 const form = ref({
   name: '',
@@ -254,7 +298,9 @@ const form = ref({
   providerIds: '',
   imageIds: '',
   stock: -1,
-  maxPerUser: 0
+  maxPerUser: 0,
+  defaultProviderId: 0,
+  defaultImageId: 0
 })
 
 const formRules = {
@@ -274,11 +320,58 @@ const formatDisk = (disk) => formatDiskSize(disk)
 // 获取产品类型中文标签
 const getTypeLabel = (type) => {
   const typeMap = {
-    vm: t('admin.products.typeVM'),
-    container: t('admin.products.typeContainer'),
-    gpu: t('admin.products.typeGPU')
+    docker: 'Docker容器',
+    podman: 'Podman',
+    containerd: 'containerd',
+    orbstack: 'OrbStack',
+    lxd: 'LXD',
+    incus: 'Incus',
+    proxmox: 'Proxmox',
+    qemu: 'QEMU/KVM',
+    kubevirt: 'KubeVirt',
+    vmware: 'VMware',
+    vm: '虚拟机',
+    container: '容器',
+    gpu: 'GPU'
   }
   return typeMap[type] || type
+}
+
+// 类型下拉选项：合并动态节点类型与常见类型，去重后展示中文标签
+const COMMON_TYPES = ['vm', 'container', 'gpu', 'docker', 'lxd', 'incus', 'proxmox', 'qemu', 'kubevirt', 'vmware', 'podman', 'containerd', 'orbstack']
+const typeOptions = computed(() => {
+  const merged = [...providerTypes.value, ...COMMON_TYPES]
+  const unique = [...new Set(merged.map(t => String(t).toLowerCase()))]
+  return unique.map(type => ({ value: type, label: getTypeLabel(type) }))
+})
+
+// 加载节点(Provider)列表，并提取可用的虚拟化类型
+const loadProviders = async () => {
+  try {
+    const res = await request({ url: '/v1/admin/providers', method: 'get', params: { pageSize: 100 } })
+    if (res.code === 200) {
+      providerList.value = res.data?.list || res.data?.items || []
+      // 从节点列表中提取唯一的虚拟化类型
+      const types = [...new Set(providerList.value.map(p => p.type).filter(Boolean))]
+      providerTypes.value = types
+    }
+  } catch (error) {
+    console.error('加载节点列表失败:', error)
+    // 接口失败时使用常见类型作为兜底
+    providerTypes.value = ['docker', 'lxd', 'incus', 'qemu', 'kubevirt']
+  }
+}
+
+// 加载系统镜像列表
+const loadImages = async () => {
+  try {
+    const res = await getSystemImages()
+    if (res.code === 200) {
+      imageList.value = res.data?.list || res.data?.items || res.data || []
+    }
+  } catch (error) {
+    console.error('加载镜像列表失败:', error)
+  }
 }
 
 // 模拟加载产品列表(管理员端API需后端配合，这里使用product.js中的列表API作为基础)
@@ -346,7 +439,9 @@ const handleAdd = () => {
     providerIds: '',
     imageIds: '',
     stock: -1,
-    maxPerUser: 0
+    maxPerUser: 0,
+    defaultProviderId: 0,
+    defaultImageId: 0
   }
   dialogVisible.value = true
 }
@@ -361,7 +456,9 @@ const handleEdit = (row) => {
     periodValue: row.periodValue || 1,
     providerIds: row.providerIds || '',
     stock: row.stock !== undefined && row.stock !== null ? row.stock : -1,
-    maxPerUser: row.maxPerUser !== undefined && row.maxPerUser !== null ? row.maxPerUser : 0
+    maxPerUser: row.maxPerUser !== undefined && row.maxPerUser !== null ? row.maxPerUser : 0,
+    defaultProviderId: row.defaultProviderId || 0,
+    defaultImageId: row.defaultImageId || 0
   }
   dialogVisible.value = true
 }
@@ -430,6 +527,8 @@ const handleDelete = async (row) => {
 
 onMounted(() => {
   loadProducts()
+  loadProviders()
+  loadImages()
 })
 </script>
 
@@ -452,6 +551,11 @@ onMounted(() => {
 .price-text {
   color: #f56c6c;
   font-weight: 600;
+}
+
+.status-cell {
+  display: flex;
+  align-items: center;
 }
 
 .pagination-wrapper {
