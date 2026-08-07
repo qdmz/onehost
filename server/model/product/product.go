@@ -181,7 +181,7 @@ type SiteConfig struct {
 	ShowHomeStats  bool   `json:"show_home_stats" gorm:"default:true"` // 是否显示首页统计
 
 	// 主题配置
-	PrimaryColor   string `json:"primary_color" gorm:"size:16;default:#409EFF"` // 主题色
+	PrimaryColor   string `json:"primary_color" gorm:"size:64;default:#409EFF"` // 主题色
 	ThemeMode      string `json:"theme_mode" gorm:"default:auto;size:16"`       // light/dark/auto
 	CustomCSS      string `json:"custom_css" gorm:"type:text"`                  // 自定义CSS
 

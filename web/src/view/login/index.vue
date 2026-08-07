@@ -247,12 +247,24 @@ const handleLogin = async () => {
       })
 
       if (result.success) {
+        // 二次验证：确认 userStore 实际拥有 token 和用户数据
+        // 因为 executeAsync 会捕获抛出的错误并返回 { success: false }，
+        // 但如果 userLogin 返回 { success: false } 而未抛出异常，
+        // executeAsync 会将其视为成功，因此需要额外检查
+        if (!userStore.token || !userStore.user) {
+          // 登录实际未成功，尽管没有抛出异常
+          if (captchaEnabled.value) {
+            refreshCaptcha()
+          }
+          return
+        }
+
         // 根据用户类型和视图模式跳转
         const userType = userStore.userType
         const viewMode = userStore.viewMode || userType
         
-        // 只有管理员可以访问管理员界面
-        if (userType === 'admin' && viewMode === 'admin') {
+        // 管理员（包括普通管理员）可以访问管理员界面
+        if ((userType === 'admin' || userType === 'normal_admin') && (viewMode === 'admin' || viewMode === 'normal_admin')) {
           router.push('/admin/dashboard')
         } else {
           // 普通用户或管理员的用户视图
