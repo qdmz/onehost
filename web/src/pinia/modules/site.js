@@ -35,6 +35,11 @@ export const useSiteStore = defineStore('site', () => {
   // 维护模式
   const maintenanceMode = ref(false)
   const maintenanceMessage = ref('')
+  // 易支付是否启用（后台“易支付配置”的启用开关）
+  const showYiPay = ref(true)
+  // 易支付启用的支付方式（后台“启用的支付方式”：alipay / wxpay / qqpay）
+  // 前端下单/充值时只展示此处列出的渠道，关闭的渠道不出现供选择
+  const enabledPayTypes = ref(['alipay', 'wxpay', 'qqpay'])
   // 是否已经初始化
   const initialized = ref(false)
 
@@ -105,6 +110,15 @@ export const useSiteStore = defineStore('site', () => {
         enableAnnouncement.value = data.enable_announcement !== false
         maintenanceMode.value = data.maintenance_mode === true
         maintenanceMessage.value = data.maintenance_message || ''
+        // 易支付开关
+        showYiPay.value = data.show_yipay !== false
+        // 启用的支付方式（来自后台“启用的支付方式”）
+        if (data.yipay_pay_types) {
+          const arr = String(data.yipay_pay_types).split(',').map(s => s.trim()).filter(Boolean)
+          if (arr.length > 0) {
+            enabledPayTypes.value = arr
+          }
+        }
         // 应用主题色
         applyPrimaryColor(primaryColor.value)
         // 应用自定义 CSS
@@ -205,6 +219,8 @@ export const useSiteStore = defineStore('site', () => {
     enableAnnouncement,
     maintenanceMode,
     maintenanceMessage,
+    showYiPay,
+    enabledPayTypes,
     fetchSiteConfig,
     fetchFullSiteConfig,
     applyPrimaryColor,

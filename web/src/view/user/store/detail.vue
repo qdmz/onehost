@@ -151,8 +151,16 @@
                   {{ t('user.store.payWithBalance') }}
                   <span class="balance-hint">(¥{{ userBalance }})</span>
                 </el-radio>
-                <el-radio label="yipay">{{ t('user.store.payWithYiPay') }}</el-radio>
+                <el-radio v-if="siteStore.showYiPay" label="yipay">{{ t('user.store.payWithYiPay') }}</el-radio>
               </el-radio-group>
+              <!-- 易支付子渠道：仅展示后台启用的支付方式 -->
+              <div v-if="paymentMethod === 'yipay' && siteStore.enabledPayTypes.length" class="pay-type-sub">
+                <el-radio-group v-model="yipayPayType">
+                  <el-radio v-if="siteStore.enabledPayTypes.includes('alipay')" label="alipay">{{ t('user.store.payAlipay') }}</el-radio>
+                  <el-radio v-if="siteStore.enabledPayTypes.includes('wxpay')" label="wxpay">{{ t('user.store.payWxpay') }}</el-radio>
+                  <el-radio v-if="siteStore.enabledPayTypes.includes('qqpay')" label="qqpay">{{ t('user.store.payQQ') }}</el-radio>
+                </el-radio-group>
+              </div>
             </div>
 
             <!-- 购买按钮 -->
@@ -178,10 +186,11 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useSiteStore } from '@/pinia/modules/site'
 import {
   ArrowLeft, Cpu, Memo, Coin, TopRight, DataLine,
   OfficeBuilding, Monitor, Box, Grid
@@ -194,6 +203,7 @@ import { formatMemorySize, formatDiskSize, formatBandwidthSpeed } from '@/utils/
 const route = useRoute()
 const router = useRouter()
 const { t } = useI18n()
+const siteStore = useSiteStore()
 
 const loading = ref(true)
 const submitting = ref(false)
@@ -202,7 +212,18 @@ const imageList = ref([])
 const selectedImage = ref('')
 const selectedPeriod = ref(1)
 const paymentMethod = ref('balance')
+// 易支付子渠道（支付宝/微信/QQ钱包），受后台“启用的支付方式”控制
+const yipayPayType = ref('alipay')
 const userBalance = ref(0)
+
+// 易支付子渠道默认取后台启用的第一个；若当前选择被后台关闭，则回退到第一个启用的
+const syncYiPayType = () => {
+  const list = siteStore.enabledPayTypes
+  if (!list.includes(yipayPayType.value)) {
+    yipayPayType.value = list[0] || 'alipay'
+  }
+}
+watch(() => siteStore.enabledPayTypes, syncYiPayType, { immediate: true })
 
 // 周期选项
 const periodOptions = [
@@ -355,7 +376,7 @@ const handlePurchase = async () => {
       // 且语义是余额充值，因此这里按订单金额充值，完成后到「我的订单」用余额支付。
       const payRes = await createYiPayOrder({
         amount: Number(totalPrice.value),
-        payType: 'alipay'
+        payType: yipayPayType.value
       })
       const payUrl = payRes?.data?.payURL || payRes?.data?.pay_url
       if (payRes?.code === 200 && payUrl) {

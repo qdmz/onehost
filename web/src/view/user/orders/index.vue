@@ -200,9 +200,11 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Box } from '@element-plus/icons-vue'
 import { getOrderList, cancelOrder, renewOrder, payWithBalance, createYiPayOrder } from '@/api/product'
 import { formatMemorySize, formatDiskSize } from '@/utils/unit-formatter'
+import { useSiteStore } from '@/pinia/modules/site'
 
 const router = useRouter()
 const { t, locale } = useI18n()
+const siteStore = useSiteStore()
 
 const loading = ref(true)
 const orderList = ref([])
@@ -320,7 +322,7 @@ const handlePay = async (order) => {
   try {
     const payRes = await createYiPayOrder({
       amount: Number(order.total_price),
-      payType: 'alipay'
+      payType: siteStore.enabledPayTypes[0] || 'alipay'
     })
     const payUrl = payRes?.data?.payURL || payRes?.data?.pay_url
     if (payRes?.code === 200 && payUrl) {

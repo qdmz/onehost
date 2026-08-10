@@ -134,14 +134,15 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import { getUserBalance, getBalanceLogs, createYiPayOrder } from '@/api/product'
-import request from '@/utils/request'
+import { useSiteStore } from '@/pinia/modules/site'
 
 const { t, locale } = useI18n()
+const siteStore = useSiteStore()
 
 const loading = ref(true)
 const balance = ref(0)
@@ -154,7 +155,8 @@ const rechargeVisible = ref(false)
 const rechargeAmount = ref(50)
 const rechargeLoading = ref(false)
 const selectedPayType = ref('alipay')
-const enabledPayTypes = ref(['alipay', 'wxpay', 'qqpay']) // default to all
+// 启用的支付方式来自全局站点配置（后台“启用的支付方式”），与下单页保持一致
+const enabledPayTypes = computed(() => siteStore.enabledPayTypes)
 
 const presetAmounts = [10, 30, 50, 100, 200, 500]
 
@@ -217,25 +219,6 @@ const handleSizeChange = (size) => {
   loadLogs()
 }
 
-// 加载启用的支付方式
-const loadEnabledPayTypes = async () => {
-  try {
-    const res = await request({
-      url: '/api/v1/public/site-config',
-      method: 'get'
-    })
-    if (res.code === 200 && res.data?.yipay_pay_types) {
-      enabledPayTypes.value = res.data.yipay_pay_types.split(',').map(t => t.trim()).filter(Boolean)
-      // 如果当前选中的支付方式不在启用列表中，则切换到第一个启用的方式
-      if (!enabledPayTypes.value.includes(selectedPayType.value) && enabledPayTypes.value.length > 0) {
-        selectedPayType.value = enabledPayTypes.value[0]
-      }
-    }
-  } catch (error) {
-    console.error('加载支付方式失败:', error)
-  }
-}
-
 // 充值
 const handleRecharge = async () => {
   if (!rechargeAmount.value || rechargeAmount.value < 1) {
@@ -262,10 +245,16 @@ const handleRecharge = async () => {
   }
 }
 
+// 若后台关闭了当前选中的支付方式，自动回退到第一个启用的渠道
+watch(() => siteStore.enabledPayTypes, (list) => {
+  if (list.length > 0 && !list.includes(selectedPayType.value)) {
+    selectedPayType.value = list[0]
+  }
+}, { immediate: true })
+
 onMounted(() => {
   loadBalance()
   loadLogs()
-  loadEnabledPayTypes()
 })
 </script>
 
