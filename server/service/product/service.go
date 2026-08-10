@@ -86,23 +86,6 @@ func (s *Service) GetProductDetail(productID uint) (*productModel.Product, error
 	return &product, nil
 }
 
-// GetRecommendedProducts 获取首页推荐产品(已上架且 is_recommended=1)
-func (s *Service) GetRecommendedProducts(limit int) ([]productModel.Product, error) {
-	if limit <= 0 {
-		limit = 8
-	}
-	var products []productModel.Product
-	if err := global.APP_DB.Model(&productModel.Product{}).
-		Where("status = ?", 1).
-		Where("is_recommended = ?", 1).
-		Order("sort_order DESC, id ASC").
-		Limit(limit).
-		Find(&products).Error; err != nil {
-		return nil, common.NewError(common.CodeDatabaseError, err.Error())
-	}
-	return products, nil
-}
-
 // GetProductImages 获取产品可用镜像
 func (s *Service) GetProductImages(productID uint) ([]systemModel.SystemImage, error) {
 	product, err := s.GetProductDetail(productID)
