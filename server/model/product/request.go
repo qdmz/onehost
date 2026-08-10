@@ -95,6 +95,8 @@ type CreateProductRequest struct {
 	Icon        string  `json:"icon" binding:"max=256"`               // 图标URL
 	ImageIDs    string  `json:"imageIds"`                               // 关联镜像ID列表
 	ProviderIDs string  `json:"providerIds"`                            // 节点限制
+	Stock       int64   `json:"stock"`                                  // 库存(-1=不限)
+	IsRecommended bool  `json:"isRecommended"`                          // 是否首页推荐
 }
 
 // UpdateProductRequest 更新产品请求
@@ -118,6 +120,8 @@ type UpdateProductRequest struct {
 	Icon         string  `json:"icon" binding:"max=256"`
 	ImageIDs     string  `json:"imageIds"`
 	ProviderIDs  string  `json:"providerIds"`
+	Stock        int64   `json:"stock"`                 // 库存(-1=不限)
+	IsRecommended bool   `json:"isRecommended"`        // 是否首页推荐
 }
 
 // UpdateProductStatusRequest 更新产品状态请求

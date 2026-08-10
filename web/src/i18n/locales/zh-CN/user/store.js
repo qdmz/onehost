@@ -42,6 +42,8 @@ export default {
   confirmPurchase: '确认购买',
   productNotFound: '产品不存在',
   node: '节点',
+  stock: '库存',
+  stockUnlimited: '不限',
   autoAssign: '自动分配',
   other: '其他',
   loadDetailFailed: '加载产品详情失败',

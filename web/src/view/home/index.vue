@@ -267,6 +267,48 @@
           </div>
         </div>
       </section>
+
+      <!-- 推荐产品 -->
+      <section
+        v-if="recommendedProducts.length > 0"
+        class="recommended-section"
+        style="margin-top: 48px;"
+      >
+        <div class="section-header">
+          <h2>{{ t('home.recommendedProducts.title') }}</h2>
+          <p>{{ t('home.recommendedProducts.subtitle') }}</p>
+        </div>
+        <div
+          style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 20px;"
+        >
+          <el-card
+            v-for="p in recommendedProducts"
+            :key="p.id"
+            shadow="hover"
+            style="cursor: pointer; border-radius: 12px;"
+            @click="goToStore"
+          >
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+              <el-icon :size="36" color="#16a34a"><Box /></el-icon>
+              <h3 style="margin: 0; font-size: 16px;">{{ p.name }}</h3>
+            </div>
+            <p style="color: #6b7280; font-size: 13px; min-height: 38px; margin: 0 0 10px;">{{ p.description }}</p>
+            <div style="display: flex; gap: 12px; color: #374151; font-size: 13px; margin-bottom: 12px;">
+              <span>{{ p.cpu }} {{ t('user.store.cores') }}</span>
+              <span>{{ p.memory >= 1024 ? (p.memory / 1024) + ' GB' : p.memory + ' MB' }}</span>
+              <span>{{ p.stock < 0 ? t('user.store.stockUnlimited') : (p.stock + ' ' + t('user.store.stock')) }}</span>
+            </div>
+            <div style="color: #f56c6c; font-weight: 600;">
+              <span style="font-size: 12px;">¥</span>
+              <span style="font-size: 20px;">{{ p.price }}</span>
+              <span style="font-size: 12px; color: #9ca3af;">/{{ t('user.store.perMonth') }}</span>
+            </div>
+          </el-card>
+        </div>
+        <div style="text-align: center; margin-top: 24px;">
+          <router-link to="/user/store" class="btn btn-secondary">{{ t('home.recommendedProducts.viewAll') }}</router-link>
+        </div>
+      </section>
     </main>
 
     <!-- 页脚 -->
@@ -476,10 +518,10 @@
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getPublicAnnouncements, getPublicStats, getServerVersion } from '@/api/public'
+import { getPublicAnnouncements, getPublicStats, getServerVersion, getRecommendedProducts } from '@/api/public'
 import { checkSystemInit } from '@/api/init'
 import { ElTag, ElMessage } from 'element-plus'
-import { Operation, Sunny, Moon } from '@element-plus/icons-vue'
+import { Operation, Sunny, Moon, Box } from '@element-plus/icons-vue'
 import { useLanguageStore } from '@/pinia/modules/language'
 import LogoCarousel from '@/components/LogoCarousel.vue'
 import proxmoxPng from '@/assets/images/proxmox.png'
@@ -501,6 +543,8 @@ const languageStore = useLanguageStore()
 const themeStore = useThemeStore()
 const siteStore = useSiteStore()
 const announcements = ref([])
+// 首页推荐产品
+const recommendedProducts = ref([])
 // 统计数据
 const usersCount = ref(null)
 const nodesCount = ref(null)
@@ -616,6 +660,21 @@ const fetchPublicStats = async () => {
   }
 }
 
+const fetchRecommendedProducts = async () => {
+  try {
+    const res = await getRecommendedProducts()
+    if (res && res.code === 200 && Array.isArray(res.data)) {
+      recommendedProducts.value = res.data.slice(0, 8)
+    }
+  } catch (error) {
+    console.error('获取推荐产品失败', error)
+  }
+}
+
+const goToStore = () => {
+  router.push('/user/store')
+}
+
 const checkInitStatus = async () => {
   try {
     const response = await checkSystemInit()
@@ -641,6 +700,8 @@ onMounted(() => {
   fetchAnnouncements()
   // 获取公开统计数据（用于未登录首页展示）
   fetchPublicStats()
+  // 获取首页推荐产品
+  fetchRecommendedProducts()
   // 获取服务器版本信息
   getServerVersion().then(res => {
     if (res && (res.code === 200) && res.data?.server_version) {

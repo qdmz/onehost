@@ -66,3 +66,11 @@ export const getProviderHardwareReport = (providerId) => {
     method: 'get'
   })
 }
+
+// 获取首页推荐产品（公开，无需登录）
+export const getRecommendedProducts = () => {
+  return request({
+    url: '/v1/public/products/recommended',
+    method: 'get'
+  })
+}

@@ -35,7 +35,7 @@
         <div class="product-badge">
           <el-tag v-if="product.is_new" type="success" size="small">{{ t('user.store.newProduct') }}</el-tag>
           <el-tag v-if="product.is_hot" type="danger" size="small">{{ t('user.store.hotProduct') }}</el-tag>
-          <el-tag v-if="!product.is_active" type="info" size="small">{{ t('user.store.offShelf') }}</el-tag>
+          <el-tag v-if="product.status !== 1" type="info" size="small">{{ t('user.store.offShelf') }}</el-tag>
         </div>
 
         <!-- 产品图标/图片 -->
@@ -67,6 +67,10 @@
             <div class="spec-item">
               <el-icon><TopRight /></el-icon>
               <span>{{ formatBandwidth(product.bandwidth) }}</span>
+            </div>
+            <div class="spec-item">
+              <el-icon><Box /></el-icon>
+              <span>{{ product.stock < 0 ? t('user.store.stockUnlimited') : product.stock }}</span>
             </div>
             <div v-if="product.traffic > 0" class="spec-item">
               <el-icon><DataLine /></el-icon>

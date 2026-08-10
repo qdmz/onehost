@@ -43,6 +43,11 @@ export default {
     typeHomepage: 'Homepage Announcement',
     typeTopbar: 'Top Bar Announcement'
   },
+  recommendedProducts: {
+    title: 'Recommended Products',
+    subtitle: 'Hand-picked cloud server plans, limited-time offers',
+    viewAll: 'View All Products'
+  },
   supporters: {
     title: 'Sponsors',
     description: 'Thanks to these groups and individuals for sponsoring OneClickVirt'

@@ -43,6 +43,11 @@ export default {
     typeHomepage: '首页公告',
     typeTopbar: '顶部栏公告'
   },
+  recommendedProducts: {
+    title: '推荐产品',
+    subtitle: '精选优质云服务器方案，限时抢购',
+    viewAll: '查看全部产品'
+  },
   supporters: {
     title: '赞助方',
     description: '感谢以下团体或个人赞助 OneClickVirt 项目'

@@ -69,6 +69,13 @@
                   <div class="spec-label">{{ t('user.store.node') }}</div>
                   <div class="spec-value">{{ product.node_name || t('user.store.autoAssign') }}</div>
                 </div>
+                <div class="spec-card">
+                  <el-icon><Box /></el-icon>
+                  <div class="spec-label">{{ t('user.store.stock') }}</div>
+                  <div class="spec-value">
+                    {{ product.stock < 0 ? t('user.store.stockUnlimited') : product.stock }}
+                  </div>
+                </div>
               </div>
             </div>
           </el-card>
@@ -118,12 +125,6 @@
               </el-radio-group>
             </div>
 
-            <!-- 数量 -->
-            <div class="config-section">
-              <label class="config-label">{{ t('user.store.quantity') }}</label>
-              <el-input-number v-model="quantity" :min="1" :max="10" />
-            </div>
-
             <el-divider />
 
             <!-- 价格汇总 -->
@@ -135,10 +136,6 @@
               <div class="price-row">
                 <span>{{ t('user.store.period') }}</span>
                 <span>{{ getPeriodLabel() }}</span>
-              </div>
-              <div class="price-row">
-                <span>{{ t('user.store.quantity') }}</span>
-                <span>x{{ quantity }}</span>
               </div>
               <div class="price-row total">
                 <span>{{ t('user.store.totalPrice') }}</span>
@@ -204,7 +201,6 @@ const product = ref({})
 const imageList = ref([])
 const selectedImage = ref('')
 const selectedPeriod = ref(1)
-const quantity = ref(1)
 const paymentMethod = ref('balance')
 const userBalance = ref(0)
 
@@ -216,15 +212,15 @@ const periodOptions = [
   { value: 12, label: t('user.store.oneYear') }
 ]
 
-// 计算总价
+// 计算总价（后端按 单价 × 周期数 计费，周期数=所选月数）
 const totalPrice = computed(() => {
   const price = product.value.price || 0
-  return (price * selectedPeriod.value * quantity.value).toFixed(2)
+  return (price * selectedPeriod.value).toFixed(2)
 })
 
 // 是否可以提交
 const canSubmit = computed(() => {
-  return selectedImage.value && selectedPeriod.value > 0 && quantity.value > 0
+  return selectedImage.value && selectedPeriod.value > 0
 })
 
 // 操作系统分组
@@ -328,10 +324,9 @@ const handlePurchase = async () => {
   try {
     // 创建订单
     const orderRes = await createOrder({
-      product_id: product.value.id,
-      image_id: selectedImage.value,
-      period: selectedPeriod.value,
-      quantity: quantity.value
+      productId: product.value.id,
+      imageId: selectedImage.value,
+      quantity: selectedPeriod.value
     })
 
     if (orderRes.code !== 200) {

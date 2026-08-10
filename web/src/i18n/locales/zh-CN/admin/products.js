@@ -36,6 +36,8 @@ export default {
   isHot: '热销',
   newTag: '新品',
   hotTag: '热销',
+  stock: '库存',
+  recommended: '推荐',
   // 周期
   periodType: '周期类型',
   periodValue: '周期值',

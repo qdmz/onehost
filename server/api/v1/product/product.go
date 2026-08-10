@@ -78,6 +78,23 @@ func GetPublicProductDetail(c *gin.Context) {
 	GetProductDetail(c)
 }
 
+// GetRecommendedProducts 获取首页推荐产品(公开，无需登录)
+// @Summary 获取首页推荐产品
+// @Description 返回已上架且标记为首页推荐的产品列表
+// @Tags 产品商城
+// @Produce json
+// @Success 200 {object} common.Response{data=[]product.Product} "获取成功"
+// @Router /public/products/recommended [get]
+func GetRecommendedProducts(c *gin.Context) {
+	service := productService.NewService()
+	products, err := service.GetRecommendedProducts(8)
+	if err != nil {
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+	common.ResponseSuccess(c, products)
+}
+
 // GetProductImages 获取产品可用镜像
 // @Summary 获取产品可用镜像
 // @Description 获取指定产品配置的可用的系统镜像列表

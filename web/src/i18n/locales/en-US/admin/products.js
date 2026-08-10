@@ -33,6 +33,8 @@ export default {
   isHot: 'Hot',
   newTag: 'New',
   hotTag: 'Hot',
+  stock: 'Stock',
+  recommended: 'Recommended',
   periodType: 'Period Type',
   periodValue: 'Period Value',
   periodTypeMonth: 'Month',

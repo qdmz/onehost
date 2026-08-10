@@ -42,6 +42,8 @@ export default {
   confirmPurchase: 'Confirm Purchase',
   productNotFound: 'Product not found',
   node: 'Node',
+  stock: 'Stock',
+  stockUnlimited: 'Unlimited',
   autoAssign: 'Auto Assign',
   other: 'Other',
   loadDetailFailed: 'Failed to load product details',

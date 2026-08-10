@@ -43,6 +43,7 @@ func InitPublicRouter(Router *gin.RouterGroup) {
 		// 公开产品列表
 		PublicRouter.GET("products", product.GetPublicProductList)
 		PublicRouter.GET("products/:id", product.GetPublicProductDetail)
+		PublicRouter.GET("products/recommended", product.GetRecommendedProducts)
 
 		// 易支付异步通知(无需登录)
 		PublicRouter.POST("payments/yipay/notify", product.YiPayNotify)

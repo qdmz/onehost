@@ -86,6 +86,23 @@ func (s *Service) GetProductDetail(productID uint) (*productModel.Product, error
 	return &product, nil
 }
 
+// GetRecommendedProducts 获取首页推荐产品列表(上架且 is_recommended=1)
+func (s *Service) GetRecommendedProducts(limit int) ([]productModel.Product, error) {
+	if limit <= 0 {
+		limit = 8
+	}
+	var products []productModel.Product
+	if err := global.APP_DB.Model(&productModel.Product{}).
+		Where("status = ?", 1).
+		Where("is_recommended = ?", 1).
+		Order("sort_order DESC, id ASC").
+		Limit(limit).
+		Find(&products).Error; err != nil {
+		return nil, common.NewError(common.CodeDatabaseError, err.Error())
+	}
+	return products, nil
+}
+
 // GetProductImages 获取产品可用镜像
 func (s *Service) GetProductImages(productID uint) ([]systemModel.SystemImage, error) {
 	product, err := s.GetProductDetail(productID)
@@ -915,6 +932,8 @@ func (s *Service) CreateAdminProduct(req productModel.CreateProductRequest) (*pr
 		Icon:         req.Icon,
 		ImageIDs:     req.ImageIDs,
 		ProviderIDs:  req.ProviderIDs,
+		Stock:        req.Stock,
+		IsRecommended: req.IsRecommended,
 	}
 
 	if err := global.APP_DB.Create(&product).Error; err != nil {
@@ -954,6 +973,8 @@ func (s *Service) UpdateAdminProduct(productID uint, req productModel.UpdateProd
 		"icon":          req.Icon,
 		"image_ids":     req.ImageIDs,
 		"provider_ids":  req.ProviderIDs,
+		"stock":         req.Stock,
+		"is_recommended": req.IsRecommended,
 	}
 
 	if err := global.APP_DB.Model(&product).Updates(updates).Error; err != nil {

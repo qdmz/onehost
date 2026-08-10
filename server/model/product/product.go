@@ -39,6 +39,10 @@ type Product struct {
 	SortOrder   int    `json:"sortOrder" gorm:"default:0"`      // 排序
 	Icon        string `json:"icon" gorm:"size:256"`            // 产品图标URL
 
+	// 库存与推荐（数据库已存在对应列，AutoMigrate 被跳过时也可安全读取）
+	Stock         int64 `json:"stock" gorm:"default:-1"`                   // 库存数量(-1=不限)
+	IsRecommended bool  `json:"isRecommended" gorm:"default:false;index"` // 是否首页推荐
+
 	// 关联镜像(逗号分隔的镜像ID列表,空则使用所有可用镜像)
 	ImageIDs string `json:"imageIds" gorm:"type:text"`
 

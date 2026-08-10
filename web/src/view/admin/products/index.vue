@@ -61,6 +61,12 @@
             <span class="price-text">¥{{ row.price }}</span>
           </template>
         </el-table-column>
+        <el-table-column :label="t('admin.products.recommended')" width="100">
+          <template #default="{ row }">
+            <el-tag v-if="row.isRecommended" type="warning" size="small">{{ t('admin.products.recommended') }}</el-tag>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
         <el-table-column :label="t('admin.products.status')" width="100">
           <template #default="{ row }">
             <el-switch
@@ -190,6 +196,19 @@
         <el-form-item :label="t('admin.products.providerIds')" prop="providerIds">
           <el-input v-model="form.providerIds" :placeholder="t('admin.products.providerIdsPlaceholder')" />
         </el-form-item>
+
+        <el-row :gutter="20">
+          <el-col :span="12">
+            <el-form-item :label="t('admin.products.stock')" prop="stock">
+              <el-input-number v-model="form.stock" :min="-1" style="width: 100%;" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item :label="t('admin.products.recommended')" prop="isRecommended">
+              <el-switch v-model="form.isRecommended" />
+            </el-form-item>
+          </el-col>
+        </el-row>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
@@ -237,7 +256,9 @@ const form = ref({
   periodType: 'month',
   periodValue: 1,
   providerIds: '',
-  imageIds: ''
+  imageIds: '',
+  stock: -1,
+  isRecommended: false
 })
 
 const formRules = {
