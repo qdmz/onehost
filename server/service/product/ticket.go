@@ -3,6 +3,7 @@ package product
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"oneclickvirt/global"
@@ -20,6 +21,27 @@ type TicketService struct{}
 // NewTicketService 创建工单服务实例
 func NewTicketService() *TicketService {
 	return &TicketService{}
+}
+
+// BuildThread 将工单原始内容作为首条「用户消息」拼接到回复列表最前。
+// 创建工单时内容只存于 tickets.content、并不生成 reply 记录，
+// 而前端详情页的对话线程只渲染 replies/messages，导致原始内容看不到。
+// 这里在展示层补齐首条消息，新旧工单都生效，且无需改库。
+func (s *TicketService) BuildThread(ticket *product.Ticket, replies []product.TicketReply) []product.TicketReply {
+	if ticket == nil || strings.TrimSpace(ticket.Content) == "" {
+		return replies
+	}
+	head := product.TicketReply{
+		TicketID: ticket.ID,
+		UserID:   ticket.UserID,
+		UserType: "user",
+		Content:  ticket.Content,
+		CreatedAt: ticket.CreatedAt,
+	}
+	out := make([]product.TicketReply, 0, len(replies)+1)
+	out = append(out, head)
+	out = append(out, replies...)
+	return out
 }
 
 // GenerateTicketNo 生成工单编号

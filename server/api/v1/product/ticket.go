@@ -158,10 +158,13 @@ func GetTicketDetail(c *gin.Context) {
 		return
 	}
 
+	// 将工单原始内容作为首条消息，补齐对话线程（详见 service.BuildThread）
+	messages := service.BuildThread(ticket, replies)
+
 	common.ResponseSuccess(c, gin.H{
 		"ticket":   ticket,
 		"replies":  replies,
-		"messages": replies, // 兼容前端 messages 字段
+		"messages": messages, // 兼容前端 messages 字段
 	})
 }
 

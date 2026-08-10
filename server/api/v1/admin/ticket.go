@@ -103,9 +103,12 @@ func GetAdminTicketDetail(c *gin.Context) {
 		return
 	}
 
+	// 将工单原始内容作为首条消息，补齐对话线程（详见 service.BuildThread）
+	thread := service.BuildThread(ticket, replies)
+
 	common.ResponseSuccess(c, gin.H{
 		"ticket":  ticket,
-		"replies": replies,
+		"replies": thread,
 		"user":    user,
 	})
 }
