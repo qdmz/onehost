@@ -42,6 +42,7 @@ type Product struct {
 	Status      int    `json:"status" gorm:"default:1;index"`  // 0=下架 1=上架
 	SortOrder   int    `json:"sortOrder" gorm:"default:0"`      // 排序
 	Icon        string `json:"icon" gorm:"size:256"`            // 产品图标URL
+	IsRecommended bool  `json:"isRecommended" gorm:"default:false;index"` // 是否推荐到首页
 
 	// 关联镜像(逗号分隔的镜像ID列表,空则使用所有可用镜像)
 	ImageIDs string `json:"imageIds" gorm:"type:text"`
@@ -247,4 +248,20 @@ type YiPayConfig struct {
 	FeePercent  float64 `json:"feePercent" gorm:"default:0"`     // 手续费百分比
 	MinAmount   float64 `json:"minAmount" gorm:"default:0.01"`   // 最小支付金额
 	MaxAmount   float64 `json:"maxAmount" gorm:"default:100000"` // 最大支付金额
+}
+
+// SiteLink 站点链接表（虚拟化平台/赞助方等首页展示链接）
+type SiteLink struct {
+	ID        uint           `json:"id" gorm:"primarykey"`
+	CreatedAt time.Time      `json:"createdAt"`
+	UpdatedAt time.Time      `json:"updatedAt"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+
+	Name      string `json:"name" gorm:"not null;size:128"`       // 名称
+	URL       string `json:"url" gorm:"size:512"`                  // 链接地址
+	IconURL   string `json:"iconUrl" gorm:"size:512"`              // 图标URL
+	LinkType  string `json:"linkType" gorm:"size:32;index;default:platform"` // 类型: platform/sponsor
+	SortOrder int    `json:"sortOrder" gorm:"default:0"`          // 排序(降序)
+	Status    int    `json:"status" gorm:"default:1;index"`       // 0=隐藏 1=显示
+	Description string `json:"description" gorm:"size:256"`       // 描述
 }

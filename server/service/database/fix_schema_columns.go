@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"oneclickvirt/global"
+	productModel "oneclickvirt/model/product"
 
 	"go.uber.org/zap"
 )
@@ -168,6 +169,53 @@ func (ds *DatabaseService) FixSchemaColumns() error {
 		} else {
 			global.APP_LOG.Debug("yipay_configs.enabled_pay_types 列已存在，跳过")
 		}
+	}
+
+	// === 7. 为 products 表添加 is_recommended 列 ===
+	if db.Migrator().HasTable("products") {
+		columns, err := ds.getTableColumns(db, "products")
+		if err != nil {
+			global.APP_LOG.Warn("获取 products 表列信息失败，跳过 is_recommended 列添加", zap.Error(err))
+		} else if !columns["is_recommended"] {
+			global.APP_LOG.Info("正在为 products 表添加 is_recommended 列")
+			if _, err := sqlDB.Exec("ALTER TABLE `products` ADD COLUMN `is_recommended` TINYINT DEFAULT 0"); err != nil {
+				global.APP_LOG.Warn("添加 products.is_recommended 列失败", zap.Error(err))
+			} else {
+				global.APP_LOG.Info("products.is_recommended 列添加完成")
+			}
+		} else {
+			global.APP_LOG.Debug("products.is_recommended 列已存在，跳过")
+		}
+	}
+
+	// === 8. 自动创建 site_links 表（如果不存在）===
+	// SiteLink 用于管理首页虚拟化平台和赞助方链接
+	if !db.Migrator().HasTable("site_links") {
+		global.APP_LOG.Info("正在创建 site_links 表")
+		if err := db.AutoMigrate(&productModel.SiteLink{}); err != nil {
+			global.APP_LOG.Warn("创建 site_links 表失败", zap.Error(err))
+		} else {
+			global.APP_LOG.Info("site_links 表创建完成")
+			// 插入默认数据：虚拟化平台
+			defaultPlatforms := []productModel.SiteLink{
+				{Name: "Proxmox VE", URL: "https://github.com/oneclickvirt/pve", IconURL: "", LinkType: "platform", SortOrder: 80, Status: 1},
+				{Name: "Incus", URL: "https://github.com/oneclickvirt/incus", IconURL: "", LinkType: "platform", SortOrder: 70, Status: 1},
+				{Name: "Docker", URL: "https://github.com/oneclickvirt/docker", IconURL: "", LinkType: "platform", SortOrder: 60, Status: 1},
+				{Name: "LXD", URL: "https://github.com/oneclickvirt/lxd", IconURL: "", LinkType: "platform", SortOrder: 50, Status: 1},
+				{Name: "Podman", URL: "https://github.com/oneclickvirt/podman", IconURL: "", LinkType: "platform", SortOrder: 40, Status: 1},
+				{Name: "Containerd", URL: "https://github.com/oneclickvirt/containerd", IconURL: "", LinkType: "platform", SortOrder: 30, Status: 1},
+				{Name: "QEMU", URL: "https://github.com/oneclickvirt/qemu", IconURL: "", LinkType: "platform", SortOrder: 20, Status: 1},
+				{Name: "KubeVirt", URL: "https://github.com/oneclickvirt/kubevirt", IconURL: "", LinkType: "platform", SortOrder: 10, Status: 1},
+			}
+			for _, link := range defaultPlatforms {
+				if err := global.APP_DB.Create(&link).Error; err != nil {
+					global.APP_LOG.Warn("插入默认平台链接失败", zap.String("name", link.Name), zap.Error(err))
+				}
+			}
+			global.APP_LOG.Info("默认虚拟化平台数据插入完成")
+		}
+	} else {
+		global.APP_LOG.Debug("site_links 表已存在，跳过创建")
 	}
 
 	return nil

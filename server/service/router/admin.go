@@ -246,6 +246,13 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		NormalAdminGroup.DELETE("/products/:id", admin.DeleteAdminProduct)
 		NormalAdminGroup.PUT("/products/:id/status", admin.UpdateProductStatus)
 
+		// 站点链接管理（虚拟化平台/赞助方）
+		NormalAdminGroup.GET("/site-links", admin.GetAdminSiteLinkList)
+		NormalAdminGroup.POST("/site-links", admin.CreateAdminSiteLink)
+		NormalAdminGroup.GET("/site-links/:id", admin.GetAdminSiteLinkDetail)
+		NormalAdminGroup.PUT("/site-links/:id", admin.UpdateAdminSiteLink)
+		NormalAdminGroup.DELETE("/site-links/:id", admin.DeleteAdminSiteLink)
+
 		// 订单管理（普通管理员可访问）
 		NormalAdminGroup.GET("/orders", admin.GetAdminOrderList)
 		NormalAdminGroup.GET("/orders/:id", admin.GetAdminOrderDetail)

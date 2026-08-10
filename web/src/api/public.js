@@ -66,3 +66,21 @@ export const getProviderHardwareReport = (providerId) => {
     method: 'get'
   })
 }
+
+// 获取推荐产品列表
+export const getRecommendedProducts = (limit = 8) => {
+  return request({
+    url: '/v1/public/products/recommended',
+    method: 'get',
+    params: { limit }
+  })
+}
+
+// 获取站点链接（虚拟化平台/赞助方）
+export const getSiteLinks = (linkType = '') => {
+  return request({
+    url: '/v1/public/site-links',
+    method: 'get',
+    params: linkType ? { linkType } : {}
+  })
+}

@@ -95,6 +95,7 @@ type CreateProductRequest struct {
 	Status      int     `json:"status" binding:"oneof=0 1"`           // 状态
 	SortOrder   int     `json:"sortOrder"`                              // 排序
 	Icon        string  `json:"icon" binding:"max=256"`               // 图标URL
+	IsRecommended bool  `json:"isRecommended"`                          // 是否推荐到首页
 	ImageIDs    string  `json:"imageIds"`                               // 关联镜像ID列表
 	ProviderIDs string  `json:"providerIds"`                            // 节点限制
 	DefaultProviderID uint `json:"defaultProviderId"`                   // 默认节点ID(0=不指定)
@@ -122,6 +123,7 @@ type UpdateProductRequest struct {
 	Status       int     `json:"status" binding:"oneof=0 1"`
 	SortOrder    int     `json:"sortOrder"`
 	Icon         string  `json:"icon" binding:"max=256"`
+	IsRecommended bool  `json:"isRecommended"`                          // 是否推荐到首页
 	ImageIDs     string  `json:"imageIds"`
 	ProviderIDs  string  `json:"providerIds"`
 	DefaultProviderID uint `json:"defaultProviderId"`   // 默认节点ID(0=不指定)
@@ -148,4 +150,28 @@ type UpdateOrderStatusRequest struct {
 	PaymentStatus   *int   `json:"paymentStatus"`     // 0=未支付 1=已支付 2=支付失败 3=已退款（nil=不更新）
 	ProvisionStatus *int   `json:"provisionStatus"`   // 0=待开通 1=开通中 2=已开通 3=开通失败（nil=不更新）
 	Remark          string `json:"remark" binding:"max=512"`
+}
+
+// ========== 站点链接相关请求 ==========
+
+// CreateSiteLinkRequest 创建站点链接请求
+type CreateSiteLinkRequest struct {
+	Name        string `json:"name" binding:"required,max=128"`
+	URL         string `json:"url" binding:"max=512"`
+	IconURL     string `json:"iconUrl" binding:"max=512"`
+	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor"`
+	SortOrder   int    `json:"sortOrder"`
+	Status      int    `json:"status" binding:"oneof=0 1"`
+	Description string `json:"description" binding:"max=256"`
+}
+
+// UpdateSiteLinkRequest 更新站点链接请求
+type UpdateSiteLinkRequest struct {
+	Name        string `json:"name" binding:"required,max=128"`
+	URL         string `json:"url" binding:"max=512"`
+	IconURL     string `json:"iconUrl" binding:"max=512"`
+	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor"`
+	SortOrder   int    `json:"sortOrder"`
+	Status      int    `json:"status" binding:"oneof=0 1"`
+	Description string `json:"description" binding:"max=256"`
 }
