@@ -212,10 +212,17 @@ func (ds *DatabaseService) FixSchemaColumns() error {
 					global.APP_LOG.Warn("插入默认平台链接失败", zap.String("name", link.Name), zap.Error(err))
 				}
 			}
-			global.APP_LOG.Info("默认虚拟化平台数据插入完成")
-		}
-	} else {
-		global.APP_LOG.Debug("site_links 表已存在，跳过创建")
+		global.APP_LOG.Info("默认虚拟化平台数据插入完成")
+	}
+} else {
+	global.APP_LOG.Debug("site_links 表已存在，跳过创建")
+}
+
+	// === 9. 修复 system_configs 重复数据并重建唯一索引 ===
+	// 该修复在「已初始化」与「全新安装」两条路径都会执行（FixSchemaColumns 均被调用），
+	// 且早于 ConfigManager 加载配置，确保后续 upsert 真正去重。
+	if err := ds.FixSystemConfigDuplicates(); err != nil {
+		global.APP_LOG.Warn("修复 system_configs 重复数据失败（可忽略）", zap.Error(err))
 	}
 
 	return nil

@@ -3,9 +3,9 @@ package database
 import (
 	"fmt"
 	"oneclickvirt/global"
+	"time"
 
 	"go.uber.org/zap"
-	"gorm.io/gorm"
 )
 
 // FixDuplicateTrafficHistory 确认 instance_traffic_histories 表中的重复数据
@@ -167,39 +167,151 @@ func (ds *DatabaseService) MigratePortsIndex() error {
 	return nil
 }
 
-// MigrateSystemConfigIndex 将 system_configs 表的唯一索引从单列 idx_system_configs_key
-// 迁移到复合列 idx_system_configs_cat_key（category + key），允许不同 category 共用相同 key 名。
-// 幂等操作：若旧索引不存在或新索引已存在，均安全跳过。
-func (ds *DatabaseService) MigrateSystemConfigIndex(db *gorm.DB) error {
+// FixSystemConfigDuplicates 清理 system_configs 的重复行，并确保唯一索引
+// idx_system_configs_cat_key 落在 (category, key) 上（不含 deleted_at）。
+//
+// 历史问题：旧唯一索引为 (key, category, deleted_at)。由于 MySQL/MariaDB 将 NULL 视为互不相等，
+// 所有 live 行的 deleted_at 均为 NULL，导致该唯一索引无法阻止 (category, key) 的重复插入。
+// 于是每次重启的 syncYAMLConfigToDatabase / mergeYAMLDefaultsIntoDatabase / UpdateConfig
+// 通过 ON DUPLICATE KEY UPDATE / INSERT IGNORE 追加新行（底层唯一索引永不冲突），
+// 行数无限膨胀，最终 configCache 被空值覆盖（表现为「已配置 SMTP 但无法发邮件」）。
+//
+// 修复：
+//  1. 去重：每个 (category, key) 仅保留最优一行（优先非空 value，其次 updated_at 最新，再次 id 最大）。
+//  2. 重建唯一索引为 (category, key)，使 upsert 真正去重。
+//
+// 幂等：可重复安全执行；在数据库初始化阶段（FixSchemaColumns）调用，早于 ConfigManager 加载。
+func (ds *DatabaseService) FixSystemConfigDuplicates() error {
+	db := ds.getDB()
 	if db == nil {
 		return fmt.Errorf("数据库连接不可用")
 	}
-
 	sqlDB, err := db.DB()
 	if err != nil {
 		return fmt.Errorf("获取底层数据库连接失败: %w", err)
 	}
+	if !db.Migrator().HasTable("system_configs") {
+		global.APP_LOG.Info("system_configs 表不存在，跳过重复数据修复（全新数据库）")
+		return nil
+	}
 
-	// 检查旧的单列唯一索引是否存在
-	var oldIndexCount int
-	checkSQL := `
+	// 1) 去重：在 Go 中计算保留行，避免依赖临时表与窗口函数（兼容连接池与低版本 MySQL）。
+	type scRow struct {
+		ID        uint
+		Category  string
+		Key       string
+		Value     string
+		UpdatedAt time.Time
+	}
+	var rows []scRow
+	if err := db.Raw("SELECT id, category, `key`, value, updated_at FROM system_configs WHERE deleted_at IS NULL").Scan(&rows).Error; err != nil {
+		return fmt.Errorf("读取 system_configs 失败: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	groups := make(map[string]*scRow)
+	for i := range rows {
+		r := &rows[i]
+		gk := r.Category + "\x00" + r.Key
+		g, ok := groups[gk]
+		if !ok {
+			groups[gk] = r
+			continue
+		}
+		// 选择更优行：优先非空 value；其次 updated_at 更新；再次 id 更大
+		better := false
+		if (r.Value != "") && (g.Value == "") {
+			better = true
+		} else if (r.Value != "") == (g.Value != "") {
+			if r.UpdatedAt.After(g.UpdatedAt) || (r.UpdatedAt.Equal(g.UpdatedAt) && r.ID > g.ID) {
+				better = true
+			}
+		}
+		if better {
+			groups[gk] = r
+		}
+	}
+
+	keep := make(map[uint]bool, len(groups))
+	for _, g := range groups {
+		keep[g.ID] = true
+	}
+	var delIDs []uint
+	for i := range rows {
+		if !keep[rows[i].ID] {
+			delIDs = append(delIDs, rows[i].ID)
+		}
+	}
+	if len(delIDs) > 0 {
+		for s := 0; s < len(delIDs); s += 1000 {
+			batch := delIDs[s:]
+			if len(batch) > 1000 {
+				batch = batch[:1000]
+			}
+			if err := db.Exec("DELETE FROM system_configs WHERE id IN (?)", batch).Error; err != nil {
+				return fmt.Errorf("清理 system_configs 重复行失败: %w", err)
+			}
+		}
+		global.APP_LOG.Warn("已清理 system_configs 重复配置行", zap.Int("count", len(delIDs)))
+	}
+
+	// 2) 确保唯一索引为 (category, key)（不含 deleted_at，避免 NULL 互异导致无法去重）。
+	var colCount int
+	row := sqlDB.QueryRow(`
 		SELECT COUNT(*) FROM information_schema.STATISTICS
 		WHERE table_schema = DATABASE()
 		  AND table_name = 'system_configs'
-		  AND index_name = 'idx_system_configs_key'
-	`
-	row := sqlDB.QueryRow(checkSQL)
-	if err := row.Scan(&oldIndexCount); err != nil {
-		return fmt.Errorf("检查旧索引失败: %w", err)
+		  AND index_name = 'idx_system_configs_cat_key'
+	`)
+	if err := row.Scan(&colCount); err != nil {
+		return fmt.Errorf("检查 system_configs 索引失败: %w", err)
 	}
 
-	if oldIndexCount > 0 {
-		global.APP_LOG.Info("发现旧的 system_configs 单列唯一索引，开始迁移到复合索引")
-		if _, err := sqlDB.Exec("ALTER TABLE system_configs DROP INDEX `idx_system_configs_key`"); err != nil {
-			return fmt.Errorf("删除旧索引 idx_system_configs_key 失败: %w", err)
+	if colCount == 0 {
+		if _, err := sqlDB.Exec("ALTER TABLE system_configs ADD UNIQUE INDEX `idx_system_configs_cat_key` (`category`, `key`)"); err != nil {
+			return fmt.Errorf("创建 system_configs 唯一索引失败: %w", err)
 		}
-		global.APP_LOG.Info("旧索引 idx_system_configs_key 已删除")
+		global.APP_LOG.Info("system_configs 唯一索引已创建 (category, key)")
+		return nil
 	}
 
+	// 读取现有索引列顺序
+	cols, err := sqlDB.Query(`
+		SELECT column_name FROM information_schema.STATISTICS
+		WHERE table_schema = DATABASE()
+		  AND table_name = 'system_configs'
+		  AND index_name = 'idx_system_configs_cat_key'
+		ORDER BY seq_in_index
+	`)
+	if err != nil {
+		return fmt.Errorf("读取 system_configs 索引列失败: %w", err)
+	}
+	var colNames []string
+	for cols.Next() {
+		var c string
+		if err := cols.Scan(&c); err != nil {
+			cols.Close()
+			return fmt.Errorf("读取 system_configs 索引列失败: %w", err)
+		}
+		colNames = append(colNames, c)
+	}
+	cols.Close()
+
+	// 期望列顺序: [category, key]
+	needFix := len(colNames) != 2 || colNames[0] != "category" || colNames[1] != "key"
+	if !needFix {
+		global.APP_LOG.Info("system_configs 唯一索引已正确 (category, key)，无需重建")
+		return nil
+	}
+
+	if _, err := sqlDB.Exec("ALTER TABLE system_configs DROP INDEX `idx_system_configs_cat_key`"); err != nil {
+		return fmt.Errorf("删除旧 system_configs 索引失败: %w", err)
+	}
+	if _, err := sqlDB.Exec("ALTER TABLE system_configs ADD UNIQUE INDEX `idx_system_configs_cat_key` (`category`, `key`)"); err != nil {
+		return fmt.Errorf("重建 system_configs 唯一索引失败: %w", err)
+	}
+	global.APP_LOG.Info("system_configs 唯一索引已重建为 (category, key)")
 	return nil
 }
