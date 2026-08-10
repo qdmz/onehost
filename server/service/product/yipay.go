@@ -53,8 +53,6 @@ func (s *YiPayService) BuildPayParams(config *productModel.YiPayConfig, orderNo 
 		"return_url":   config.ReturnURL,
 		"name":         "账户充值",
 		"money":        fmt.Sprintf("%.2f", amount),
-		"clientip":     clientIP,
-		"device":       "pc",
 	}
 
 	// 生成签名

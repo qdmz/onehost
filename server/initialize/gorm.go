@@ -72,6 +72,13 @@ func Gorm() *gorm.DB {
 	// 如果已初始化则跳过自动迁移，避免MariaDB上AutoMigrate挂起的问题
 	if isSystemInitialized(db) {
 		global.APP_LOG.Info("系统已初始化，跳过数据库表结构自动迁移")
+
+		// 即使系统已初始化（跳过 AutoMigrate），也需要执行列结构修复迁移，
+		// 确保旧数据库的表结构与新版本代码期望的一致
+		dbService := database.GetDatabaseService()
+		if err := dbService.FixSchemaColumns(); err != nil {
+			global.APP_LOG.Warn("执行数据库列结构修复迁移失败", zap.Error(err))
+		}
 	} else {
 		// 只有在数据库连接成功且系统未初始化时才进行表结构迁移
 		global.APP_LOG.Info("开始数据库表结构自动迁移")
@@ -219,6 +226,11 @@ func RegisterTables(db *gorm.DB) {
 	// AutoMigrate完成后再确认重复数据（表已存在才安全执行）
 	if fixErr := dbService.FixAllDuplicateData(); fixErr != nil {
 		global.APP_LOG.Warn("确认重复数据时出现警告（可忽略，如果是新数据库）", zap.Error(fixErr))
+	}
+
+	// 执行列结构修复迁移，确保表结构与新版本代码期望的一致
+	if fixErr := dbService.FixSchemaColumns(); fixErr != nil {
+		global.APP_LOG.Warn("执行数据库列结构修复迁移失败", zap.Error(fixErr))
 	}
 
 	// Initialize default block rules

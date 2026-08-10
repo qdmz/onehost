@@ -34,20 +34,25 @@ type Product struct {
 	MaxSnapshots int `json:"maxSnapshots" gorm:"default:1"`  // 最大快照数
 	MaxPorts     int `json:"maxPorts" gorm:"default:0"`      // 最大端口映射数(0=不限)
 
+	// 库存与限购配置
+	Stock      int `json:"stock" gorm:"default:-1"` // 库存数量，-1为不限
+	MaxPerUser int `json:"maxPerUser" gorm:"default:0"` // 每人限购数量，0为不限
+
 	// 状态
 	Status      int    `json:"status" gorm:"default:1;index"`  // 0=下架 1=上架
 	SortOrder   int    `json:"sortOrder" gorm:"default:0"`      // 排序
 	Icon        string `json:"icon" gorm:"size:256"`            // 产品图标URL
-
-	// 库存与推荐（数据库已存在对应列，AutoMigrate 被跳过时也可安全读取）
-	Stock         int64 `json:"stock" gorm:"default:-1"`                   // 库存数量(-1=不限)
-	IsRecommended bool  `json:"isRecommended" gorm:"default:false;index"` // 是否首页推荐
+	IsRecommended bool  `json:"isRecommended" gorm:"default:false;index"` // 是否推荐到首页
 
 	// 关联镜像(逗号分隔的镜像ID列表,空则使用所有可用镜像)
 	ImageIDs string `json:"imageIds" gorm:"type:text"`
 
 	// 节点限制(逗号分隔的Provider ID列表,空则所有节点可用)
 	ProviderIDs string `json:"providerIds" gorm:"type:text"`
+
+	// 默认节点和默认镜像(用户购买时可预选)
+	DefaultProviderID uint `json:"defaultProviderId" gorm:"default:0"` // 默认节点ID(0=不指定)
+	DefaultImageID    uint `json:"defaultImageId" gorm:"default:0"`   // 默认镜像ID(0=不指定)
 }
 
 // ProductOrder 产品订单表
@@ -181,7 +186,7 @@ type SiteConfig struct {
 	ShowHomeStats  bool   `json:"show_home_stats" gorm:"default:true"` // 是否显示首页统计
 
 	// 主题配置
-	PrimaryColor   string `json:"primary_color" gorm:"size:16;default:#409EFF"` // 主题色
+	PrimaryColor   string `json:"primary_color" gorm:"size:64;default:#409EFF"` // 主题色
 	ThemeMode      string `json:"theme_mode" gorm:"default:auto;size:16"`       // light/dark/auto
 	CustomCSS      string `json:"custom_css" gorm:"type:text"`                  // 自定义CSS
 
@@ -234,10 +239,29 @@ type YiPayConfig struct {
 	Key         string `json:"key" gorm:"size:256"`              // 商户密钥
 	NotifyURL   string `json:"notifyUrl" gorm:"size:512"`        // 异步通知地址
 	ReturnURL   string `json:"returnUrl" gorm:"size:512"`        // 同步跳转地址
-	PayType     string `json:"payType" gorm:"size:32;default:alipay"` // alipay/wxpay/qqpay
+	PayType     string `json:"payType" gorm:"size:32;default:alipay"` // alipay/wxpay/qqpay (默认支付方式)
+
+	// 启用的支付方式(逗号分隔,如 "alipay,wxpay,qqpay",空则全部启用)
+	EnabledPayTypes string `json:"enabledPayTypes" gorm:"size:128;default:alipay,wxpay,qqpay"`
 
 	// 费率配置
 	FeePercent  float64 `json:"feePercent" gorm:"default:0"`     // 手续费百分比
 	MinAmount   float64 `json:"minAmount" gorm:"default:0.01"`   // 最小支付金额
 	MaxAmount   float64 `json:"maxAmount" gorm:"default:100000"` // 最大支付金额
+}
+
+// SiteLink 站点链接表（虚拟化平台/赞助方等首页展示链接）
+type SiteLink struct {
+	ID        uint           `json:"id" gorm:"primarykey"`
+	CreatedAt time.Time      `json:"createdAt"`
+	UpdatedAt time.Time      `json:"updatedAt"`
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+
+	Name      string `json:"name" gorm:"not null;size:128"`       // 名称
+	URL       string `json:"url" gorm:"size:512"`                  // 链接地址
+	IconURL   string `json:"iconUrl" gorm:"size:512"`              // 图标URL
+	LinkType  string `json:"linkType" gorm:"size:32;index;default:platform"` // 类型: platform/sponsor
+	SortOrder int    `json:"sortOrder" gorm:"default:0"`          // 排序(降序)
+	Status    int    `json:"status" gorm:"default:1;index"`       // 0=隐藏 1=显示
+	Description string `json:"description" gorm:"size:256"`       // 描述
 }

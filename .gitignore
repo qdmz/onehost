@@ -45,5 +45,9 @@ deploy/deploy_dist.py
 deploy/verify.py
 deploy/switch_db.awk
 # 前端构建临时产物
+web/dist.old/
 web/dist.old.*/
 web/dist.upload.*.tar.gz
+# 本地运维/测试记录（可能含凭据，禁止提交）
+线上全面测试报告.md
+线上复查记录-*.md

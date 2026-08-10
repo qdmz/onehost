@@ -167,6 +167,14 @@ export function resetPassword() {
   })
 }
 
+export function changePassword(data) {
+  return request({
+    url: '/v1/user/password',
+    method: 'put',
+    data
+  })
+}
+
 export function resetInstancePassword(instanceId) {
   return request({
     url: `/v1/user/instances/${instanceId}/reset-password`,

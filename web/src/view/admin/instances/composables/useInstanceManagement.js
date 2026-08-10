@@ -2,6 +2,7 @@ import { ref, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import { getAllInstances, adminInstanceAction, adminBatchInstanceAction, resetInstancePassword, getAdminInstanceNewPassword, setInstanceExpiry, freezeInstance, unfreezeInstance, getUserList, createAdminInstanceShare } from '@/api/admin'
+import { getFilteredImages } from '@/api/user'
 import { adminTransferInstance } from '@/api/features'
 import { useSSHStore } from '@/pinia/modules/ssh'
 import { copyToClipboard } from '@/utils/clipboard'
@@ -27,6 +28,17 @@ export function useInstanceManagement() {
   const searchingUsers = ref(false)
   const userOptions = ref([])
   const tableRef = ref(null)
+
+  // 重装系统镜像选择相关
+  const resetImageDialogVisible = ref(false)
+  const resetImageList = ref([])
+  const selectedResetImage = ref('')
+  const loadingResetImages = ref(false)
+
+  // VNC 控制台相关
+  const vncDialogVisible = ref(false)
+  const vncInstanceId = ref(null)
+  const vncInstanceName = ref('')
 
   const filters = ref({
     instanceName: '',
@@ -141,12 +153,21 @@ export function useInstanceManagement() {
   const performAction = async (action) => {
     if (!warnInstanceBlocked(actionInstance.value)) return
     if (action === 'setExpiry') { actionDialogVisible.value = false; await handleSetInstanceExpiry(actionInstance.value); actionInstance.value = null; return }
+    if (action === 'renew') { actionDialogVisible.value = false; await handleSetInstanceExpiry(actionInstance.value); actionInstance.value = null; return }
     if (action === 'freeze') { actionDialogVisible.value = false; await handleFreezeInstance(actionInstance.value); actionInstance.value = null; return }
     if (action === 'unfreeze') { actionDialogVisible.value = false; await handleUnfreezeInstance(actionInstance.value); actionInstance.value = null; return }
+    if (action === 'vnc') {
+      vncInstanceId.value = actionInstance.value.id
+      vncInstanceName.value = actionInstance.value.name || actionInstance.value.uuid || ''
+      vncDialogVisible.value = true
+      actionDialogVisible.value = false
+      return
+    }
 
     const actionText = {
       'start': t('common.start'), 'stop': t('common.stop'), 'restart': t('common.restart'),
-      'reset': t('admin.instances.resetSystem'), 'resetPassword': t('admin.instances.resetPassword'), 'delete': t('common.delete')
+      'reset': t('admin.instances.resetSystem'), 'resetPassword': t('admin.instances.resetPassword'), 'delete': t('common.delete'),
+      'renew': t('admin.instances.renew')
     }[action]
 
     try {
@@ -155,6 +176,14 @@ export function useInstanceManagement() {
         t('admin.instances.manageTitle', { action: actionText }),
         { confirmButtonText: t('common.confirm'), cancelButtonText: t('common.cancel'), type: 'warning' }
       )
+
+      // 重装系统：先弹出镜像选择对话框，不直接调用 API
+      if (action === 'reset') {
+        await loadResetImages(actionInstance.value)
+        resetImageDialogVisible.value = true
+        return
+      }
+
       actionLoading.value = true
       const instanceId = actionInstance.value.id
       const instanceIndex = instances.value.findIndex(i => i.id === instanceId)
@@ -180,6 +209,54 @@ export function useInstanceManagement() {
       }
     } catch (error) {
       if (error !== 'cancel') { ElMessage.error(t('admin.instances.actionFailed', { action: actionText })); await loadInstances() }
+    } finally {
+      actionLoading.value = false
+    }
+  }
+
+  // 加载重装系统可用的镜像列表
+  const loadResetImages = async (instance) => {
+    const providerId = instance?.provider_id || instance?.providerId
+    if (!providerId) {
+      ElMessage.warning(t('admin.instances.instanceNotFound'))
+      return
+    }
+    loadingResetImages.value = true
+    try {
+      const res = await getFilteredImages({
+        provider_id: providerId,
+        instance_type: instance.instance_type || instance.instanceType
+      })
+      resetImageList.value = res.data?.data || res.data || []
+      selectedResetImage.value = instance.image || ''
+    } catch (err) {
+      console.error('Failed to load images for reset:', err)
+      resetImageList.value = []
+    } finally {
+      loadingResetImages.value = false
+    }
+  }
+
+  // 确认使用所选镜像重装系统
+  const confirmResetWithImage = async () => {
+    resetImageDialogVisible.value = false
+    const instance = actionInstance.value
+    if (!instance) return
+    actionLoading.value = true
+    const instanceId = instance.id
+    const instanceIndex = instances.value.findIndex(i => i.id === instanceId)
+    if (instanceIndex !== -1) {
+      instances.value[instanceIndex].status = 'resetting'
+    }
+    try {
+      await adminInstanceAction(instanceId, 'reset', { image: selectedResetImage.value || undefined })
+      ElMessage.success(t('admin.instances.taskCreated', { action: t('admin.instances.resetSystem') }))
+      actionDialogVisible.value = false
+      actionInstance.value = null
+      setTimeout(() => loadInstances(), 500)
+    } catch (error) {
+      ElMessage.error(t('admin.instances.actionFailed', { action: t('admin.instances.resetSystem') }))
+      await loadInstances()
     } finally {
       actionLoading.value = false
     }
@@ -447,6 +524,9 @@ export function useInstanceManagement() {
     searchUsers, searchingUsers, userOptions,
     canOpenInstanceDetail, isInstanceBusy,
     createShareLink,
+    resetImageDialogVisible, resetImageList, selectedResetImage, loadingResetImages,
+    confirmResetWithImage,
+    vncDialogVisible, vncInstanceId, vncInstanceName,
     t
   }
 }

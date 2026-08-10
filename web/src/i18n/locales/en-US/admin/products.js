@@ -69,5 +69,9 @@ export default {
   statusChangeFailed: 'Failed to change status',
   searchPlaceholder: 'Search product name',
   noProducts: 'No products',
-  loadFailed: 'Failed to load products'
+  loadFailed: 'Failed to load products',
+  stock: 'Stock',
+  maxPerUser: 'Max Per User',
+  stockHint: '-1 means unlimited stock',
+  maxPerUserHint: '0 means no limit'
 }

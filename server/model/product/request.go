@@ -90,13 +90,16 @@ type CreateProductRequest struct {
 	PeriodValue int     `json:"periodValue" binding:"required,min=1"` // 周期值
 	MaxSnapshots int    `json:"maxSnapshots" binding:"min=0"`         // 最大快照数
 	MaxPorts    int     `json:"maxPorts" binding:"min=0"`             // 最大端口映射数
+	Stock       int     `json:"stock"`                                // 库存数量，-1为不限
+	MaxPerUser  int     `json:"maxPerUser"`                           // 每人限购数量，0为不限
 	Status      int     `json:"status" binding:"oneof=0 1"`           // 状态
 	SortOrder   int     `json:"sortOrder"`                              // 排序
 	Icon        string  `json:"icon" binding:"max=256"`               // 图标URL
+	IsRecommended bool  `json:"isRecommended"`                          // 是否推荐到首页
 	ImageIDs    string  `json:"imageIds"`                               // 关联镜像ID列表
 	ProviderIDs string  `json:"providerIds"`                            // 节点限制
-	Stock       int64   `json:"stock"`                                  // 库存(-1=不限)
-	IsRecommended bool  `json:"isRecommended"`                          // 是否首页推荐
+	DefaultProviderID uint `json:"defaultProviderId"`                   // 默认节点ID(0=不指定)
+	DefaultImageID    uint `json:"defaultImageId"`                     // 默认镜像ID(0=不指定)
 }
 
 // UpdateProductRequest 更新产品请求
@@ -115,13 +118,16 @@ type UpdateProductRequest struct {
 	PeriodValue  int     `json:"periodValue" binding:"required,min=1"`
 	MaxSnapshots int     `json:"maxSnapshots" binding:"min=0"`
 	MaxPorts     int     `json:"maxPorts" binding:"min=0"`
+	Stock        int     `json:"stock"`           // 库存数量，-1为不限
+	MaxPerUser   int     `json:"maxPerUser"`      // 每人限购数量，0为不限
 	Status       int     `json:"status" binding:"oneof=0 1"`
 	SortOrder    int     `json:"sortOrder"`
 	Icon         string  `json:"icon" binding:"max=256"`
+	IsRecommended bool  `json:"isRecommended"`                          // 是否推荐到首页
 	ImageIDs     string  `json:"imageIds"`
 	ProviderIDs  string  `json:"providerIds"`
-	Stock        int64   `json:"stock"`                 // 库存(-1=不限)
-	IsRecommended bool   `json:"isRecommended"`        // 是否首页推荐
+	DefaultProviderID uint `json:"defaultProviderId"`   // 默认节点ID(0=不指定)
+	DefaultImageID    uint `json:"defaultImageId"`     // 默认镜像ID(0=不指定)
 }
 
 // UpdateProductStatusRequest 更新产品状态请求
@@ -144,4 +150,28 @@ type UpdateOrderStatusRequest struct {
 	PaymentStatus   *int   `json:"paymentStatus"`     // 0=未支付 1=已支付 2=支付失败 3=已退款（nil=不更新）
 	ProvisionStatus *int   `json:"provisionStatus"`   // 0=待开通 1=开通中 2=已开通 3=开通失败（nil=不更新）
 	Remark          string `json:"remark" binding:"max=512"`
+}
+
+// ========== 站点链接相关请求 ==========
+
+// CreateSiteLinkRequest 创建站点链接请求
+type CreateSiteLinkRequest struct {
+	Name        string `json:"name" binding:"required,max=128"`
+	URL         string `json:"url" binding:"max=512"`
+	IconURL     string `json:"iconUrl" binding:"max=512"`
+	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor"`
+	SortOrder   int    `json:"sortOrder"`
+	Status      int    `json:"status" binding:"oneof=0 1"`
+	Description string `json:"description" binding:"max=256"`
+}
+
+// UpdateSiteLinkRequest 更新站点链接请求
+type UpdateSiteLinkRequest struct {
+	Name        string `json:"name" binding:"required,max=128"`
+	URL         string `json:"url" binding:"max=512"`
+	IconURL     string `json:"iconUrl" binding:"max=512"`
+	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor"`
+	SortOrder   int    `json:"sortOrder"`
+	Status      int    `json:"status" binding:"oneof=0 1"`
+	Description string `json:"description" binding:"max=256"`
 }

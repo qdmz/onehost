@@ -108,6 +108,16 @@ func (s *SiteService) GetPublicSiteInfo() (map[string]interface{}, error) {
 		return nil, err
 	}
 
+	// 获取易支付启用的支付方式
+	yipayEnabledPayTypes := ""
+	var yipayConfig product.YiPayConfig
+	if err := global.APP_DB.Where("enabled = ?", true).First(&yipayConfig).Error; err == nil {
+		yipayEnabledPayTypes = yipayConfig.EnabledPayTypes
+		if yipayEnabledPayTypes == "" {
+			yipayEnabledPayTypes = "alipay,wxpay,qqpay"
+		}
+	}
+
 	// 只返回前端需要的公开字段
 	return map[string]interface{}{
 		"site_name":            config.SiteName,
@@ -132,6 +142,7 @@ func (s *SiteService) GetPublicSiteInfo() (map[string]interface{}, error) {
 		"contact_telegram":     config.ContactTelegram,
 		"show_balance":         config.ShowBalance,
 		"show_yipay":           config.ShowYiPay,
+		"yipay_pay_types":      yipayEnabledPayTypes,
 		"enable_registration":  config.EnableRegistration,
 		"enable_ticket":        config.EnableTicket,
 		"enable_product_store": config.EnableProductStore,

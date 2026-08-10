@@ -136,7 +136,7 @@ func (bp *BaseProvider) AllocatePort(ctx context.Context, providerID uint, prefe
 func (bp *BaseProvider) isPortAvailableInTx(tx *gorm.DB, providerID uint, port int) bool {
 	var count int64
 	result := tx.Model(&provider.Port{}).
-		Clauses(clause.Locking{Strength: "SHARE"}).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("provider_id = ? AND host_port <= ?", providerID, port).
 		Where("mapping_type IS NULL OR mapping_type = '' OR mapping_type <> 'controller'").
 		Where("CASE WHEN host_port_end > 0 THEN host_port_end WHEN port_count > 1 THEN host_port + port_count - 1 ELSE host_port END >= ?", port).

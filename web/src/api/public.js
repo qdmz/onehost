@@ -74,3 +74,12 @@ export const getRecommendedProducts = () => {
     method: 'get'
   })
 }
+
+// 获取站点链接（虚拟化平台/赞助方，公开）
+export const getSiteLinks = (linkType = '') => {
+  return request({
+    url: '/v1/public/site-links',
+    method: 'get',
+    params: linkType ? { linkType } : {}
+  })
+}

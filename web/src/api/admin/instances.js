@@ -37,11 +37,11 @@ export const deleteInstance = (id) => {
   })
 }
 
-export const adminInstanceAction = (id, action) => {
+export const adminInstanceAction = (id, action, extraData = {}) => {
   return instanceOperationRequest({
     url: `/v1/admin/instances/${id}/action`,
     method: 'post',
-    data: { action }
+    data: { action, ...extraData }
   })
 }
 
@@ -116,4 +116,21 @@ export const unfreezeInstance = (data) => {
     method: 'post',
     data
   })
+}
+
+// 管理员 VNC 控制台
+export const getAdminInstanceVNCInfo = (instanceId) => request({
+  url: `/v1/admin/instances/${instanceId}/vnc`,
+  method: 'get'
+})
+
+export const getAdminInstanceVNCWsUrl = (instanceId) => {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  let host = window.location.host
+  if (import.meta.env.MODE === 'development' && import.meta.env.VITE_SERVER_PORT) {
+    host = `${window.location.hostname}:${import.meta.env.VITE_SERVER_PORT}`
+  }
+  const token = sessionStorage.getItem('token') || ''
+  const query = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `${protocol}//${host}/api/v1/admin/instances/${instanceId}/vnc/ws${query}`
 }

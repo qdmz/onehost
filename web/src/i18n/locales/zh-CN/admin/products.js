@@ -78,5 +78,9 @@ export default {
   statusChangeFailed: '状态修改失败',
   searchPlaceholder: '搜索产品名称',
   noProducts: '暂无产品',
-  loadFailed: '加载产品列表失败'
+  loadFailed: '加载产品列表失败',
+  stock: '库存数量',
+  maxPerUser: '每人限购',
+  stockHint: '-1 表示不限库存',
+  maxPerUserHint: '0 表示不限购'
 }

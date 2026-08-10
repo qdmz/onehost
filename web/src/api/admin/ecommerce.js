@@ -206,3 +206,51 @@ export const getYiPayConfig = () => {
 export const updateYiPayConfig = (data) => {
   return request({ url: '/v1/admin/yipay-config', method: 'put', data })
 }
+
+// ========== 管理员站点链接管理 API ==========
+
+/**
+ * 获取站点链接列表
+ * @param {Object} params - 查询参数
+ * @returns {Promise}
+ */
+export const getAdminSiteLinkList = (params) => {
+  return request({ url: '/v1/admin/site-links', method: 'get', params })
+}
+
+/**
+ * 创建站点链接
+ * @param {Object} data - 站点链接数据
+ * @returns {Promise}
+ */
+export const createAdminSiteLink = (data) => {
+  return request({ url: '/v1/admin/site-links', method: 'post', data })
+}
+
+/**
+ * 获取站点链接详情
+ * @param {number} id - 站点链接ID
+ * @returns {Promise}
+ */
+export const getAdminSiteLinkDetail = (id) => {
+  return request({ url: `/v1/admin/site-links/${id}`, method: 'get' })
+}
+
+/**
+ * 更新站点链接
+ * @param {number} id - 站点链接ID
+ * @param {Object} data - 站点链接数据
+ * @returns {Promise}
+ */
+export const updateAdminSiteLink = (id, data) => {
+  return request({ url: `/v1/admin/site-links/${id}`, method: 'put', data })
+}
+
+/**
+ * 删除站点链接
+ * @param {number} id - 站点链接ID
+ * @returns {Promise}
+ */
+export const deleteAdminSiteLink = (id) => {
+  return request({ url: `/v1/admin/site-links/${id}`, method: 'delete' })
+}
