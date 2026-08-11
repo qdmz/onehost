@@ -228,6 +228,11 @@ func (ds *DatabaseService) FixSchemaColumns() error {
 				"show_sponsors":     "TINYINT DEFAULT 1",
 				"show_recommended":  "TINYINT DEFAULT 1",
 				"recommended_limit": "INT DEFAULT 8",
+				"recommended_title":     "VARCHAR(256) DEFAULT ''",
+				"recommended_subtitle":  "VARCHAR(512) DEFAULT ''",
+				"recommended_cols":      "INT DEFAULT 4",
+				"recommended_show_price": "TINYINT DEFAULT 1",
+				"recommended_show_specs": "TINYINT DEFAULT 1",
 			}
 			for col, ddl := range siteConfigNewCols {
 				if !cols[col] {

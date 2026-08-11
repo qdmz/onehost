@@ -186,10 +186,17 @@ type SiteConfig struct {
 	ShowHomeStats  bool   `json:"show_home_stats" gorm:"default:true"` // 是否显示首页统计
 
 	// 首页栏目开关（站点配置中可动态控制首页各显示栏目）
-	ShowPlatformsSection  bool `json:"show_platforms" gorm:"default:true"`   // 是否显示“支持的虚拟化平台”栏目
-	ShowSponsorsSection   bool `json:"show_sponsors" gorm:"default:true"`    // 是否显示“赞助方”栏目
-	ShowRecommendedSection bool `json:"show_recommended" gorm:"default:true"` // 是否显示“推荐产品”栏目
+	ShowPlatformsSection  bool `json:"show_platforms" gorm:"column:show_platforms;default:true"`   // 是否显示“支持的虚拟化平台”栏目
+	ShowSponsorsSection   bool `json:"show_sponsors" gorm:"column:show_sponsors;default:true"`    // 是否显示“赞助方”栏目
+	ShowRecommendedSection bool `json:"show_recommended" gorm:"column:show_recommended;default:true"` // 是否显示“推荐产品”栏目
 	RecommendedLimit      int  `json:"recommended_limit" gorm:"default:8"`   // 首页推荐产品数量
+
+	// 首页推荐产品「详细配置」（站点配置中可动态设置）
+	RecommendedTitle     string `json:"recommended_title" gorm:"size:256"`            // 推荐产品栏目标题（为空则用默认文案）
+	RecommendedSubtitle  string `json:"recommended_subtitle" gorm:"size:512"`         // 推荐产品栏目副标题
+	RecommendedCols      int    `json:"recommended_cols" gorm:"default:4"`            // 每行显示列数（2/3/4/6）
+	RecommendedShowPrice bool   `json:"recommended_show_price" gorm:"default:true"`   // 是否显示价格
+	RecommendedShowSpecs bool   `json:"recommended_show_specs" gorm:"default:true"`   // 是否显示规格详情（CPU/内存/磁盘/带宽/流量等）
 
 	// 主题配置
 	PrimaryColor   string `json:"primary_color" gorm:"size:64;default:#409EFF"` // 主题色

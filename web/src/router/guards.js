@@ -40,8 +40,18 @@ async function checkInitStatus() {
 }
 
 export function setupRouterGuards(router) {
+  // chunk 加载失败自动重载（一次）：部署后浏览器残留旧 index.html 指向已删除的 JS chunk 时，
+  // 会触发「Failed to fetch dynamically imported module」，导致「加载失败」。自动刷新一次即可恢复，
+  // 避免用户手动硬刷新。
+  let chunkReloaded = false
   router.onError((error) => {
     NProgress.done()
+    const msg = (error && error.message) ? error.message : ''
+    if (/Failed to fetch dynamically imported module/i.test(msg) && !chunkReloaded) {
+      chunkReloaded = true
+      window.location.reload()
+      return
+    }
     console.error('路由加载失败:', error)
     ElMessage.error(i18n.global.t('common.loadFailed'))
   })

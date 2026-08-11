@@ -344,6 +344,43 @@
           <el-input-number v-model="form.recommended_limit" :min="1" :max="20" />
         </el-form-item>
 
+        <el-divider content-position="left">
+          {{ t('admin.siteConfig.recommendedSettings') }}
+        </el-divider>
+
+        <el-form-item :label="t('admin.siteConfig.recommendedTitle')">
+          <el-input v-model="form.recommended_title" :placeholder="t('admin.siteConfig.recommendedTitlePlaceholder')" maxlength="256" />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.recommendedSubtitle')">
+          <el-input v-model="form.recommended_subtitle" :placeholder="t('admin.siteConfig.recommendedSubtitlePlaceholder')" maxlength="512" />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.recommendedCols')">
+          <el-select v-model="form.recommended_cols" style="width: 160px;">
+            <el-option label="2" :value="2" />
+            <el-option label="3" :value="3" />
+            <el-option label="4" :value="4" />
+            <el-option label="6" :value="6" />
+          </el-select>
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.recommendedShowPrice')">
+          <el-switch
+            v-model="form.recommended_show_price"
+            :active-text="t('admin.siteConfig.on')"
+            :inactive-text="t('admin.siteConfig.off')"
+          />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.recommendedShowSpecs')">
+          <el-switch
+            v-model="form.recommended_show_specs"
+            :active-text="t('admin.siteConfig.on')"
+            :inactive-text="t('admin.siteConfig.off')"
+          />
+        </el-form-item>
+
         <el-form-item :label="t('admin.siteConfig.copyrightText')">
           <el-input v-model="form.copyright_text" :placeholder="t('admin.siteConfig.copyrightTextPlaceholder')" maxlength="512" />
         </el-form-item>
@@ -455,6 +492,11 @@ const form = ref({
   show_sponsors: true,
   show_recommended: true,
   recommended_limit: 8,
+  recommended_title: '',
+  recommended_subtitle: '',
+  recommended_cols: 4,
+  recommended_show_price: true,
+  recommended_show_specs: true,
   copyright_text: ''
 })
 
@@ -503,6 +545,11 @@ const loadConfig = async () => {
         show_sponsors: data.show_sponsors !== false,
         show_recommended: data.show_recommended !== false,
         recommended_limit: Number(data.recommended_limit) > 0 ? Number(data.recommended_limit) : 8,
+        recommended_title: data.recommended_title || '',
+        recommended_subtitle: data.recommended_subtitle || '',
+        recommended_cols: Number(data.recommended_cols) > 0 ? Number(data.recommended_cols) : 4,
+        recommended_show_price: data.recommended_show_price !== false,
+        recommended_show_specs: data.recommended_show_specs !== false,
         copyright_text: data.copyright_text || ''
       }
     }

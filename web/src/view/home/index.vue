@@ -281,41 +281,85 @@
       <section
         v-if="siteStore.showRecommended && recommendedProducts.length > 0"
         class="recommended-section"
-        style="margin-top: 48px;"
       >
         <div class="section-header">
-          <h2>{{ t('home.recommendedProducts.title') }}</h2>
-          <p>{{ t('home.recommendedProducts.subtitle') }}</p>
+          <h2>{{ siteStore.recommendedTitle || t('home.recommendedProducts.title') }}</h2>
+          <p>{{ siteStore.recommendedSubtitle || t('home.recommendedProducts.subtitle') }}</p>
         </div>
         <div
-          style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 20px;"
+          class="recommended-grid"
+          :style="{ gridTemplateColumns: 'repeat(' + effectiveCols + ', minmax(0, 1fr))' }"
         >
           <el-card
             v-for="p in recommendedProducts"
             :key="p.id"
             shadow="hover"
-            style="cursor: pointer; border-radius: 12px;"
+            class="recommended-card"
             @click="goToStore"
           >
-            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
-              <el-icon :size="36" color="#16a34a"><Box /></el-icon>
-              <h3 style="margin: 0; font-size: 16px;">{{ p.name }}</h3>
+            <div class="rec-card-head">
+              <div class="rec-card-icon">
+                <img
+                  v-if="p.icon"
+                  :src="p.icon"
+                  :alt="p.name"
+                  class="rec-icon-img"
+                >
+                <el-icon v-else :size="30" color="#16a34a"><Box /></el-icon>
+              </div>
+              <div class="rec-card-title">
+                <h3 class="rec-name">{{ p.name }}</h3>
+                <span class="rec-type-tag">{{ categoryLabel(p) }}</span>
+              </div>
             </div>
-            <p style="color: #6b7280; font-size: 13px; min-height: 38px; margin: 0 0 10px;">{{ p.description }}</p>
-            <div style="display: flex; gap: 12px; color: #374151; font-size: 13px; margin-bottom: 12px;">
-              <span>{{ p.cpu }} {{ t('user.store.cores') }}</span>
-              <span>{{ p.memory >= 1024 ? (p.memory / 1024) + ' GB' : p.memory + ' MB' }}</span>
-              <span>{{ p.stock < 0 ? t('user.store.stockUnlimited') : (p.stock + ' ' + t('user.store.stock')) }}</span>
+            <p class="rec-desc">{{ p.description }}</p>
+
+            <div
+              v-if="siteStore.recommendedShowSpecs"
+              class="rec-specs"
+            >
+              <div class="rec-spec">
+                <span class="rec-spec-label">{{ t('user.store.cpu') }}</span>
+                <span class="rec-spec-val">{{ p.cpu }} {{ t('user.store.cores') }}</span>
+              </div>
+              <div class="rec-spec">
+                <span class="rec-spec-label">{{ t('user.store.memory') }}</span>
+                <span class="rec-spec-val">{{ formatMB(p.memory) }}</span>
+              </div>
+              <div class="rec-spec">
+                <span class="rec-spec-label">{{ t('user.store.disk') }}</span>
+                <span class="rec-spec-val">{{ formatMB(p.disk) }}</span>
+              </div>
+              <div class="rec-spec">
+                <span class="rec-spec-label">{{ t('user.store.bandwidth') }}</span>
+                <span class="rec-spec-val">{{ p.bandwidth }} Mbps</span>
+              </div>
+              <div class="rec-spec">
+                <span class="rec-spec-label">{{ t('user.store.traffic') }}</span>
+                <span class="rec-spec-val">{{ formatMB(p.traffic) }}</span>
+              </div>
             </div>
-            <div style="color: #f56c6c; font-weight: 600;">
-              <span style="font-size: 12px;">¥</span>
-              <span style="font-size: 20px;">{{ p.price }}</span>
-              <span style="font-size: 12px; color: #9ca3af;">/{{ t('user.store.perMonth') }}</span>
+
+            <div class="rec-footer">
+              <div
+                v-if="siteStore.recommendedShowPrice"
+                class="rec-price"
+              >
+                <span class="rec-price-symbol">¥</span>
+                <span class="rec-price-num">{{ p.price }}</span>
+                <span class="rec-price-unit">/{{ periodLabel(p) }}</span>
+              </div>
+              <div class="rec-stock">
+                {{ p.stock < 0 ? t('user.store.stockUnlimited') : (p.stock + ' ' + t('user.store.stock')) }}
+              </div>
             </div>
           </el-card>
         </div>
-        <div style="text-align: center; margin-top: 24px;">
-          <router-link to="/user/store" class="btn btn-secondary">{{ t('home.recommendedProducts.viewAll') }}</router-link>
+        <div class="rec-viewall">
+          <router-link
+            to="/user/store"
+            class="btn btn-secondary"
+          >{{ t('home.recommendedProducts.viewAll') }}</router-link>
         </div>
       </section>
     </main>
@@ -635,6 +679,40 @@ const fetchRecommendedProducts = async () => {
 
 const goToStore = () => {
   router.push('/user/store')
+}
+
+// 推荐产品每行列数（来自站点配置，限制在 2~6 之间）
+const effectiveCols = computed(() => {
+  const c = Number(siteStore.recommendedCols)
+  if (!c || c < 2) return 2
+  if (c > 6) return 6
+  return c
+})
+
+// 产品类型/类别标签
+const categoryLabel = (p) => {
+  if (!p) return ''
+  if (p.category === 'container') return t('user.store.categoryContainer')
+  if (p.category === 'vm') return t('user.store.categoryVM')
+  return p.type || ''
+}
+
+// 将 MB 格式化为 GB / MB
+const formatMB = (mb) => {
+  const n = Number(mb) || 0
+  if (n >= 1024) return (n / 1024) + ' GB'
+  return n + ' MB'
+}
+
+// 计费周期后缀
+const periodLabel = (p) => {
+  const map = {
+    month: t('user.store.perMonth'),
+    day: t('user.store.perDay'),
+    year: t('user.store.perYear'),
+    hour: t('user.store.perHour')
+  }
+  return map[p && p.periodType] || t('user.store.perMonth')
 }
 
 const checkInitStatus = async () => {

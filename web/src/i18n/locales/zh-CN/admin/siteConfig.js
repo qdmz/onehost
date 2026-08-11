@@ -80,6 +80,14 @@ export default {
   showSponsors: '显示赞助方栏目',
   showRecommended: '显示推荐产品栏目',
   recommendedLimit: '推荐产品数量',
+  recommendedSettings: '推荐产品设置',
+  recommendedTitle: '栏目标题',
+  recommendedTitlePlaceholder: '留空则使用默认文案「推荐产品」',
+  recommendedSubtitle: '栏目副标题',
+  recommendedSubtitlePlaceholder: '留空则使用默认文案',
+  recommendedCols: '每行列数',
+  recommendedShowPrice: '显示价格',
+  recommendedShowSpecs: '显示规格详情',
   copyrightText: '版权信息',
   copyrightTextPlaceholder: '留空则使用默认版权信息'
 }

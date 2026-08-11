@@ -80,6 +80,14 @@ export default {
   showSponsors: 'Show Sponsors',
   showRecommended: 'Show Recommended Products',
   recommendedLimit: 'Recommended Products Count',
+  recommendedSettings: 'Recommended Products Settings',
+  recommendedTitle: 'Section Title',
+  recommendedTitlePlaceholder: 'Leave empty to use the default "Recommended Products"',
+  recommendedSubtitle: 'Section Subtitle',
+  recommendedSubtitlePlaceholder: 'Leave empty to use the default text',
+  recommendedCols: 'Columns per Row',
+  recommendedShowPrice: 'Show Price',
+  recommendedShowSpecs: 'Show Spec Details',
   copyrightText: 'Copyright Text',
   copyrightTextPlaceholder: 'Left empty to use the default copyright'
 }

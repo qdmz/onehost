@@ -134,6 +134,11 @@ func (s *SiteService) GetPublicSiteInfo() (map[string]interface{}, error) {
 		"show_sponsors":        config.ShowSponsorsSection,
 		"show_recommended":     config.ShowRecommendedSection,
 		"recommended_limit":    config.RecommendedLimit,
+		"recommended_title":    config.RecommendedTitle,
+		"recommended_subtitle": config.RecommendedSubtitle,
+		"recommended_cols":     config.RecommendedCols,
+		"recommended_show_price": config.RecommendedShowPrice,
+		"recommended_show_specs": config.RecommendedShowSpecs,
 		"primary_color":        config.PrimaryColor,
 		"theme_mode":           config.ThemeMode,
 		"custom_css":           config.CustomCSS,
@@ -177,6 +182,8 @@ var allowedSiteConfigKeys = map[string]bool{
 	"enable_registration": true, "enable_ticket": true, "enable_product_store": true,
 	"announcement_bar": true, "announcement_enabled": true,
 	"show_platforms": true, "show_sponsors": true, "show_recommended": true, "recommended_limit": true,
+	"recommended_title": true, "recommended_subtitle": true, "recommended_cols": true,
+	"recommended_show_price": true, "recommended_show_specs": true,
 }
 
 // jsonKeyToColumn 修正「JSON 字段名与数据库列名不一致」的字段。
@@ -201,8 +208,8 @@ func (s *SiteService) UpdateSiteConfigFields(m map[string]interface{}) error {
 		if !allowedSiteConfigKeys[k] {
 			continue
 		}
-		// 数值型字段（如 recommended_limit）在 JSON 反序列化后为 float64，转回 int 避免类型不匹配
-		if k == "recommended_limit" {
+		// 数值型字段（如 recommended_limit / recommended_cols）在 JSON 反序列化后为 float64，转回 int 避免类型不匹配
+		if k == "recommended_limit" || k == "recommended_cols" {
 			if f, ok := v.(float64); ok {
 				v = int(f)
 			}

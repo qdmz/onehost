@@ -54,6 +54,12 @@ export const useSiteStore = defineStore('site', () => {
   const showSponsors = ref(true)
   const showRecommended = ref(true)
   const recommendedLimit = ref(8)
+  // 推荐产品详细配置
+  const recommendedTitle = ref('')
+  const recommendedSubtitle = ref('')
+  const recommendedCols = ref(4)
+  const recommendedShowPrice = ref(true)
+  const recommendedShowSpecs = ref(true)
   // 其它展示项
   const copyrightText = ref('')
   const darkLogoURL = ref('')
@@ -148,6 +154,11 @@ export const useSiteStore = defineStore('site', () => {
         showSponsors.value = data.show_sponsors !== false
         showRecommended.value = data.show_recommended !== false
         recommendedLimit.value = Number(data.recommended_limit) > 0 ? Number(data.recommended_limit) : 8
+        recommendedTitle.value = data.recommended_title || ''
+        recommendedSubtitle.value = data.recommended_subtitle || ''
+        recommendedCols.value = Number(data.recommended_cols) > 0 ? Number(data.recommended_cols) : 4
+        recommendedShowPrice.value = data.recommended_show_price !== false
+        recommendedShowSpecs.value = data.recommended_show_specs !== false
         copyrightText.value = data.copyright_text || ''
         contactPhone.value = data.contact_phone || ''
         contactQQ.value = data.contact_qq || ''
@@ -270,6 +281,11 @@ export const useSiteStore = defineStore('site', () => {
     showSponsors,
     showRecommended,
     recommendedLimit,
+    recommendedTitle,
+    recommendedSubtitle,
+    recommendedCols,
+    recommendedShowPrice,
+    recommendedShowSpecs,
     copyrightText,
     darkLogoURL,
     contactPhone,
