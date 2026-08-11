@@ -61,6 +61,7 @@ export default {
     documentation: 'Documentation',
     feedback: 'Issue Feedback',
     communityGroup: 'Community Group',
+    friendLinks: 'Friend Links',
     allRightsReserved: 'All rights reserved.',
     openSourceProject: 'Open Source Projects by OneClickVirt',
     serverVersion: 'Server',

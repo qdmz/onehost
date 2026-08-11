@@ -67,5 +67,19 @@ export default {
   saveSuccess: '站点配置保存成功',
   saveFailed: '站点配置保存失败',
   validationFailed: '表单验证失败，请检查输入',
-  resetSuccess: '已重置为最新配置'
+  resetSuccess: '已重置为最新配置',
+  homepageSettings: '首页设置',
+  homeTitle: '首页大标题',
+  homeTitlePlaceholder: '留空则使用默认标题',
+  homeSubtitle: '首页副标题',
+  homeSubtitlePlaceholder: '留空则使用默认副标题',
+  homeBackground: '首页背景图',
+  showHomeStats: '显示平台统计',
+  homepageSections: '首页显示栏目',
+  showPlatforms: '显示虚拟化平台栏目',
+  showSponsors: '显示赞助方栏目',
+  showRecommended: '显示推荐产品栏目',
+  recommendedLimit: '推荐产品数量',
+  copyrightText: '版权信息',
+  copyrightTextPlaceholder: '留空则使用默认版权信息'
 }

@@ -130,6 +130,10 @@ func (s *SiteService) GetPublicSiteInfo() (map[string]interface{}, error) {
 		"home_subtitle":        config.HomeSubtitle,
 		"home_background":      config.HomeBackground,
 		"show_home_stats":      config.ShowHomeStats,
+		"show_platforms":       config.ShowPlatformsSection,
+		"show_sponsors":        config.ShowSponsorsSection,
+		"show_recommended":     config.ShowRecommendedSection,
+		"recommended_limit":    config.RecommendedLimit,
 		"primary_color":        config.PrimaryColor,
 		"theme_mode":           config.ThemeMode,
 		"custom_css":           config.CustomCSS,
@@ -160,39 +164,63 @@ func (s *SiteService) GetAdminSiteConfig() (*product.SiteConfig, error) {
 	return s.GetSiteConfig()
 }
 
-// UpdateSiteConfig 更新站点配置
-func (s *SiteService) UpdateSiteConfig(config *product.SiteConfig) error {
-	if config == nil {
-		return errors.New("配置不能为空")
+// allowedSiteConfigKeys 站点配置允许通过接口更新的字段白名单（JSON key == 数据库列名）
+var allowedSiteConfigKeys = map[string]bool{
+	"site_name": true, "site_description": true, "site_keywords": true,
+	"logo_url": true, "favicon_url": true, "dark_logo_url": true,
+	"custom_header": true, "header_enabled": true, "show_nav": true,
+	"custom_footer": true, "footer_enabled": true, "copyright_text": true, "icp_number": true,
+	"home_title": true, "home_subtitle": true, "home_background": true, "show_home_stats": true,
+	"primary_color": true, "theme_mode": true, "custom_css": true,
+	"contact_email": true, "contact_phone": true, "contact_qq": true, "contact_telegram": true,
+	"show_balance": true, "show_yipay": true,
+	"enable_registration": true, "enable_ticket": true, "enable_product_store": true,
+	"announcement_bar": true, "announcement_enabled": true,
+	"show_platforms": true, "show_sponsors": true, "show_recommended": true, "recommended_limit": true,
+}
+
+// UpdateSiteConfigFields 部分更新站点配置
+// 只更新请求中提供的字段（白名单内），未提供的字段保持不变，
+// 从而修复此前使用 Save() 整体覆盖导致未提交字段（如首页配置）被清零的问题。
+func (s *SiteService) UpdateSiteConfigFields(m map[string]interface{}) error {
+	if len(m) == 0 {
+		return nil
+	}
+
+	updates := make(map[string]interface{})
+	for k, v := range m {
+		if !allowedSiteConfigKeys[k] {
+			continue
+		}
+		// 数值型字段（如 recommended_limit）在 JSON 反序列化后为 float64，转回 int 避免类型不匹配
+		if k == "recommended_limit" {
+			if f, ok := v.(float64); ok {
+				v = int(f)
+			}
+		}
+		updates[k] = v
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	// 确保配置行存在（GetSiteConfig 会在缺失时创建默认行）
+	if _, err := s.GetSiteConfig(); err != nil {
+		return err
 	}
 
 	var existing product.SiteConfig
 	if err := global.APP_DB.First(&existing).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 不存在则创建
-			if err := global.APP_DB.Create(config).Error; err != nil {
-				global.APP_LOG.Error("创建站点配置失败", zap.Error(err))
-				return err
-			}
-			s.setCachedConfig(config)
-			global.APP_LOG.Info("创建站点配置成功")
-			return nil
-		}
 		return err
 	}
 
-	// 使用 Save 而非 Updates，确保零值布尔字段也能正确更新
-	config.ID = existing.ID
-	config.CreatedAt = existing.CreatedAt
-	if err := global.APP_DB.Save(config).Error; err != nil {
+	if err := global.APP_DB.Model(&existing).Updates(updates).Error; err != nil {
 		global.APP_LOG.Error("更新站点配置失败", zap.Error(err))
 		return err
 	}
 
-	// 使缓存失效
 	s.invalidateCache()
-
-	global.APP_LOG.Info("更新站点配置成功", zap.Uint("configID", existing.ID))
+	global.APP_LOG.Info("更新站点配置成功", zap.Uint("configID", existing.ID), zap.Int("fields", len(updates)))
 	return nil
 }
 

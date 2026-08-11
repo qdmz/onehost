@@ -218,6 +218,32 @@ func (ds *DatabaseService) FixSchemaColumns() error {
 	global.APP_LOG.Debug("site_links 表已存在，跳过创建")
 }
 
+	// === 8.5 为 site_configs 表补充首页栏目开关等新列 ===
+	// SiteConfig 仅在首次安装时 AutoMigrate，已初始化的实例不会自动加列，这里手动补齐，
+	// 否则旧库缺少 show_platforms / show_sponsors / show_recommended / recommended_limit 等列。
+	if db.Migrator().HasTable("site_configs") {
+		if cols, err := ds.getTableColumns(db, "site_configs"); err == nil {
+			siteConfigNewCols := map[string]string{
+				"show_platforms":    "TINYINT DEFAULT 1",
+				"show_sponsors":     "TINYINT DEFAULT 1",
+				"show_recommended":  "TINYINT DEFAULT 1",
+				"recommended_limit": "INT DEFAULT 8",
+			}
+			for col, ddl := range siteConfigNewCols {
+				if !cols[col] {
+					global.APP_LOG.Info("正在为 site_configs 表添加列 " + col)
+					if _, e := sqlDB.Exec("ALTER TABLE `site_configs` ADD COLUMN `" + col + "` " + ddl); e != nil {
+						global.APP_LOG.Warn("添加 site_configs."+col+" 列失败", zap.Error(e))
+					} else {
+						global.APP_LOG.Info("site_configs." + col + " 列添加完成")
+					}
+				}
+			}
+		} else {
+			global.APP_LOG.Warn("获取 site_configs 表列信息失败，跳过新列添加", zap.Error(err))
+		}
+	}
+
 	// === 9. 修复 system_configs 重复数据并重建唯一索引 ===
 	// 该修复在「已初始化」与「全新安装」两条路径都会执行（FixSchemaColumns 均被调用），
 	// 且早于 ConfigManager 加载配置，确保后续 upsert 真正去重。

@@ -61,6 +61,7 @@ export default {
     documentation: '使用文档',
     feedback: '问题反馈',
     communityGroup: '交流群组',
+    friendLinks: '友情链接',
     allRightsReserved: 'All rights reserved.',
     openSourceProject: '一键虚拟化旗下开源项目',
     serverVersion: '主控版本',

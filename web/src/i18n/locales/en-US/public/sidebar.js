@@ -45,5 +45,6 @@ export default {
   productManagement: 'Product Management',
   orderManagement: 'Order Management',
   ticketManagement: 'Ticket Management',
-  siteConfig: 'Site Configuration'
+  siteConfig: 'Site Configuration',
+  siteLink: 'Site Links'
 }

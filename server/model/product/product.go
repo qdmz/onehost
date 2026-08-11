@@ -185,6 +185,12 @@ type SiteConfig struct {
 	HomeBackground string `json:"home_background" gorm:"size:512"`   // 首页背景图
 	ShowHomeStats  bool   `json:"show_home_stats" gorm:"default:true"` // 是否显示首页统计
 
+	// 首页栏目开关（站点配置中可动态控制首页各显示栏目）
+	ShowPlatformsSection  bool `json:"show_platforms" gorm:"default:true"`   // 是否显示“支持的虚拟化平台”栏目
+	ShowSponsorsSection   bool `json:"show_sponsors" gorm:"default:true"`    // 是否显示“赞助方”栏目
+	ShowRecommendedSection bool `json:"show_recommended" gorm:"default:true"` // 是否显示“推荐产品”栏目
+	RecommendedLimit      int  `json:"recommended_limit" gorm:"default:8"`   // 首页推荐产品数量
+
 	// 主题配置
 	PrimaryColor   string `json:"primary_color" gorm:"size:64;default:#409EFF"` // 主题色
 	ThemeMode      string `json:"theme_mode" gorm:"default:auto;size:16"`       // light/dark/auto

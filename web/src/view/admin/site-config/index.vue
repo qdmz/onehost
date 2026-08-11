@@ -286,6 +286,67 @@
             :inactive-text="t('admin.siteConfig.off')"
           />
         </el-form-item>
+
+        <!-- 首页设置 -->
+        <el-divider content-position="left">
+          {{ t('admin.siteConfig.homepageSettings') }}
+        </el-divider>
+
+        <el-form-item :label="t('admin.siteConfig.homeTitle')">
+          <el-input v-model="form.home_title" :placeholder="t('admin.siteConfig.homeTitlePlaceholder')" maxlength="256" />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.homeSubtitle')">
+          <el-input v-model="form.home_subtitle" :placeholder="t('admin.siteConfig.homeSubtitlePlaceholder')" maxlength="512" />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.homeBackground')">
+          <el-input v-model="form.home_background" placeholder="https://..." maxlength="512" />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.showHomeStats')">
+          <el-switch
+            v-model="form.show_home_stats"
+            :active-text="t('admin.siteConfig.on')"
+            :inactive-text="t('admin.siteConfig.off')"
+          />
+        </el-form-item>
+
+        <el-divider content-position="left">
+          {{ t('admin.siteConfig.homepageSections') }}
+        </el-divider>
+
+        <el-form-item :label="t('admin.siteConfig.showPlatforms')">
+          <el-switch
+            v-model="form.show_platforms"
+            :active-text="t('admin.siteConfig.on')"
+            :inactive-text="t('admin.siteConfig.off')"
+          />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.showSponsors')">
+          <el-switch
+            v-model="form.show_sponsors"
+            :active-text="t('admin.siteConfig.on')"
+            :inactive-text="t('admin.siteConfig.off')"
+          />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.showRecommended')">
+          <el-switch
+            v-model="form.show_recommended"
+            :active-text="t('admin.siteConfig.on')"
+            :inactive-text="t('admin.siteConfig.off')"
+          />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.recommendedLimit')">
+          <el-input-number v-model="form.recommended_limit" :min="1" :max="20" />
+        </el-form-item>
+
+        <el-form-item :label="t('admin.siteConfig.copyrightText')">
+          <el-input v-model="form.copyright_text" :placeholder="t('admin.siteConfig.copyrightTextPlaceholder')" maxlength="512" />
+        </el-form-item>
       </el-form>
 
       <!-- 底部操作按钮 -->
@@ -385,7 +446,16 @@ const form = ref({
   enable_product_store: true,
   show_yipay: false,
   enable_ticket: true,
-  announcement_enabled: false
+  announcement_enabled: false,
+  home_title: '',
+  home_subtitle: '',
+  home_background: '',
+  show_home_stats: true,
+  show_platforms: true,
+  show_sponsors: true,
+  show_recommended: true,
+  recommended_limit: 8,
+  copyright_text: ''
 })
 
 // 表单验证规则
@@ -424,7 +494,16 @@ const loadConfig = async () => {
         enable_product_store: data.enable_product_store !== false,
         show_yipay: data.show_yipay === true,
         enable_ticket: data.enable_ticket !== false,
-        announcement_enabled: data.announcement_enabled === true
+        announcement_enabled: data.announcement_enabled === true,
+        home_title: data.home_title || '',
+        home_subtitle: data.home_subtitle || '',
+        home_background: data.home_background || '',
+        show_home_stats: data.show_home_stats !== false,
+        show_platforms: data.show_platforms !== false,
+        show_sponsors: data.show_sponsors !== false,
+        show_recommended: data.show_recommended !== false,
+        recommended_limit: Number(data.recommended_limit) > 0 ? Number(data.recommended_limit) : 8,
+        copyright_text: data.copyright_text || ''
       }
     }
   } catch (error) {

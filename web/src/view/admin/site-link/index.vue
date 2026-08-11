@@ -16,6 +16,7 @@
           <el-select v-model="queryParams.linkType" placeholder="全部" clearable>
             <el-option label="虚拟化平台" value="platform" />
             <el-option label="赞助方" value="sponsor" />
+            <el-option label="页脚友链" value="footer" />
           </el-select>
         </el-form-item>
         <el-form-item label="状态">
@@ -98,6 +99,7 @@
           <el-select v-model="form.linkType" placeholder="请选择类型">
             <el-option label="虚拟化平台" value="platform" />
             <el-option label="赞助方" value="sponsor" />
+            <el-option label="页脚友链" value="footer" />
           </el-select>
         </el-form-item>
 
@@ -223,7 +225,7 @@ const handleAdd = () => {
 }
 
 // 编辑
-const handleEdit (row) => {
+const handleEdit = (row) => {
   Object.assign(form, {
     id: row.id,
     name: row.name,

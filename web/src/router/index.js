@@ -508,6 +508,16 @@ const routes = [
         }
       },
       {
+        path: 'site-link',
+        name: 'AdminSiteLink',
+        component: () => import('@/view/admin/site-link/index.vue'),
+        meta: {
+          title: 'sidebar.siteLink',
+          requiresAuth: true,
+          roles: ['admin']
+        }
+      },
+      {
         path: 'yipay-config',
         name: 'AdminYipayConfig',
         component: () => import('@/view/admin/yipay-config/index.vue'),

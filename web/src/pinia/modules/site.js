@@ -43,6 +43,29 @@ export const useSiteStore = defineStore('site', () => {
   // 是否已经初始化
   const initialized = ref(false)
 
+  // ===== 首页与站点展示配置（来自完整站点配置） =====
+  // 首页英雄区
+  const homeTitle = ref('')
+  const homeSubtitle = ref('')
+  const homeBackground = ref('')
+  const showHomeStats = ref(true)
+  // 首页各显示栏目开关
+  const showPlatforms = ref(true)
+  const showSponsors = ref(true)
+  const showRecommended = ref(true)
+  const recommendedLimit = ref(8)
+  // 其它展示项
+  const copyrightText = ref('')
+  const darkLogoURL = ref('')
+  const contactPhone = ref('')
+  const contactQQ = ref('')
+  const contactTelegram = ref('')
+  const showBalance = ref(true)
+  const showNav = ref(true)
+  const headerEnabled = ref(false)
+  const footerEnabled = ref(false)
+  const announcementBar = ref('')
+
   // 默认 Logo 资源路径（用于 img src 属性）
   const defaultLogoSrc = new URL('@/assets/images/logo.png', import.meta.url).href
 
@@ -97,21 +120,39 @@ export const useSiteStore = defineStore('site', () => {
         siteDescription.value = data.site_description || ''
         siteKeywords.value = data.site_keywords || ''
         contactEmail.value = data.contact_email || ''
-        icp.value = data.icp || ''
+        icp.value = data.icp_number || ''
         faviconURL.value = data.favicon_url || ''
+        darkLogoURL.value = data.dark_logo_url || ''
         primaryColor.value = data.primary_color || '#2563eb'
         customCSS.value = data.custom_css || ''
         customHeader.value = data.custom_header || ''
         customFooter.value = data.custom_footer || ''
-        enableRegister.value = data.enable_register !== false
-        enableStore.value = data.enable_store !== false
-        enableRecharge.value = data.enable_recharge !== false
+        // 功能开关（字段名须与后端 GetPublicSiteInfo 返回保持一致）
+        enableRegister.value = data.enable_registration !== false
+        enableStore.value = data.enable_product_store !== false
         enableTicket.value = data.enable_ticket !== false
-        enableAnnouncement.value = data.enable_announcement !== false
+        enableAnnouncement.value = data.announcement_enabled === true
+        showBalance.value = data.show_balance !== false
+        showYiPay.value = data.show_yipay !== false
+        showNav.value = data.show_nav !== false
+        headerEnabled.value = data.header_enabled === true
+        footerEnabled.value = data.footer_enabled === true
         maintenanceMode.value = data.maintenance_mode === true
         maintenanceMessage.value = data.maintenance_message || ''
-        // 易支付开关
-        showYiPay.value = data.show_yipay !== false
+        // 首页配置
+        homeTitle.value = data.home_title || ''
+        homeSubtitle.value = data.home_subtitle || ''
+        homeBackground.value = data.home_background || ''
+        showHomeStats.value = data.show_home_stats !== false
+        showPlatforms.value = data.show_platforms !== false
+        showSponsors.value = data.show_sponsors !== false
+        showRecommended.value = data.show_recommended !== false
+        recommendedLimit.value = Number(data.recommended_limit) > 0 ? Number(data.recommended_limit) : 8
+        copyrightText.value = data.copyright_text || ''
+        contactPhone.value = data.contact_phone || ''
+        contactQQ.value = data.contact_qq || ''
+        contactTelegram.value = data.contact_telegram || ''
+        announcementBar.value = data.announcement_bar || ''
         // 启用的支付方式（来自后台“启用的支付方式”）
         if (data.yipay_pay_types) {
           const arr = String(data.yipay_pay_types).split(',').map(s => s.trim()).filter(Boolean)
@@ -221,6 +262,24 @@ export const useSiteStore = defineStore('site', () => {
     maintenanceMessage,
     showYiPay,
     enabledPayTypes,
+    homeTitle,
+    homeSubtitle,
+    homeBackground,
+    showHomeStats,
+    showPlatforms,
+    showSponsors,
+    showRecommended,
+    recommendedLimit,
+    copyrightText,
+    darkLogoURL,
+    contactPhone,
+    contactQQ,
+    contactTelegram,
+    showBalance,
+    showNav,
+    headerEnabled,
+    footerEnabled,
+    announcementBar,
     fetchSiteConfig,
     fetchFullSiteConfig,
     applyPrimaryColor,

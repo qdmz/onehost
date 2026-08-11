@@ -463,6 +463,14 @@ const userRoutes = computed(() => {
             }
           },
           {
+            path: '/admin/site-link',
+            name: 'AdminSiteLink',
+            meta: {
+              title: 'sidebar.siteLink',
+              icon: 'Link'
+            }
+          },
+          {
             path: '/admin/yipay-config',
             name: 'AdminYipayConfig',
             meta: {

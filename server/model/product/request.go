@@ -159,7 +159,7 @@ type CreateSiteLinkRequest struct {
 	Name        string `json:"name" binding:"required,max=128"`
 	URL         string `json:"url" binding:"max=512"`
 	IconURL     string `json:"iconUrl" binding:"max=512"`
-	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor"`
+	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor footer"`
 	SortOrder   int    `json:"sortOrder"`
 	Status      int    `json:"status" binding:"oneof=0 1"`
 	Description string `json:"description" binding:"max=256"`
@@ -170,7 +170,7 @@ type UpdateSiteLinkRequest struct {
 	Name        string `json:"name" binding:"required,max=128"`
 	URL         string `json:"url" binding:"max=512"`
 	IconURL     string `json:"iconUrl" binding:"max=512"`
-	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor"`
+	LinkType    string `json:"linkType" binding:"required,oneof=platform sponsor footer"`
 	SortOrder   int    `json:"sortOrder"`
 	Status      int    `json:"status" binding:"oneof=0 1"`
 	Description string `json:"description" binding:"max=256"`

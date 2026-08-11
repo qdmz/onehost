@@ -48,13 +48,16 @@
     <!-- 主要内容 -->
     <main class="home-main">
       <!-- 英雄区域 -->
-      <section class="hero-section">
+      <section
+        class="hero-section"
+        :style="heroStyle"
+      >
         <div class="hero-content">
           <h1 class="hero-title">
-            {{ t('home.hero.title') }}
+            {{ siteStore.homeTitle || t('home.hero.title') }}
           </h1>
           <p class="hero-description">
-            {{ t('home.hero.description') }}
+            {{ siteStore.homeSubtitle || t('home.hero.description') }}
           </p>
           <div class="hero-actions">
             <router-link
@@ -163,13 +166,16 @@
       </section>
 
       <!-- 支持的虚拟化平台 -->
-      <section class="platforms-section">
+      <section
+        v-if="siteStore.showPlatforms"
+        class="platforms-section"
+      >
         <div class="section-header">
           <h2>{{ t('home.platforms.title') }}</h2>
           <p>{{ t('home.platforms.description') }}</p>
         </div>
         <LogoCarousel
-          :items="platforms"
+          :items="platformList"
           :speed="35"
           direction="left"
           :gap="24"
@@ -207,14 +213,17 @@
       </section>
 
       <!-- 赞助方 -->
-      <section class="supporters-section">
+      <section
+        v-if="siteStore.showSponsors"
+        class="supporters-section"
+      >
         <div class="section-header">
           <h2>{{ t('home.supporters.title') }}</h2>
           <p>{{ t('home.supporters.description') }}</p>
         </div>
         <div class="supporters-grid">
           <a
-            v-for="item in footerSponsors"
+            v-for="item in sponsorList"
             :key="item.name"
             :href="item.href"
             target="_blank"
@@ -270,7 +279,7 @@
 
       <!-- 推荐产品 -->
       <section
-        v-if="recommendedProducts.length > 0"
+        v-if="siteStore.showRecommended && recommendedProducts.length > 0"
         class="recommended-section"
         style="margin-top: 48px;"
       >
@@ -345,120 +354,26 @@
           </a>
         </div>
 
-        <div class="footer-links-grid">
+        <div
+          v-if="footerLinkList.length > 0"
+          class="footer-links-grid"
+        >
           <div class="footer-col">
             <h4 class="footer-col-title">
               <span class="footer-col-dot" />
-              {{ t('home.footer.coreProjects') }}
+              {{ t('home.footer.friendLinks') }}
             </h4>
             <ul class="footer-link-list">
-              <li>
+              <li
+                v-for="l in footerLinkList"
+                :key="l.id"
+              >
                 <a
-                  href="https://github.com/oneclickvirt/oneclickvirt"
+                  :href="l.href"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  <span class="link-arrow">›</span>OneClickVirt
-                </a>
-              </li>
-              <li>
-                <a
-                  href="https://github.com/oneclickvirt/ecs"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>ECS
-                </a>
-              </li>
-            </ul>
-          </div>
-
-          <div class="footer-col">
-            <h4 class="footer-col-title">
-              <span class="footer-col-dot" />
-              {{ t('home.footer.relatedProjects') }}
-            </h4>
-            <ul class="footer-link-list">
-              <li>
-                <a
-                  href="https://github.com/oneclickvirt/pve"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>Proxmox VE
-                </a>
-              </li>
-              <li>
-                <a
-                  href="https://github.com/oneclickvirt/incus"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>Incus
-                </a>
-              </li>
-              <li>
-                <a
-                  href="https://github.com/oneclickvirt/docker"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>Docker
-                </a>
-              </li>
-              <li>
-                <a
-                  href="https://github.com/oneclickvirt/lxd"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>LXD
-                </a>
-              </li>
-              <li>
-                <a
-                  href="https://github.com/oneclickvirt"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  class="more-link"
-                >
-                  <span class="link-arrow">›</span>{{ t('home.footer.moreProjects') }}
-                </a>
-              </li>
-            </ul>
-          </div>
-
-          <div class="footer-col">
-            <h4 class="footer-col-title">
-              <span class="footer-col-dot" />
-              {{ t('home.footer.supportAndDocs') }}
-            </h4>
-            <ul class="footer-link-list">
-              <li>
-                <a
-                  href="https://www.spiritlhl.net/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>{{ t('home.footer.documentation') }}
-                </a>
-              </li>
-              <li>
-                <a
-                  href="https://github.com/oneclickvirt/oneclickvirt/issues"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>{{ t('home.footer.feedback') }}
-                </a>
-              </li>
-              <li>
-                <a
-                  href="https://t.me/oneclickvirt"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <span class="link-arrow">›</span>{{ t('home.footer.communityGroup') }}
+                  <span class="link-arrow">›</span>{{ l.name }}
                 </a>
               </li>
             </ul>
@@ -468,7 +383,7 @@
 
       <div class="footer-bottom">
         <div class="footer-bottom-inner">
-          <span class="footer-copyright">&copy; 2026 {{ siteStore.displaySiteName }}. {{ t('home.footer.allRightsReserved') }}</span>
+          <span class="footer-copyright">&copy; 2026 {{ siteStore.copyrightText || (siteStore.displaySiteName + '. ' + t('home.footer.allRightsReserved')) }}</span>
           <span class="footer-divider" />
           <a
             href="https://github.com/oneclickvirt"
@@ -518,7 +433,7 @@
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getPublicAnnouncements, getPublicStats, getServerVersion, getRecommendedProducts } from '@/api/public'
+import { getPublicAnnouncements, getPublicStats, getServerVersion, getRecommendedProducts, getSiteLinks } from '@/api/public'
 import { checkSystemInit } from '@/api/init'
 import { ElTag, ElMessage } from 'element-plus'
 import { Operation, Sunny, Moon, Box } from '@element-plus/icons-vue'
@@ -609,6 +524,52 @@ const nodesCountDisplay = computed(() => (nodesCount.value === null ? '-' : node
 const containersCountDisplay = computed(() => (containersCount.value === null ? '-' : containersCount.value))
 const vmsCountDisplay = computed(() => (vmsCount.value === null ? '-' : vmsCount.value))
 
+// 站点链接（来自 site_links 表，后台「站点链接」可配置）——首页平台/赞助方/页脚均从此读取
+const siteLinksPlatform = ref([])
+const siteLinksSponsor = ref([])
+const footerLinks = ref([])
+
+const fetchSiteLinks = async () => {
+  try {
+    const [p, s, f] = await Promise.all([
+      getSiteLinks('platform'),
+      getSiteLinks('sponsor'),
+      getSiteLinks('footer')
+    ])
+    if (p && p.code === 200 && Array.isArray(p.data)) siteLinksPlatform.value = p.data
+    if (s && s.code === 200 && Array.isArray(s.data)) siteLinksSponsor.value = s.data
+    if (f && f.code === 200 && Array.isArray(f.data)) footerLinks.value = f.data
+  } catch (error) {
+    console.error('获取站点链接失败', error)
+  }
+}
+
+// 平台轮播：优先使用后台配置的 site_links，无数据时回退到内置默认值
+const platformList = computed(() => {
+  if (siteLinksPlatform.value.length > 0) {
+    return siteLinksPlatform.value.map(l => ({ name: l.name, href: l.url, icon: l.iconUrl, repo: l.description || '' }))
+  }
+  return platforms
+})
+
+// 赞助方：优先后台配置，无数据回退内置默认值
+const sponsorList = computed(() => {
+  if (siteLinksSponsor.value.length > 0) {
+    return siteLinksSponsor.value.map(l => ({ name: l.name, href: l.url, logo: l.iconUrl }))
+  }
+  return footerSponsors
+})
+
+// 页脚友链
+const footerLinkList = computed(() => footerLinks.value.map(l => ({ id: l.id, name: l.name, href: l.url })))
+
+// 英雄区背景（站点配置可设置首页背景图）
+const heroStyle = computed(() => {
+  return siteStore.homeBackground
+    ? { backgroundImage: `url(${siteStore.homeBackground})`, backgroundSize: 'cover', backgroundPosition: 'center' }
+    : {}
+})
+
 const switchLanguage = () => {
   const newLang = languageStore.toggleLanguage()
   locale.value = newLang
@@ -662,9 +623,10 @@ const fetchPublicStats = async () => {
 
 const fetchRecommendedProducts = async () => {
   try {
-    const res = await getRecommendedProducts()
+    const limit = siteStore.recommendedLimit > 0 ? siteStore.recommendedLimit : 8
+    const res = await getRecommendedProducts({ limit })
     if (res && res.code === 200 && Array.isArray(res.data)) {
-      recommendedProducts.value = res.data.slice(0, 8)
+      recommendedProducts.value = res.data.slice(0, limit)
     }
   } catch (error) {
     console.error('获取推荐产品失败', error)
@@ -694,6 +656,10 @@ const checkInitStatus = async () => {
 }
 
 onMounted(() => {
+  // 首先加载完整站点配置（首页各栏目/英雄区文本/显示开关均由站点配置驱动）
+  siteStore.fetchFullSiteConfig()
+  // 获取后台可配置的站点链接（平台/赞助方/页脚）
+  fetchSiteLinks()
   // 首先检查初始化状态
   checkInitStatus()
   // 然后获取公告

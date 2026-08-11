@@ -45,5 +45,6 @@ export default {
   orderManagement: '订单管理',
   ticketManagement: '工单管理',
   siteConfig: '站点配置',
+  siteLink: '站点链接',
   yipayConfig: '易支付配置'
 }

@@ -67,5 +67,19 @@ export default {
   saveSuccess: 'Site configuration saved',
   saveFailed: 'Failed to save site configuration',
   validationFailed: 'Form validation failed, please check your input',
-  resetSuccess: 'Reset to the latest saved configuration'
+  resetSuccess: 'Reset to the latest saved configuration',
+  homepageSettings: 'Homepage Settings',
+  homeTitle: 'Homepage Title',
+  homeTitlePlaceholder: 'Left empty to use the default title',
+  homeSubtitle: 'Homepage Subtitle',
+  homeSubtitlePlaceholder: 'Left empty to use the default subtitle',
+  homeBackground: 'Homepage Background',
+  showHomeStats: 'Show Platform Statistics',
+  homepageSections: 'Homepage Sections',
+  showPlatforms: 'Show Virtualization Platforms',
+  showSponsors: 'Show Sponsors',
+  showRecommended: 'Show Recommended Products',
+  recommendedLimit: 'Recommended Products Count',
+  copyrightText: 'Copyright Text',
+  copyrightTextPlaceholder: 'Left empty to use the default copyright'
 }

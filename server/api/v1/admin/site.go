@@ -4,7 +4,6 @@ import (
 	"io"
 
 	"oneclickvirt/model/common"
-	productModel "oneclickvirt/model/product"
 	"oneclickvirt/service/product"
 
 	"github.com/gin-gonic/gin"
@@ -46,14 +45,14 @@ func GetAdminSiteConfig(c *gin.Context) {
 // @Failure 500 {object} common.Response "更新失败"
 // @Router /admin/site-config [put]
 func UpdateSiteConfig(c *gin.Context) {
-	var config productModel.SiteConfig
-	if err := c.ShouldBindJSON(&config); err != nil {
+	var m map[string]interface{}
+	if err := c.ShouldBindJSON(&m); err != nil {
 		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "参数错误"))
 		return
 	}
 
 	service := product.NewSiteService()
-	if err := service.UpdateSiteConfig(&config); err != nil {
+	if err := service.UpdateSiteConfigFields(m); err != nil {
 		common.ResponseWithError(c, common.ClassifyError(err))
 		return
 	}
