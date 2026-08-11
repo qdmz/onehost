@@ -516,15 +516,35 @@ func (s *Service) executeProviderCreation(ctx context.Context, task *adminModel.
 
 	global.APP_LOG.Info("Provider创建实例成功", zap.Uint("taskId", task.ID), zap.String("instanceName", instance.Name))
 
+	// 创建成功后，持久化实例在 Provider 上的真实远端 ID（Proxmox 为数字 VMID）。
+	// 注意：绝不能直接把实例名写进 provider_vm_id —— 后续的 GetInstance 回查、快照、
+	// 网络配置、IPv6 接口检测等操作都按数字 VMID 寻址，写名字会导致
+	// "instance not found" / "vmid type check failed" 等错误。
 	if strings.TrimSpace(instance.ProviderVMID) == "" {
-		if err := global.APP_DB.Model(instance).Update("provider_vm_id", instance.Name).Error; err != nil {
-			global.APP_LOG.Warn("写入实例远端ID失败",
+		if remote, gErr := providerInstance.GetInstance(ctx, instance.Name); gErr == nil && remote != nil && strings.TrimSpace(remote.ID) != "" {
+			instance.ProviderVMID = remote.ID
+			if uErr := global.APP_DB.Model(instance).Update("provider_vm_id", remote.ID).Error; uErr != nil {
+				global.APP_LOG.Warn("写入实例远端ID失败",
+					zap.Uint("taskId", task.ID),
+					zap.Uint("instanceId", instance.ID),
+					zap.String("remoteId", remote.ID),
+					zap.Error(uErr))
+			}
+		} else {
+			// 极少数情况下列表/回查失败，退化为写实例名（保证 provider_vm_id 非空），
+			// 但优先依赖上面的真实 VMID 回写。
+			global.APP_LOG.Warn("创建后无法获取实例真实远端ID，退化为写实例名",
 				zap.Uint("taskId", task.ID),
 				zap.Uint("instanceId", instance.ID),
-				zap.String("providerInstanceId", instance.Name),
-				zap.Error(err))
-		} else {
-			instance.ProviderVMID = instance.Name
+				zap.Error(gErr))
+			if uErr := global.APP_DB.Model(instance).Update("provider_vm_id", instance.Name).Error; uErr != nil {
+				global.APP_LOG.Warn("写入实例名兜底失败",
+					zap.Uint("taskId", task.ID),
+					zap.Uint("instanceId", instance.ID),
+					zap.Error(uErr))
+			} else {
+				instance.ProviderVMID = instance.Name
+			}
 		}
 	}
 

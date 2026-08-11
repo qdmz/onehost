@@ -41,12 +41,21 @@ data
 *.test
 # 交叉编译产物
 oneclickvirt-linux-amd64
+oneclickvirt-linux-amd64.gz
+deploy/_*.sql
 # 本地部署脚本（含服务器凭据，禁止提交）
 deploy/deploy.py
 deploy/rexec.py
 deploy/deploy_dist.py
 deploy/verify.py
 deploy/switch_db.awk
+deploy/backfill_provider_vmid.py
+deploy/deploy_backend_only.py
+deploy/deploy_backend_gz.py
+deploy/rexec_dedup.py
+deploy/rexec_deploy_backend.py
+deploy/rexec_ver.py
+deploy/rexec_verifystate.py
 # 前端构建临时产物
 web/dist.old/
 web/dist.old.*/

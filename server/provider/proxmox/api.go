@@ -17,6 +17,7 @@ import (
 // apiListInstances 通过API方式获取Proxmox实例列表
 func (p *ProxmoxProvider) apiListInstances(ctx context.Context) ([]provider.Instance, error) {
 	var instances []provider.Instance
+	var firstErr error
 
 	// 获取虚拟机列表
 	vmURL := fmt.Sprintf("https://%s:8006/api2/json/nodes/%s/qemu", p.config.Host, p.node)
@@ -30,40 +31,54 @@ func (p *ProxmoxProvider) apiListInstances(ctx context.Context) ([]provider.Inst
 
 	vmResp, err := p.apiClient.Do(vmReq)
 	if err != nil {
+		firstErr = fmt.Errorf("获取虚拟机列表失败: %w", err)
 		global.APP_LOG.Warn("获取虚拟机列表失败", zap.Error(err))
 	} else {
-		defer vmResp.Body.Close()
+		if vmResp.StatusCode != http.StatusOK {
+			// API 返回非 200（如鉴权失败 401/403、网关不可达等）时必须返回错误，
+			// 否则上层 ListInstances 无法回退到 SSH 路径，导致 GetInstance 因空列表误报 "instance not found"。
+			vmResp.Body.Close()
+			firstErr = fmt.Errorf("获取虚拟机列表HTTP错误: %d", vmResp.StatusCode)
+			global.APP_LOG.Warn("获取虚拟机列表HTTP错误", zap.Int("status", vmResp.StatusCode))
+		} else {
+			defer vmResp.Body.Close()
 
-		var vmResponse map[string]interface{}
-		if err := json.NewDecoder(vmResp.Body).Decode(&vmResponse); err == nil {
-			if data, ok := vmResponse["data"].([]interface{}); ok {
-				for _, item := range data {
-					if vmData, ok := item.(map[string]interface{}); ok {
-						status := "stopped"
-						if vmStatus, _ := vmData["status"].(string); vmStatus == "running" {
-							status = "running"
+			var vmResponse map[string]interface{}
+			if err := json.NewDecoder(vmResp.Body).Decode(&vmResponse); err == nil {
+				if data, ok := vmResponse["data"].([]interface{}); ok {
+					for _, item := range data {
+						if vmData, ok := item.(map[string]interface{}); ok {
+							status := "stopped"
+							if vmStatus, _ := vmData["status"].(string); vmStatus == "running" {
+								status = "running"
+							}
+
+							vmName, _ := vmData["name"].(string)
+							vmMem, _ := vmData["mem"].(float64)
+
+							instance := provider.Instance{
+								ID:     fmt.Sprintf("%v", vmData["vmid"]),
+								Name:   vmName,
+								Status: status,
+								Type:   "vm",
+								CPU:    fmt.Sprintf("%v", vmData["cpus"]),
+								Memory: fmt.Sprintf("%.0f MB", vmMem/1024/1024),
+							}
+
+							// 获取VM的IP地址
+							if ipAddress, err := p.getInstanceIPAddress(ctx, instance.ID, "vm"); err == nil && ipAddress != "" {
+								instance.IP = ipAddress
+								instance.PrivateIP = ipAddress
+							}
+							instances = append(instances, instance)
 						}
-
-						vmName, _ := vmData["name"].(string)
-						vmMem, _ := vmData["mem"].(float64)
-
-						instance := provider.Instance{
-							ID:     fmt.Sprintf("%v", vmData["vmid"]),
-							Name:   vmName,
-							Status: status,
-							Type:   "vm",
-							CPU:    fmt.Sprintf("%v", vmData["cpus"]),
-							Memory: fmt.Sprintf("%.0f MB", vmMem/1024/1024),
-						}
-
-						// 获取VM的IP地址
-						if ipAddress, err := p.getInstanceIPAddress(ctx, instance.ID, "vm"); err == nil && ipAddress != "" {
-							instance.IP = ipAddress
-							instance.PrivateIP = ipAddress
-						}
-						instances = append(instances, instance)
 					}
 				}
+			} else {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("解析虚拟机列表失败: %w", err)
+				}
+				global.APP_LOG.Warn("解析虚拟机列表失败", zap.Error(err))
 			}
 		}
 	}
@@ -79,45 +94,70 @@ func (p *ProxmoxProvider) apiListInstances(ctx context.Context) ([]provider.Inst
 
 		ctResp, err := p.apiClient.Do(ctReq)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("获取容器列表失败: %w", err)
+			}
 			global.APP_LOG.Warn("获取容器列表失败", zap.Error(err))
 		} else {
-			defer ctResp.Body.Close()
+			if ctResp.StatusCode != http.StatusOK {
+				ctResp.Body.Close()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("获取容器列表HTTP错误: %d", ctResp.StatusCode)
+				}
+				global.APP_LOG.Warn("获取容器列表HTTP错误", zap.Int("status", ctResp.StatusCode))
+			} else {
+				defer ctResp.Body.Close()
 
-			var ctResponse map[string]interface{}
-			if err := json.NewDecoder(ctResp.Body).Decode(&ctResponse); err == nil {
-				if data, ok := ctResponse["data"].([]interface{}); ok {
-					for _, item := range data {
-						if ctData, ok := item.(map[string]interface{}); ok {
-							status := "stopped"
-							if ctStatus, _ := ctData["status"].(string); ctStatus == "running" {
-								status = "running"
+				var ctResponse map[string]interface{}
+				if err := json.NewDecoder(ctResp.Body).Decode(&ctResponse); err == nil {
+					if data, ok := ctResponse["data"].([]interface{}); ok {
+						for _, item := range data {
+							if ctData, ok := item.(map[string]interface{}); ok {
+								status := "stopped"
+								if ctStatus, _ := ctData["status"].(string); ctStatus == "running" {
+									status = "running"
+								}
+
+								ctName, _ := ctData["name"].(string)
+								ctMem, _ := ctData["mem"].(float64)
+
+								instance := provider.Instance{
+									ID:     fmt.Sprintf("%v", ctData["vmid"]),
+									Name:   ctName,
+									Status: status,
+									Type:   "container",
+									CPU:    fmt.Sprintf("%v", ctData["cpus"]),
+									Memory: fmt.Sprintf("%.0f MB", ctMem/1024/1024),
+								}
+
+								// 获取容器的IP地址
+								if ipAddress, err := p.getInstanceIPAddress(ctx, instance.ID, "container"); err == nil && ipAddress != "" {
+									instance.IP = ipAddress
+									instance.PrivateIP = ipAddress
+								}
+								instances = append(instances, instance)
 							}
-
-							ctName, _ := ctData["name"].(string)
-							ctMem, _ := ctData["mem"].(float64)
-
-							instance := provider.Instance{
-								ID:     fmt.Sprintf("%v", ctData["vmid"]),
-								Name:   ctName,
-								Status: status,
-								Type:   "container",
-								CPU:    fmt.Sprintf("%v", ctData["cpus"]),
-								Memory: fmt.Sprintf("%.0f MB", ctMem/1024/1024),
-							}
-
-							// 获取容器的IP地址
-							if ipAddress, err := p.getInstanceIPAddress(ctx, instance.ID, "container"); err == nil && ipAddress != "" {
-								instance.IP = ipAddress
-								instance.PrivateIP = ipAddress
-							}
-							instances = append(instances, instance)
 						}
 					}
+				} else {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("解析容器列表失败: %w", err)
+					}
+					global.APP_LOG.Warn("解析容器列表失败", zap.Error(err))
 				}
 			}
 		}
 	}
 
+	// 如果完全没拿到任何实例且存在错误，返回错误以便上层（ListInstances）回退到 SSH 路径。
+	// 这样即便 Proxmox API 临时不可用/鉴权失败，也能通过 SSH 正常列举实例，
+	// 避免 GetInstance 因空列表而误报 "instance not found"。
+	if len(instances) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	if firstErr != nil {
+		global.APP_LOG.Warn("Proxmox API获取实例列表部分失败，已返回可用部分", zap.Error(firstErr))
+	}
 	global.APP_LOG.Info("通过API成功获取Proxmox实例列表",
 		zap.Int("totalCount", len(instances)))
 	return instances, nil
