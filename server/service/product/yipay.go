@@ -127,19 +127,21 @@ func (s *YiPayService) Sign(params map[string]string, key string) string {
 	}
 	sb.WriteString(key)
 
-	// MD5加密并转大写
+	// MD5加密并转小写（易支付官方文档要求 sign 为小写）
 	hash := md5.Sum([]byte(sb.String()))
-	return fmt.Sprintf("%032X", hash)
+	return fmt.Sprintf("%032x", hash)
 }
 
 // QueryOrder 查询易支付订单状态
+// 易支付 mapi 查询接口标准格式：api.php?act=query&pid=商户ID&key=商户密钥&out_trade_no=订单号
+// 网关会用 key 参数与后台存储的密钥比对：一致返回订单状态(code=1)，不一致返回 code=-3 商户密钥错误
 func (s *YiPayService) QueryOrder(config *productModel.YiPayConfig, orderNo string) (map[string]interface{}, error) {
 	params := map[string]string{
+		"act":          "query",
 		"pid":          config.Pid,
+		"key":          config.Key,
 		"out_trade_no": orderNo,
 	}
-	params["sign"] = s.Sign(params, config.Key)
-	params["sign_type"] = "MD5"
 
 	queryURL, _ := url.Parse(config.ApiURL + "/api.php")
 	q := queryURL.Query()
@@ -159,10 +161,9 @@ func (s *YiPayService) QueryOrder(config *productModel.YiPayConfig, orderNo stri
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 
-	// 简单解析JSON（实际项目中建议使用json.Unmarshal到结构体）
 	global.APP_LOG.Debug("易支付订单查询响应", zap.String("body", string(body)))
 
-	// 这里返回原始数据，由调用方解析
+	// 返回原始数据，由调用方解析（test 端点会据此判断 -3 密钥不匹配）
 	return map[string]interface{}{
 		"raw": string(body),
 	}, nil

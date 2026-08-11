@@ -29,5 +29,12 @@ export default {
   testNotifyUrl: 'Async Notify URL',
   testReturnUrl: 'Return URL',
   hint: 'Tip: obtain the merchant ID and key from your payment gateway, then fill them in here. Configure the notify and return URLs in the gateway dashboard.',
-  status: 'Status'
+  status: 'Status',
+  test: 'Test Connection',
+  testing: 'Testing...',
+  testResultTitle: 'YiPay Self-test Result',
+  testSuccessHint: 'Gateway returned success, the key matches and the config is usable.',
+  testKeyMismatchHint: 'Gateway returned "merchant key error" (-3): the configured key does not match the actual key in the merchant dashboard. Check character-by-character (mind the case and trailing spaces).',
+  testNetworkErrorHint: 'Cannot reach the gateway. Check the gateway URL is reachable.',
+  testRaw: 'Gateway raw response'
 }

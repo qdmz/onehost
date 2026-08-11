@@ -207,6 +207,15 @@ export const updateYiPayConfig = (data) => {
   return request({ url: '/v1/admin/yipay-config', method: 'put', data })
 }
 
+/**
+ * 测试易支付连通性/密钥自检
+ * 用当前配置的 key 向网关发起订单查询，返回网关原始响应，用于排查「MD5签名校验失败」(key 不一致)
+ * @returns {Promise}
+ */
+export const testYiPayConfig = () => {
+  return request({ url: '/v1/admin/yipay-config/test', method: 'get' })
+}
+
 // ========== 管理员站点链接管理 API ==========
 
 /**

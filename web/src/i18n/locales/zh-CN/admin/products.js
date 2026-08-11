@@ -53,6 +53,10 @@ export default {
   // 节点
   providerIds: '节点ID',
   providerIdsPlaceholder: '可选，节点ID列表，逗号分隔（留空则所有节点可用）',
+  defaultProvider: '默认节点',
+  defaultProviderPlaceholder: '请选择默认节点（需在上面节点ID范围内）',
+  defaultImage: '默认操作系统',
+  defaultImagePlaceholder: '请选择默认操作系统（需在上面镜像ID范围内）',
   // 操作
   actions: '操作',
   edit: '编辑',

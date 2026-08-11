@@ -35,10 +35,10 @@
       <el-table :data="tableData" v-loading="loading" border>
         <el-table-column prop="id" label="ID" width="80" />
         <el-table-column prop="name" label="名称" min-width="120" />
-        <el-table-column prop="linkType" label="类型" width="100">
+        <el-table-column prop="linkType" label="类型" width="120">
           <template #default="{ row }">
-            <el-tag :type="row.linkType === 'platform' ? 'primary' : 'success'">
-              {{ row.linkType === 'platform' ? '虚拟化平台' : '赞助方' }}
+            <el-tag :type="getLinkTypeTagType(row.linkType)">
+              {{ getLinkTypeLabel(row.linkType) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -182,6 +182,19 @@ const rules = {
   linkType: [
     { required: true, message: '请选择链接类型', trigger: 'change' }
   ]
+}
+
+const linkTypeLabelMap = {
+  platform: '虚拟化平台',
+  sponsor: '赞助方',
+  footer: '页脚友链'
+}
+const getLinkTypeLabel = (type) => linkTypeLabelMap[type] || type || '未知'
+const getLinkTypeTagType = (type) => {
+  if (type === 'platform') return 'primary'
+  if (type === 'sponsor') return 'success'
+  if (type === 'footer') return 'warning'
+  return 'info'
 }
 
 // 加载数据

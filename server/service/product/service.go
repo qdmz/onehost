@@ -566,8 +566,8 @@ func (s *Service) provisionInstance(order *productModel.ProductOrder) error {
 		return fmt.Errorf("获取产品信息失败: %w", err)
 	}
 
-	// 选择节点
-	providerID, err := s.selectProvider(&product)
+	// 选择节点（优先使用产品配置的默认节点）
+	providerID, err := s.selectProvider(&product, product.DefaultProviderID)
 	if err != nil {
 		return err
 	}
@@ -695,33 +695,55 @@ func (s *Service) trackProvisionTask(orderID uint, taskID uint) {
 }
 
 // selectProvider 从产品配置的节点中选择一个可用节点
-func (s *Service) selectProvider(product *productModel.Product) (uint, error) {
-	if product.ProviderIDs == "" {
-		return 0, errors.New("该产品未配置可用节点")
+// defaultProviderID: 产品配置的默认节点，优先使用（0 表示无默认值）
+// 选择优先级：①配置的默认节点（即使不在 providerIds 列表也视为允许）→ ②providerIds 列表中的可用节点 → ③兜底任意可用节点（仅当两者都为空时）
+func (s *Service) selectProvider(product *productModel.Product, defaultProviderID uint) (uint, error) {
+	providerIDList := []string{}
+	if product.ProviderIDs != "" {
+		providerIDList = strings.Split(product.ProviderIDs, ",")
 	}
 
-	providerIDList := strings.Split(product.ProviderIDs, ",")
+	// 节点是否可开通
+	providerAvailable := func(id uint) bool {
+		var p providerModel.Provider
+		if err := global.APP_DB.First(&p, id).Error; err != nil {
+			return false
+		}
+		ok := (p.ConnectionType == "agent" && p.AgentStatus == "online") ||
+			(p.ConnectionType != "agent" && (p.Status == "active" || p.Status == "partial"))
+		return ok && !p.IsFrozen && p.AllowClaim
+	}
+
+	// ① 优先默认节点（后台设置了默认节点即认为允许，无需在 providerIds 列表内）
+	if defaultProviderID > 0 && providerAvailable(defaultProviderID) {
+		return defaultProviderID, nil
+	}
+
+	// ② 在 providerIds 允许列表中寻找可用节点
 	for _, idStr := range providerIDList {
 		idStr = strings.TrimSpace(idStr)
 		if idStr == "" {
 			continue
 		}
-		providerID, err := strconv.ParseUint(idStr, 10, 32)
+		pid, err := strconv.ParseUint(idStr, 10, 32)
 		if err != nil {
 			continue
 		}
-
-		// 检查节点是否可用
-		var provider providerModel.Provider
-		if err := global.APP_DB.First(&provider, providerID).Error; err != nil {
-			continue
+		if providerAvailable(uint(pid)) {
+			return uint(pid), nil
 		}
+	}
 
-		providerAvailable := (provider.ConnectionType == "agent" && provider.AgentStatus == "online") ||
-			(provider.ConnectionType != "agent" && (provider.Status == "active" || provider.Status == "partial"))
-
-		if providerAvailable && !provider.IsFrozen && provider.AllowClaim {
-			return uint(providerID), nil
+	// ③ 兜底：providerIds 为空且未设置默认节点时，使用任意可用节点，避免自动开通硬失败
+	if len(providerIDList) == 0 && defaultProviderID == 0 {
+		var providers []providerModel.Provider
+		if err := global.APP_DB.Where("is_frozen = ? AND allow_claim = ?", false, true).
+			Find(&providers).Error; err == nil {
+			for _, p := range providers {
+				if providerAvailable(p.ID) {
+					return p.ID, nil
+				}
+			}
 		}
 	}
 

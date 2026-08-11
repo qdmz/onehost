@@ -29,5 +29,12 @@ export default {
   testNotifyUrl: '异步通知地址',
   testReturnUrl: '同步跳转地址',
   hint: '提示: 请在易支付平台获取商户ID和密钥，填入此处。异步通知地址和同步跳转地址请填写到易支付平台后台。',
-  status: '状态'
+  status: '状态',
+  test: '测试连接',
+  testing: '测试中...',
+  testResultTitle: '易支付自检结果',
+  testSuccessHint: '网关返回成功，密钥匹配，配置可用。',
+  testKeyMismatchHint: '网关返回「商户密钥错误」(-3)：配置的密钥与商户后台实际密钥不一致，请逐字符核对（注意大小写、前后空格）。',
+  testNetworkErrorHint: '无法连接网关，请检查支付网关地址是否可达。',
+  testRaw: '网关原始返回'
 }

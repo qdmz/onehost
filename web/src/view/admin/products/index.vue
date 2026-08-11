@@ -199,6 +199,33 @@
 
         <el-row :gutter="20">
           <el-col :span="12">
+            <el-form-item :label="t('admin.products.defaultProvider')" prop="defaultProviderId">
+              <el-select v-model="form.defaultProviderId" clearable style="width: 100%;" :placeholder="t('admin.products.defaultProviderPlaceholder')">
+                <el-option
+                  v-for="p in filteredProviderOptions"
+                  :key="p.id"
+                  :label="p.name"
+                  :value="p.id"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item :label="t('admin.products.defaultImage')" prop="defaultImageId">
+              <el-select v-model="form.defaultImageId" clearable style="width: 100%;" :placeholder="t('admin.products.defaultImagePlaceholder')">
+                <el-option
+                  v-for="img in filteredImageOptions"
+                  :key="img.id"
+                  :label="img.name"
+                  :value="img.id"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-row :gutter="20">
+          <el-col :span="12">
             <el-form-item :label="t('admin.products.stock')" prop="stock">
               <el-input-number v-model="form.stock" :min="-1" style="width: 100%;" />
             </el-form-item>
@@ -226,12 +253,13 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search } from '@element-plus/icons-vue'
 import { formatMemorySize, formatDiskSize } from '@/utils/unit-formatter'
-import { getAdminProductList, createAdminProduct, updateAdminProduct, deleteAdminProduct, updateAdminProductStatus } from '@/api/admin'
+import { getAdminProductList, createAdminProduct, updateAdminProduct, deleteAdminProduct, updateAdminProductStatus, getProviderList } from '@/api/admin'
+import { systemImageApi } from '@/api/admin/content'
 
 const { t } = useI18n()
 
@@ -246,6 +274,8 @@ const dialogVisible = ref(false)
 const isEdit = ref(false)
 const submitting = ref(false)
 const formRef = ref(null)
+const providerOptions = ref([])
+const imageOptions = ref([])
 
 const form = ref({
   name: '',
@@ -262,6 +292,8 @@ const form = ref({
   periodValue: 1,
   providerIds: '',
   imageIds: '',
+  defaultProviderId: 0,
+  defaultImageId: 0,
   stock: -1,
   isRecommended: false,
   maxPerUser: 0
@@ -293,6 +325,42 @@ const formRules = {
 
 const formatMemory = (memory) => formatMemorySize(memory)
 const formatDisk = (disk) => formatDiskSize(disk)
+
+const filteredProviderOptions = computed(() => {
+  const ids = (form.value.providerIds || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (ids.length === 0) return providerOptions.value
+  return providerOptions.value.filter(p => ids.includes(String(p.id)))
+})
+
+const filteredImageOptions = computed(() => {
+  const ids = (form.value.imageIds || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (ids.length === 0) return imageOptions.value
+  return imageOptions.value.filter(img => ids.includes(String(img.id)))
+})
+
+// 加载可用节点列表
+const loadProviders = async () => {
+  try {
+    const res = await getProviderList({ pageSize: 9999 })
+    if (res.code === 200) {
+      providerOptions.value = res.data?.list || res.data?.items || []
+    }
+  } catch (error) {
+    console.error('加载节点列表失败:', error)
+  }
+}
+
+// 加载可用镜像列表
+const loadImages = async () => {
+  try {
+    const res = await systemImageApi.getList({ pageSize: 9999 })
+    if (res.code === 200) {
+      imageOptions.value = res.data?.list || res.data?.items || []
+    }
+  } catch (error) {
+    console.error('加载镜像列表失败:', error)
+  }
+}
 
 // 获取产品类型中文标签
 const getTypeLabel = (type) => {
@@ -367,7 +435,12 @@ const handleAdd = () => {
     periodType: 'month',
     periodValue: 1,
     providerIds: '',
-    imageIds: ''
+    imageIds: '',
+    defaultProviderId: 0,
+    defaultImageId: 0,
+    stock: -1,
+    isRecommended: false,
+    maxPerUser: 0
   }
   dialogVisible.value = true
 }
@@ -380,7 +453,13 @@ const handleEdit = (row) => {
     category: row.category || '',
     periodType: row.periodType || 'month',
     periodValue: row.periodValue || 1,
-    providerIds: row.providerIds || ''
+    providerIds: row.providerIds || '',
+    imageIds: row.imageIds || '',
+    defaultProviderId: row.defaultProviderId || 0,
+    defaultImageId: row.defaultImageId || 0,
+    stock: row.stock === undefined || row.stock === null ? -1 : row.stock,
+    isRecommended: !!row.isRecommended,
+    maxPerUser: row.maxPerUser || 0
   }
   dialogVisible.value = true
 }
@@ -449,6 +528,8 @@ const handleDelete = async (row) => {
 
 onMounted(() => {
   loadProducts()
+  loadProviders()
+  loadImages()
 })
 </script>
 

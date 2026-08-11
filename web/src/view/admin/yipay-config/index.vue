@@ -81,7 +81,23 @@
           <el-button type="primary" size="large" :loading="submitting" @click="handleSubmit">
             {{ t('common.save') }}
           </el-button>
+          <el-button size="large" :loading="testing" @click="handleTest">
+            {{ testing ? t('admin.yipayConfig.testing') : t('admin.yipayConfig.test') }}
+          </el-button>
         </div>
+
+        <el-alert
+          v-if="testResultVisible"
+          :type="testResultType"
+          :closable="true"
+          @close="testResultVisible = false"
+          style="margin-top: 16px;"
+        >
+          <template #title>{{ t('admin.yipayConfig.testResultTitle') }}</template>
+          <div style="margin-top: 6px; white-space: pre-wrap; word-break: break-all;">
+            {{ testResultMessage }}
+          </div>
+        </el-alert>
       </el-form>
     </el-card>
   </div>
@@ -91,12 +107,16 @@
 import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
-import { getYiPayConfig, updateYiPayConfig } from '@/api/admin'
+import { getYiPayConfig, updateYiPayConfig, testYiPayConfig } from '@/api/admin'
 
 const { t } = useI18n()
 const formRef = ref(null)
 const loading = ref(false)
 const submitting = ref(false)
+const testing = ref(false)
+const testResultVisible = ref(false)
+const testResultType = ref('info')
+const testResultMessage = ref('')
 
 const form = ref({
   enabled: false,
@@ -173,6 +193,40 @@ const handleSubmit = async () => {
 onMounted(() => {
   loadConfig()
 })
+
+// 易支付连通性/密钥自检：用当前配置的 key 向网关发起订单查询
+const handleTest = async () => {
+  testing.value = true
+  testResultVisible.value = false
+  try {
+    const res = await testYiPayConfig()
+    if (res && res.code === 200 && res.data) {
+      const query = res.data.query || {}
+      const raw = query.raw || ''
+      // 网关返回含 -3 / 商户密钥错误 => 密钥不匹配
+      const isKeyMismatch = raw.includes('-3') || raw.includes('商户密钥错误') || raw.includes('merchant key')
+      if (raw.includes('"code":1') || raw.includes('"code": 1') || (!isKeyMismatch && raw.includes('"code"'))) {
+        testResultType.value = 'success'
+        testResultMessage.value = t('admin.yipayConfig.testSuccessHint') + '\n' +
+          t('admin.yipayConfig.testRaw') + ':\n' + raw
+      } else if (isKeyMismatch) {
+        testResultType.value = 'error'
+        testResultMessage.value = t('admin.yipayConfig.testKeyMismatchHint') + '\n' +
+          t('admin.yipayConfig.testRaw') + ':\n' + raw
+      } else {
+        testResultType.value = 'warning'
+        testResultMessage.value = t('admin.yipayConfig.testRaw') + ':\n' + raw
+      }
+      testResultVisible.value = true
+    } else {
+      ElMessage.error(res?.message || t('admin.yipayConfig.testNetworkErrorHint'))
+    }
+  } catch (error) {
+    ElMessage.error(error?.message || t('admin.yipayConfig.testNetworkErrorHint'))
+  } finally {
+    testing.value = false
+  }
+}
 </script>
 
 <style scoped lang="scss">
