@@ -179,6 +179,15 @@ var allowedSiteConfigKeys = map[string]bool{
 	"show_platforms": true, "show_sponsors": true, "show_recommended": true, "recommended_limit": true,
 }
 
+// jsonKeyToColumn 修正「JSON 字段名与数据库列名不一致」的字段。
+// 模型字段 FooterHTML / HeaderHTML 的 JSON 名为 custom_footer / custom_header，
+// 但 gorm 默认列名为 footer_html / header_html；若直接以 JSON 名作为更新列名会报 Unknown column。
+var jsonKeyToColumn = map[string]string{
+	"custom_header": "header_html",
+	"custom_footer": "footer_html",
+	"show_yipay":    "show_yi_pay",
+}
+
 // UpdateSiteConfigFields 部分更新站点配置
 // 只更新请求中提供的字段（白名单内），未提供的字段保持不变，
 // 从而修复此前使用 Save() 整体覆盖导致未提交字段（如首页配置）被清零的问题。
@@ -198,7 +207,12 @@ func (s *SiteService) UpdateSiteConfigFields(m map[string]interface{}) error {
 				v = int(f)
 			}
 		}
-		updates[k] = v
+		// JSON 字段名与数据库列名可能不一致（如 custom_footer -> footer_html），更新时需转换为真实列名
+		col := k
+		if c, ok := jsonKeyToColumn[k]; ok {
+			col = c
+		}
+		updates[col] = v
 	}
 	if len(updates) == 0 {
 		return nil
