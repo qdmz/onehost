@@ -193,6 +193,7 @@ type UserInstanceDetailResponse struct {
 	HasSshMapping   bool       `json:"hasSshMapping"`   // 是否有可用的SSH端口映射（支持Web SSH连接）
 	CreatedAt       time.Time  `json:"createdAt"`
 	ExpiresAt       *time.Time `json:"expiresAt"` // 实例过期时间
+	OrderID         uint       `json:"orderId"`   // 关联订单ID（用于续费）
 	IsFrozen        bool       `json:"isFrozen"`
 	FrozenReason    string     `json:"frozenReason"`
 	// 流量配额显示

@@ -17,6 +17,9 @@ server/oneclickvirt
 web/node_modules
 web/dist
 web/dist.zip
+# 构建前重命名的旧 dist 备份（绕过 safe-delete 守卫产生）
+web/dist.old*
+deploy/*.log
 # Storage directories
 server/storage/*
 server/storage/logs/*

@@ -129,6 +129,9 @@ func InitUserRouter(Router *gin.RouterGroup) {
 		UserGroup.GET("/user/balance", productAPI.GetUserBalance)
 		UserGroup.GET("/user/balance/logs", productAPI.GetBalanceLogs)
 
+		// 代金券兑换（券码充值到余额）
+		UserGroup.POST("/user/vouchers/redeem", user.RedeemVoucher)
+
 		// 产品商城
 		UserGroup.GET("/products", productAPI.GetProductList)
 		UserGroup.GET("/products/:id", productAPI.GetProductDetail)

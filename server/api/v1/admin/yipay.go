@@ -4,6 +4,7 @@ import (
 	"oneclickvirt/global"
 	"oneclickvirt/model/common"
 	productModel "oneclickvirt/model/product"
+	productService "oneclickvirt/service/product"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -99,10 +100,11 @@ func UpdateYiPayConfig(c *gin.Context) {
 		"key":          req.Key,
 		"notify_url":   req.NotifyURL,
 		"return_url":   req.ReturnURL,
-		"pay_type":     req.PayType,
-		"fee_percent":  req.FeePercent,
-		"min_amount":   req.MinAmount,
-		"max_amount":   req.MaxAmount,
+		"pay_type":          req.PayType,
+		"fee_percent":       req.FeePercent,
+		"min_amount":        req.MinAmount,
+		"max_amount":        req.MaxAmount,
+		"enabled_pay_types": req.EnabledPayTypes,
 	}
 
 	if err := global.APP_DB.Model(&config).Updates(updates).Error; err != nil {
@@ -119,4 +121,38 @@ func UpdateYiPayConfig(c *gin.Context) {
 	}
 
 	common.ResponseSuccess(c, config, "易支付配置更新成功")
+}
+
+// TestYiPayConfig 易支付连通性/密钥自检
+// @Summary 易支付密钥自检
+// @Description 用当前配置的 key 向网关发起一笔订单查询，返回网关原始响应，用于排查「MD5签名校验失败」(key 不一致)
+// @Tags 管理员易支付配置
+// @Security BearerAuth
+// @Param out_trade_no query string false "任意商户订单号(用于验证签名拼法)"
+// @Success 200 {object} common.Response "自检完成"
+// @Router /admin/yipay-config/test [get]
+func TestYiPayConfig(c *gin.Context) {
+	yipaySvc := productService.NewYiPayService()
+	config, err := yipaySvc.GetActiveConfig()
+	if err != nil {
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+	outTradeNo := c.Query("out_trade_no")
+	if outTradeNo == "" {
+		outTradeNo = yipaySvc.GenerateOrderNo()
+	}
+	res, err := yipaySvc.QueryOrder(config, outTradeNo)
+	if err != nil {
+		common.ResponseWithError(c, common.ClassifyError(err))
+		return
+	}
+	common.ResponseSuccess(c, map[string]interface{}{
+		"pid":  config.Pid,
+		"api":  config.ApiURL,
+		"sign_sample": yipaySvc.Sign(map[string]string{
+			"pid": config.Pid, "out_trade_no": outTradeNo,
+		}, config.Key),
+		"query": res,
+	}, "易支付自检完成，请对比网关返回的 code/msg 与商户后台密钥")
 }

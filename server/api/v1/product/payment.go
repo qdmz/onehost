@@ -69,7 +69,8 @@ func CreateYiPayOrder(c *gin.Context) {
 // @Failure 400 {string} string "fail"
 // @Router /payments/yipay/notify [post]
 func YiPayNotify(c *gin.Context) {
-	// 解析所有表单参数
+	// 解析所有表单参数（确保 POST form-urlencoded 的 PostForm 被正确解析）
+	_ = c.Request.ParseForm()
 	params := make(map[string]string)
 	for key, values := range c.Request.PostForm {
 		if len(values) > 0 {

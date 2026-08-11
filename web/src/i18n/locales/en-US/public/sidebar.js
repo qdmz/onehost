@@ -16,6 +16,7 @@ export default {
   userManagement: 'User Management',
   inviteCodeManagement: 'Invite Code Management',
   redemptionCodeManagement: 'Redemption Code Management',
+  voucherManagement: 'Voucher Management',
   providerManagement: 'Provider Management',
   groupManagement: 'Group Management',
   taskManagement: 'Task Management',

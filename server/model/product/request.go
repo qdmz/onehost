@@ -85,7 +85,7 @@ type CreateProductRequest struct {
 	Disk        int     `json:"disk" binding:"required,min=1024"`     // 磁盘(MB)
 	Bandwidth   int     `json:"bandwidth" binding:"min=1"`            // 带宽(Mbps)
 	Traffic     int     `json:"traffic" binding:"min=0"`              // 流量配额(MB)
-	Price       float64 `json:"price" binding:"required,min=0"`       // 单价
+	Price       float64 `json:"price" binding:"min=0"`               // 单价
 	PeriodType  string  `json:"periodType" binding:"required,max=16"` // 周期类型
 	PeriodValue int     `json:"periodValue" binding:"required,min=1"` // 周期值
 	MaxSnapshots int    `json:"maxSnapshots" binding:"min=0"`         // 最大快照数
@@ -113,7 +113,7 @@ type UpdateProductRequest struct {
 	Disk         int     `json:"disk" binding:"required,min=1024"`
 	Bandwidth    int     `json:"bandwidth" binding:"min=1"`
 	Traffic      int     `json:"traffic" binding:"min=0"`
-	Price        float64 `json:"price" binding:"required,min=0"`
+	Price        float64 `json:"price" binding:"min=0"`
 	PeriodType   string  `json:"periodType" binding:"required,max=16"`
 	PeriodValue  int     `json:"periodValue" binding:"required,min=1"`
 	MaxSnapshots int     `json:"maxSnapshots" binding:"min=0"`

@@ -249,6 +249,19 @@ func (ds *DatabaseService) FixSchemaColumns() error {
 		}
 	}
 
+	// === 8.6 创建 vouchers（代金券）表 ===
+	// 代金券为新增功能表，已初始化的实例会跳过 AutoMigrate，因此在此按需创建。
+	if !db.Migrator().HasTable("vouchers") {
+		global.APP_LOG.Info("正在创建 vouchers 表")
+		if err := db.AutoMigrate(&productModel.Voucher{}); err != nil {
+			global.APP_LOG.Warn("创建 vouchers 表失败", zap.Error(err))
+		} else {
+			global.APP_LOG.Info("vouchers 表创建完成")
+		}
+	} else {
+		global.APP_LOG.Debug("vouchers 表已存在，跳过创建")
+	}
+
 	// === 9. 修复 system_configs 重复数据并重建唯一索引 ===
 	// 该修复在「已初始化」与「全新安装」两条路径都会执行（FixSchemaColumns 均被调用），
 	// 且早于 ConfigManager 加载配置，确保后续 upsert 真正去重。

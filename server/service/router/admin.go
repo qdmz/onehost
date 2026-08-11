@@ -237,6 +237,7 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		// 易支付配置管理
 		NormalAdminGroup.GET("/yipay-config", admin.GetYiPayConfig)
 		NormalAdminGroup.PUT("/yipay-config", admin.UpdateYiPayConfig)
+		NormalAdminGroup.GET("/yipay-config/test", admin.TestYiPayConfig)
 
 		// 产品管理（普通管理员可访问）
 		NormalAdminGroup.GET("/products", admin.GetAdminProductList)
@@ -374,5 +375,16 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 
 		// 用户余额记录管理（超管可查看任意用户的余额记录）
 		SuperAdminGroup.GET("/users/:userId/balance-logs", user.AdminGetUserBalanceLogs)
+
+		// 用户余额调整（超管可增减/设定任意用户余额，写入余额变动记录）
+		SuperAdminGroup.PUT("/users/:id/balance", user.AdminAdjustUserBalance)
+
+		// 代金券管理（超管专用）
+		SuperAdminGroup.GET("/vouchers", admin.GetVoucherList)
+		SuperAdminGroup.GET("/vouchers/stats", admin.GetVoucherStats)
+		SuperAdminGroup.POST("/vouchers", admin.CreateVouchers)
+		SuperAdminGroup.POST("/vouchers/batch-delete", admin.BatchDeleteVouchers)
+		SuperAdminGroup.PUT("/vouchers/:id/void", admin.VoidVoucher)
+		SuperAdminGroup.DELETE("/vouchers/:id", admin.DeleteVoucher)
 	}
 }

@@ -742,6 +742,14 @@
       :instance-name="vncInstanceName"
       admin-mode
     />
+    <!-- 设置过期时间（日期选择器） -->
+    <SetExpiryDialog
+      :visible="showSetExpiryDialog"
+      :form="expiryForm"
+      :loading="expiryLoading"
+      @confirm="confirmSetInstanceExpiry"
+      @update:visible="showSetExpiryDialog = $event"
+    />
   </div>
 </template>
 
@@ -759,6 +767,7 @@ import {
 } from '@element-plus/icons-vue'
 import { useInstanceManagement } from './composables/useInstanceManagement'
 import VNCDialog from '@/components/VNCDialog.vue'
+import SetExpiryDialog from './components/SetExpiryDialog.vue'
 
 const {
   instances, loading, detailDialogVisible, actionDialogVisible,
@@ -773,7 +782,8 @@ const {
   showTransferDialog, confirmTransfer, handleWindowResize,
   searchUsers, searchingUsers, userOptions, canOpenInstanceDetail, isInstanceBusy, createShareLink,
   resetImageDialogVisible, resetImageList, selectedResetImage, loadingResetImages, confirmResetWithImage,
-  vncDialogVisible, vncInstanceId, vncInstanceName
+  vncDialogVisible, vncInstanceId, vncInstanceName,
+  showSetExpiryDialog, expiryForm, expiryLoading, confirmSetInstanceExpiry
 } = useInstanceManagement()
 
 onMounted(() => {

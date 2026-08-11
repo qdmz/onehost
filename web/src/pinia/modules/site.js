@@ -175,6 +175,10 @@ export const useSiteStore = defineStore('site', () => {
         applyPrimaryColor(primaryColor.value)
         // 应用自定义 CSS
         applyCustomCSS(customCSS.value)
+        // 应用站点图标
+        applyFavicon(faviconURL.value)
+        // 站点名称加载晚于路由守卫时，同步刷新一次浏览器标题
+        applyDocumentTitle()
       }
     } catch (e) {
       // 静默失败，使用默认配置
@@ -228,6 +232,27 @@ export const useSiteStore = defineStore('site', () => {
         background-color: ${color} !important;
       }
     `
+  }
+
+  // 应用站点图标（favicon）
+  function applyFavicon(url) {
+    if (!url || typeof document === 'undefined') return
+    let link = document.querySelector("link[rel~='icon']")
+    if (!link) {
+      link = document.createElement('link')
+      link.rel = 'icon'
+      document.head.appendChild(link)
+    }
+    link.href = url
+  }
+
+  // 用站点名称刷新浏览器标题（保留当前页面名部分）
+  function applyDocumentTitle() {
+    if (typeof document === 'undefined') return
+    const brand = displaySiteName.value
+    const cur = document.title || ''
+    const idx = cur.lastIndexOf(' - ')
+    document.title = idx > 0 ? `${cur.slice(0, idx)} - ${brand}` : brand
   }
 
   // 应用自定义 CSS

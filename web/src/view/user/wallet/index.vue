@@ -16,10 +16,16 @@
               <span class="amount">{{ formatAmount(balance) }}</span>
             </div>
           </div>
-          <el-button type="primary" size="large" @click="rechargeVisible = true">
-            <el-icon><Plus /></el-icon>
-            {{ t('user.wallet.recharge') }}
-          </el-button>
+          <div class="balance-actions">
+            <el-button size="large" @click="openVoucherDialog">
+              <el-icon><Ticket /></el-icon>
+              {{ t('user.wallet.redeemVoucher') }}
+            </el-button>
+            <el-button type="primary" size="large" @click="rechargeVisible = true">
+              <el-icon><Plus /></el-icon>
+              {{ t('user.wallet.recharge') }}
+            </el-button>
+          </div>
         </div>
       </el-card>
     </div>
@@ -130,6 +136,32 @@
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- 代金券兑换弹窗 -->
+    <el-dialog
+      v-model="voucherVisible"
+      :title="t('user.wallet.redeemVoucher')"
+      width="420px"
+      :close-on-click-modal="false"
+    >
+      <div class="voucher-content">
+        <div class="voucher-hint">{{ t('user.wallet.voucherHint') }}</div>
+        <el-input
+          v-model="voucherCode"
+          :placeholder="t('user.wallet.voucherPlaceholder')"
+          size="large"
+          clearable
+          maxlength="64"
+          @keyup.enter="handleRedeemVoucher"
+        />
+      </div>
+      <template #footer>
+        <el-button @click="voucherVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="voucherLoading" @click="handleRedeemVoucher">
+          {{ t('user.wallet.confirmRedeem') }}
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -137,8 +169,8 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
-import { getUserBalance, getBalanceLogs, createYiPayOrder } from '@/api/product'
+import { Plus, Ticket } from '@element-plus/icons-vue'
+import { getUserBalance, getBalanceLogs, createYiPayOrder, redeemVoucher } from '@/api/product'
 import { useSiteStore } from '@/pinia/modules/site'
 
 const { t, locale } = useI18n()
@@ -155,6 +187,9 @@ const rechargeVisible = ref(false)
 const rechargeAmount = ref(50)
 const rechargeLoading = ref(false)
 const selectedPayType = ref('alipay')
+const voucherVisible = ref(false)
+const voucherLoading = ref(false)
+const voucherCode = ref('')
 // 启用的支付方式来自全局站点配置（后台“启用的支付方式”），与下单页保持一致
 const enabledPayTypes = computed(() => siteStore.enabledPayTypes)
 
@@ -217,6 +252,38 @@ const handleSizeChange = (size) => {
   pageSize.value = size
   currentPage.value = 1
   loadLogs()
+}
+
+// 代金券兑换
+const openVoucherDialog = () => {
+  voucherCode.value = ''
+  voucherVisible.value = true
+}
+
+const handleRedeemVoucher = async () => {
+  const code = (voucherCode.value || '').trim().toUpperCase()
+  if (!code) {
+    ElMessage.warning(t('user.wallet.voucherPlaceholder'))
+    return
+  }
+  voucherLoading.value = true
+  try {
+    const res = await redeemVoucher(code)
+    if (res?.code === 200) {
+      ElMessage.success(
+        t('user.wallet.redeemSuccess', { amount: formatAmount(res.data?.amount) })
+      )
+      voucherVisible.value = false
+      // 兑换成功后刷新余额与流水
+      await Promise.all([loadBalance(), loadLogs()])
+    } else {
+      throw new Error(res?.message || t('user.wallet.redeemFailed'))
+    }
+  } catch (error) {
+    ElMessage.error(error?.message || t('user.wallet.redeemFailed'))
+  } finally {
+    voucherLoading.value = false
+  }
 }
 
 // 充值
@@ -352,10 +419,25 @@ onMounted(() => {
 }
 
 /* 充值弹窗 */
+.balance-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 .recharge-content {
   .recharge-hint {
     margin-bottom: 16px;
     color: var(--text-color-secondary);
+  }
+}
+
+.voucher-content {
+  .voucher-hint {
+    margin-bottom: 16px;
+    color: var(--text-color-secondary);
+    line-height: 1.6;
   }
 }
 

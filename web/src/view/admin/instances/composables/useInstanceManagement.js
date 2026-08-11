@@ -1,4 +1,4 @@
-import { ref, nextTick } from 'vue'
+import { ref, reactive, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import { getAllInstances, adminInstanceAction, adminBatchInstanceAction, resetInstancePassword, getAdminInstanceNewPassword, setInstanceExpiry, freezeInstance, unfreezeInstance, getUserList, createAdminInstanceShare } from '@/api/admin'
@@ -152,8 +152,8 @@ export function useInstanceManagement() {
 
   const performAction = async (action) => {
     if (!warnInstanceBlocked(actionInstance.value)) return
-    if (action === 'setExpiry') { actionDialogVisible.value = false; await handleSetInstanceExpiry(actionInstance.value); actionInstance.value = null; return }
-    if (action === 'renew') { actionDialogVisible.value = false; await handleSetInstanceExpiry(actionInstance.value); actionInstance.value = null; return }
+    if (action === 'setExpiry') { actionDialogVisible.value = false; openSetInstanceExpiry(actionInstance.value); actionInstance.value = null; return }
+    if (action === 'renew') { actionDialogVisible.value = false; actionInstance.value = null; return }
     if (action === 'freeze') { actionDialogVisible.value = false; await handleFreezeInstance(actionInstance.value); actionInstance.value = null; return }
     if (action === 'unfreeze') { actionDialogVisible.value = false; await handleUnfreezeInstance(actionInstance.value); actionInstance.value = null; return }
     if (action === 'vnc') {
@@ -401,19 +401,30 @@ export function useInstanceManagement() {
     failedMessage: 'admin.instances.batchStopFailed'
   })
 
-  const handleSetInstanceExpiry = async (instance) => {
+  // 设置过期时间：使用日期选择器对话框（避免手动录入格式错误）
+  const showSetExpiryDialog = ref(false)
+  const expiryInstance = ref(null)
+  const expiryForm = reactive({ name: '', expiresAt: '' })
+  const expiryLoading = ref(false)
+  const openSetInstanceExpiry = (instance) => {
+    expiryInstance.value = instance
+    expiryForm.name = instance?.name || ''
+    expiryForm.expiresAt = instance?.expiresAt || ''
+    showSetExpiryDialog.value = true
+  }
+  const confirmSetInstanceExpiry = async () => {
+    if (!expiryInstance.value) return
+    expiryLoading.value = true
     try {
-      const { value: expiresAt } = await ElMessageBox.prompt(t('admin.instances.setExpiryPrompt'), t('admin.instances.setExpiry'), {
-        confirmButtonText: t('common.confirm'), cancelButtonText: t('common.cancel'),
-        inputPattern: /^(\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?)?$/,
-        inputErrorMessage: t('admin.instances.dateFormatError'),
-        inputPlaceholder: instance.expiresAt ? formatDate(instance.expiresAt) : '2024-12-31 23:59:59',
-        inputValue: instance.expiresAt ? formatDate(instance.expiresAt) : ''
-      })
-      await setInstanceExpiry({ instanceId: instance.id, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null })
+      await setInstanceExpiry({ instanceId: expiryInstance.value.id, expiresAt: expiryForm.expiresAt || null })
+      showSetExpiryDialog.value = false
       ElMessage.success(t('admin.instances.setExpirySuccess'))
       await loadInstances()
-    } catch (error) { if (error !== 'cancel') ElMessage.error(t('admin.instances.setExpiryFailed')) }
+    } catch (error) {
+      ElMessage.error(t('admin.instances.setExpiryFailed'))
+    } finally {
+      expiryLoading.value = false
+    }
   }
 
   const handleFreezeInstance = async (instance) => {
@@ -527,6 +538,7 @@ export function useInstanceManagement() {
     resetImageDialogVisible, resetImageList, selectedResetImage, loadingResetImages,
     confirmResetWithImage,
     vncDialogVisible, vncInstanceId, vncInstanceName,
+    showSetExpiryDialog, expiryForm, expiryLoading, confirmSetInstanceExpiry,
     t
   }
 }

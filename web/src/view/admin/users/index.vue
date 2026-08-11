@@ -148,6 +148,7 @@
         @toggle-status="handleToggleUserStatus"
         @reset-password="handleResetPassword"
         @login-as="handleLoginAsUser"
+        @adjust-balance="handleAdjustBalance"
       />
 
       <!-- 分页 -->
@@ -195,6 +196,14 @@
       @update:visible="showSetExpiryDialog = $event"
       @confirm="confirmSetExpiry"
     />
+
+    <AdjustBalanceDialog
+      :visible="showAdjustBalanceDialog"
+      :form="balanceForm"
+      :loading="balanceLoading"
+      @update:visible="showAdjustBalanceDialog = $event"
+      @confirm="confirmAdjustBalance"
+    />
   </div>
 </template>
 
@@ -206,11 +215,13 @@ import UsersTable from './components/UsersTable.vue'
 import AddEditUserDialog from './components/AddEditUserDialog.vue'
 import ResetPasswordDialog from './components/ResetPasswordDialog.vue'
 import SetExpiryDialog from './components/SetExpiryDialog.vue'
+import AdjustBalanceDialog from './components/AdjustBalanceDialog.vue'
 
 const {
   users, loading, showAddDialog, addUserLoading, addUserFormRef, isEditing,
   showResetPasswordDialog, resetPasswordForm, resetPasswordLoading, generatedPassword,
   showSetExpiryDialog, freezeLoading, freezeForm,
+  showAdjustBalanceDialog, balanceLoading, balanceForm,
   searchUsername, searchStatus, searchUserType,
   multipleSelection, currentPage, pageSize, total, availableLevels,
   addUserForm, addUserRules,
@@ -223,6 +234,7 @@ const {
   handleResetPassword, confirmResetPassword, cancelResetPassword,
   handleLoginAsUser, copyPassword,
   handleSetExpiry, confirmSetExpiry,
+  handleAdjustBalance, confirmAdjustBalance,
   formatDateTime, isExpired,
   handleSizeChange, handleCurrentChange,
   t

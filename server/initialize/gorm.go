@@ -215,6 +215,7 @@ func RegisterTables(db *gorm.DB) {
 		&productModel.SiteConfig{},      // 站点前端配置表
 		&productModel.UserBalanceLog{},  // 用户余额变动记录表
 		&productModel.YiPayConfig{},     // 易支付配置表
+		&productModel.Voucher{},         // 代金券表
 	)
 	if err != nil {
 		global.APP_LOG.Error("register table failed", zap.Error(err))

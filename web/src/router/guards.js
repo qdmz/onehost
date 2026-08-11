@@ -1,4 +1,5 @@
 import { useUserStore } from '@/pinia/modules/user'
+import { useSiteStore } from '@/pinia/modules/site'
 import { checkSystemInit } from '@/api/init'
 import { ElMessage } from 'element-plus'
 import i18n from '@/i18n'
@@ -231,7 +232,7 @@ export function setupRouterGuards(router) {
       }
       
       // 超级管理员专属页面：normal_admin 不能访问
-      const superAdminOnlyPaths = ['/admin/users', '/admin/config', '/admin/performance', '/admin/logs', '/admin/oauth2-providers', '/admin/invite-codes', '/admin/announcements', '/admin/kyc']
+      const superAdminOnlyPaths = ['/admin/users', '/admin/config', '/admin/performance', '/admin/logs', '/admin/oauth2-providers', '/admin/invite-codes', '/admin/announcements', '/admin/kyc', '/admin/vouchers']
       if (userStore.userType === 'normal_admin' && superAdminOnlyPaths.some(p => to.path.startsWith(p))) {
         ElMessage.warning(i18n.global.t('navbar.noPermission'))
         next('/admin/dashboard')
@@ -284,7 +285,14 @@ export function setupRouterGuards(router) {
     NProgress.done()
     const t = i18n.global.t
     const title = to.meta.title ? t(to.meta.title) : ''
-    document.title = title ? `${title} - OneClickVirt` : 'OneClickVirt'
+    // 站点名称跟随后台“站点配置”，未配置时回退到 OneClickVirt
+    let brand = 'OneClickVirt'
+    try {
+      brand = useSiteStore().displaySiteName || brand
+    } catch (e) {
+      // pinia 尚未就绪时使用默认值
+    }
+    document.title = title ? `${title} - ${brand}` : brand
     
     // 对于用户页面，确保每次导航都触发组件刷新
     if (to.path.startsWith('/user/') && from.path !== to.path) {

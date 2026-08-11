@@ -38,5 +38,12 @@ export default {
   selectAmount: 'Select or enter a top-up amount',
   amountTooSmall: 'Top-up amount must be at least ¥1',
   openPayPage: 'Payment page opened, please complete payment in the new window',
-  createPayFailed: 'Failed to create payment order'
+  createPayFailed: 'Failed to create payment order',
+  redeemVoucher: 'Redeem Voucher',
+  voucherHint: 'Enter your voucher code. The amount will be credited to your balance immediately. Codes are case-insensitive.',
+  voucherPlaceholder: 'Enter voucher code',
+  voucherCodeRequired: 'Please enter a voucher code',
+  confirmRedeem: 'Redeem',
+  redeemSuccess: 'Redeemed successfully, balance increased by ¥{amount}',
+  redeemFailed: 'Redemption failed. Please check the code is valid and unused'
 }

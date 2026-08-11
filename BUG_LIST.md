@@ -35,12 +35,19 @@
 
 ## 三、当前已知风险
 - 并发会话（IP `117.187.124.154`）曾反复改密码 / 端口 / 库导致 502，**建议关闭多余会话**，避免再次互相覆盖。
-- GitHub 推送卡在 token 失效，本地 `v0.03`（`60b562c`）未同步到 `qdmz/onehost`，但**生产已部署且健康**。
+- GitHub 推送卡在 token 失效，本地最新 `v0.05`（`3c6a055`）未同步到 `qdmz/onehost`，但**生产已部署且健康**（v0.03/v0.04/v0.05 均已部署）。
 
 ---
 
 ## 四、新发现 Bug（实时追加）
-（暂无 —— 发现后让我「记一下」即可）
+
+| # | 问题 | 现象 | 状态 |
+|---|------|------|------|
+| 6 | 首页栏目开关失效（核心根因） | 站点配置里打开「显示平台 / 赞助方 / 推荐产品」等开关并保存，前端首页始终不显示对应栏目（最初「站点配置设置项没被前端动态显示」的真正原因） | ✅ 已修复（v0.05） |
+
+> **根因**：`server/model/product/product.go` 中 `ShowPlatformsSection` / `ShowSponsorsSection` / `ShowRecommendedSection` 三个字段**未显式指定 gorm 列名**，gorm 默认按字段名生成列 `show_platforms_section` / `show_sponsors_section` / `show_recommended_section`；但迁移加的列、前端/接口用的键都是 `show_platforms` / `show_sponsors` / `show_recommended`。结果：**更新写进 `show_recommended` 列，读取却从 `show_recommended_section` 列取**，导致开关永远 False、怎么点都不生效。`show_nav`（字段名 `ShowNav`→列名 `show_nav`）与 `recommended_title`（→`recommended_title`）恰好一致，所以那两个能存。
 
 ## 五、历史回归修复记录
-- **2026-08-11 站点配置保存 500（v0.03 引入的回归）**：后端 `UpdateSiteConfigFields` 用 JSON 字段名（`custom_footer`/`custom_header`/`show_yipay`）直接当 DB 列名做 UPDATE，而真实列名是 `footer_html`/`header_html`/`show_yi_pay`，导致 `Unknown column` 500。修复：在 `server/service/product/site.go` 增加 `jsonKeyToColumn` 映射，更新前转成真实列名。线上已部署，`deploy/verify.py` 验证 **12/12 全 PASS**。版本 v0.04（本地已提交，GitHub 推送待新 token）。
+- **2026-08-11 站点配置保存 500（v0.03 引入的回归）**：后端 `UpdateSiteConfigFields` 用 JSON 字段名（`custom_footer`/`custom_header`/`show_yipay`）直接当 DB 列名做 UPDATE，而真实列名是 `footer_html`/`header_html`/`show_yi_pay`，导致 `Unknown column` 500。修复：在 `server/service/product/site.go` 增加 `jsonKeyToColumn` 映射，更新前转成真实列名。线上已部署，v0.04。
+- **2026-08-11 首页栏目开关失效（模型列名不匹配）**：如上「Bug6」。修复：给三个字段加 `gorm:"column:show_platforms;..."` 等显式列名。线上已部署并实测开关可落库，`deploy/verify.py` 验证 **12/12 全 PASS**。版本 v0.05（本地已提交 `3c6a055`，GitHub 推送待新 token）。
+- **2026-08-11 登录「加载失败」根治**：根因为浏览器残留旧 `index.html` 缓存指向已删除的 chunk（每次部署 JS hash 变化）。修复：`web/src/router/guards.js` 的 `router.onError` 在 chunk 加载失败时自动 `location.reload()` 一次；并已在 nginx 对 `index.html` 加 `Cache-Control: no-cache`。

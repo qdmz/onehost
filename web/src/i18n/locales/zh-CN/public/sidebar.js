@@ -18,6 +18,7 @@ export default {
   userManagement: '用户管理',
   inviteCodeManagement: '邀请码管理',
   redemptionCodeManagement: '兑换码管理',
+  voucherManagement: '代金券管理',
   providerManagement: '节点管理',
   groupManagement: '分组管理',
   taskManagement: '任务管理',

@@ -48,8 +48,9 @@ func InitPublicRouter(Router *gin.RouterGroup) {
 		// 站点链接（虚拟化平台/赞助方）
 		PublicRouter.GET("site-links", product.GetPublicSiteLinks)
 
-		// 易支付异步通知(无需登录)
+		// 易支付异步通知(无需登录)；部分网关使用 GET 回调，故同时注册 GET/POST
 		PublicRouter.POST("payments/yipay/notify", product.YiPayNotify)
+		PublicRouter.GET("payments/yipay/notify", product.YiPayNotify)
 		PublicRouter.GET("payments/yipay/return", product.YiPayReturn)
 	}
 }

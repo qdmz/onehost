@@ -653,6 +653,8 @@ const handleSubmit = async () => {
     const res = await updateAdminSiteConfig(form.value)
     if (res && res.code === 200) {
       ElMessage.success(t('admin.siteConfig.saveSuccess'))
+      // 重新拉取配置回填表单，避免"看似没保存"
+      await loadConfig()
       // 刷新全局站点配置
       const siteStore = (await import('@/pinia/modules/site')).useSiteStore()
       await siteStore.refresh()

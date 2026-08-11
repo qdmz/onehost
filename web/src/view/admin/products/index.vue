@@ -209,6 +209,11 @@
             </el-form-item>
           </el-col>
         </el-row>
+
+        <el-form-item :label="t('admin.products.maxPerUser')" prop="maxPerUser">
+          <el-input-number v-model="form.maxPerUser" :min="0" style="width: 100%;" />
+          <div class="form-hint">{{ t('admin.products.maxPerUserHint') }}</div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
@@ -258,7 +263,8 @@ const form = ref({
   providerIds: '',
   imageIds: '',
   stock: -1,
-  isRecommended: false
+  isRecommended: false,
+  maxPerUser: 0
 })
 
 const formRules = {
@@ -267,7 +273,20 @@ const formRules = {
   cpu: [{ required: true, message: t('admin.products.cpuRequired'), trigger: 'blur' }],
   memory: [{ required: true, message: t('admin.products.memoryRequired'), trigger: 'blur' }],
   disk: [{ required: true, message: t('admin.products.diskRequired'), trigger: 'blur' }],
-  price: [{ required: true, message: t('admin.products.priceRequired'), trigger: 'blur' }],
+  // 价格允许为 0（免费产品）。不能用 required：async-validator 会把数字 0 判为空值，
+  // 导致填 0 时表单校验失败、请求发不出去。改为自定义校验，只拦截空值和负数。
+  price: [{
+    validator: (rule, value, callback) => {
+      if (value === null || value === undefined || value === '') {
+        callback(new Error(t('admin.products.priceRequired')))
+      } else if (Number(value) < 0) {
+        callback(new Error(t('admin.products.priceRequired')))
+      } else {
+        callback()
+      }
+    },
+    trigger: 'blur'
+  }],
   periodType: [{ required: true, message: t('admin.products.periodTypeRequired'), trigger: 'change' }],
   periodValue: [{ required: true, message: t('admin.products.periodValueRequired'), trigger: 'blur' }]
 }

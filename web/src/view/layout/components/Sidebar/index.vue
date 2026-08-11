@@ -291,6 +291,14 @@ const userRoutes = computed(() => {
               title: 'sidebar.redemptionCodeManagement',
               icon: 'Discount'
             }
+          },
+          {
+            path: '/admin/vouchers',
+            name: 'AdminVouchers',
+            meta: {
+              title: 'sidebar.voucherManagement',
+              icon: 'Wallet'
+            }
           }
         ]
       },

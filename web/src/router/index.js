@@ -298,6 +298,16 @@ const routes = [
         }
       },
       {
+        path: 'vouchers',
+        name: 'AdminVouchers',
+        component: () => import('@/view/admin/vouchers/index.vue'),
+        meta: {
+          title: 'sidebar.voucherManagement',
+          requiresAuth: true,
+          roles: ['admin']
+        }
+      },
+      {
         path: 'providers',
         name: 'AdminProviders',
         component: () => import('@/view/admin/providers/index.vue'),

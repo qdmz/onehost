@@ -1,15 +1,18 @@
 <template>
   <div class="snapshots-tab">
     <div class="toolbar">
-      <el-button v-if="!isReadOnly" type="primary" :loading="submitting" @click="openCreateDialog">
+      <el-button v-if="!isReadOnly" type="primary" :disabled="snapshotLimitReached" :loading="submitting" @click="openCreateDialog">
         {{ t('user.instanceDetail.createSnapshot') }}
       </el-button>
-      <el-button v-if="!isReadOnly" :loading="uploading" @click="triggerUpload">
+      <el-button v-if="!isReadOnly" :disabled="snapshotLimitReached" :loading="uploading" @click="triggerUpload">
         {{ t('user.instanceDetail.uploadSnapshot') }}
       </el-button>
       <el-button :loading="loading" @click="loadSnapshots">
         {{ t('user.instanceDetail.refresh') }}
       </el-button>
+      <span class="snapshot-quota">
+        {{ t('user.instanceDetail.snapshotQuota', { used: pagination.total, max: limits.maxSnapshotsPerInstance > 0 ? limits.maxSnapshotsPerInstance : 0 }) }}
+      </span>
       <input ref="uploadInput" class="hidden-file-input" type="file" accept="application/json,.json" @change="handleUpload" />
     </div>
 
@@ -88,6 +91,7 @@ import {
   downloadUserSnapshot,
   getSharedInstanceSnapshots,
   getUserInstanceSnapshots,
+  getUserLimits,
   restoreUserSnapshot,
   uploadUserSnapshot
 } from '@/api/user'
@@ -117,6 +121,24 @@ const createDialogVisible = ref(false)
 const createForm = reactive({ name: '', description: '' })
 const isReadOnly = computed(() => props.readonly || Boolean(props.shareToken))
 const uploadInput = ref(null)
+
+// 快照额度：每实例允许数量 与 已用数量
+const limits = ref({ maxSnapshotsPerInstance: 0, maxSnapshots: 0 })
+const loadLimits = async () => {
+  try {
+    const res = await getUserLimits()
+    limits.value = res.data || { maxSnapshotsPerInstance: 0, maxSnapshots: 0 }
+  } catch (e) {
+    limits.value = { maxSnapshotsPerInstance: 0, maxSnapshots: 0 }
+  }
+}
+// 是否已达到每实例快照上限（0 表示不允许）
+const snapshotLimitReached = computed(() => {
+  if (isReadOnly.value) return true
+  const cap = limits.value.maxSnapshotsPerInstance
+  if (cap <= 0) return true
+  return pagination.total >= cap
+})
 
 const errorMessage = (error, fallback) => error?.details || error?.message || fallback
 
@@ -249,7 +271,10 @@ watch(() => [props.instanceId, props.shareToken], () => {
   loadSnapshots()
 })
 
-onMounted(loadSnapshots)
+onMounted(() => {
+  loadSnapshots()
+  loadLimits()
+})
 </script>
 
 <style scoped>
@@ -265,6 +290,11 @@ onMounted(loadSnapshots)
 }
 .hidden-file-input {
   display: none;
+}
+.snapshot-quota {
+  font-size: 13px;
+  color: #909399;
+  margin-left: 4px;
 }
 .pagination {
   margin-top: 16px;

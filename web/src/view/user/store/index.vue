@@ -70,7 +70,7 @@
             </div>
             <div class="spec-item">
               <el-icon><Box /></el-icon>
-              <span>{{ product.stock < 0 ? t('user.store.stockUnlimited') : product.stock }}</span>
+              <span>{{ product.stock < 0 ? (t('user.store.stock') + '：' + t('user.store.stockUnlimited')) : (t('user.store.stock') + '：' + product.stock) }}</span>
             </div>
             <div v-if="product.traffic > 0" class="spec-item">
               <el-icon><DataLine /></el-icon>

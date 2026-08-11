@@ -172,3 +172,18 @@ export const getBalanceLogs = (params) => {
     params
   })
 }
+
+// ========== 代金券相关 API ==========
+
+/**
+ * 兑换代金券（券码充值到余额）
+ * @param {string} code - 券码
+ * @returns {Promise}
+ */
+export const redeemVoucher = (code) => {
+  return request({
+    url: '/v1/user/vouchers/redeem',
+    method: 'post',
+    data: { code }
+  })
+}

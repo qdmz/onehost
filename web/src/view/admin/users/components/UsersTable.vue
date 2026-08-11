@@ -49,6 +49,16 @@
       </template>
     </el-table-column>
     <el-table-column
+      prop="balance"
+      :label="$t('admin.users.balance')"
+      width="120"
+      align="center"
+    >
+      <template #default="scope">
+        <span class="balance-cell">¥{{ Number(scope.row.balance || 0).toFixed(2) }}</span>
+      </template>
+    </el-table-column>
+    <el-table-column
       prop="userType"
       :label="$t('admin.users.userType')"
       width="120"
@@ -103,7 +113,7 @@
     </el-table-column>
     <el-table-column
       :label="$t('common.actions')"
-      width="420"
+      width="520"
       fixed="right"
       align="center"
     >
@@ -158,6 +168,13 @@
             {{ $t('admin.users.resetPassword') }}
           </el-button>
           <el-button
+            size="small"
+            type="success"
+            @click="$emit('adjust-balance', scope.row)"
+          >
+            {{ $t('admin.users.adjustBalance') }}
+          </el-button>
+          <el-button
             v-if="scope.row.userType !== 'admin'"
             size="small"
             type="info"
@@ -181,7 +198,7 @@ defineProps({
   availableLevels: { type: Array, default: () => [1, 2, 3, 4, 5] }
 })
 
-defineEmits(['selection-change', 'edit', 'set-user-level', 'set-expiry', 'toggle-status', 'reset-password', 'login-as'])
+defineEmits(['selection-change', 'edit', 'set-user-level', 'set-expiry', 'toggle-status', 'reset-password', 'login-as', 'adjust-balance'])
 
 const { t, locale } = useI18n()
 
@@ -212,3 +229,10 @@ const isExpired = (dateTimeStr) => {
   return new Date(dateTimeStr) < new Date()
 }
 </script>
+
+<style scoped>
+.balance-cell {
+  color: var(--el-color-danger);
+  font-weight: 600;
+}
+</style>

@@ -8,6 +8,7 @@ import (
 	"oneclickvirt/constant"
 	"oneclickvirt/global"
 	adminModel "oneclickvirt/model/admin"
+	productModel "oneclickvirt/model/product"
 	providerModel "oneclickvirt/model/provider"
 	userModel "oneclickvirt/model/user"
 	trafficService "oneclickvirt/service/traffic"
@@ -103,6 +104,12 @@ func (s *Service) GetInstanceDetail(userID, instanceID uint) (*userModel.UserIns
 		TrafficQuotaVisible: true, // 默认显示流量额度，后续从Provider覆盖
 		TrafficLimited:      instance.TrafficLimited,
 		TrafficLimitReason:  instance.TrafficLimitReason,
+	}
+
+	// 回填关联订单ID，供前端续费使用
+	var relOrder productModel.ProductOrder
+	if err := global.APP_DB.Where("instance_id = ?", instance.ID).Order("id desc").First(&relOrder).Error; err == nil {
+		detail.OrderID = relOrder.ID
 	}
 
 	if hasProvider {

@@ -7,10 +7,10 @@
         <div class="logo">
           <img
             :src="siteStore.logoSrc"
-            alt="OneClickVirt Logo"
+            :alt="siteStore.displaySiteName"
             class="logo-image"
           >
-          <h1>{{ t('home.title') }}</h1>
+          <h1>{{ siteStore.displaySiteName }}</h1>
         </div>
         <nav class="nav-menu">
           <!-- 主题切换按钮 -->

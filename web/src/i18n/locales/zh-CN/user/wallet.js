@@ -38,5 +38,12 @@ export default {
   selectAmount: '请选择或输入充值金额',
   amountTooSmall: '充值金额不能小于 1 元',
   openPayPage: '已打开支付页面，请在新窗口完成支付',
-  createPayFailed: '创建支付订单失败'
+  createPayFailed: '创建支付订单失败',
+  redeemVoucher: '兑换代金券',
+  voucherHint: '请输入代金券兑换码，兑换成功后金额将直接充入账户余额。兑换码不区分大小写。',
+  voucherPlaceholder: '请输入兑换码',
+  voucherCodeRequired: '请输入兑换码',
+  confirmRedeem: '确认兑换',
+  redeemSuccess: '兑换成功，余额增加 ¥{amount}',
+  redeemFailed: '兑换失败，请检查兑换码是否正确或已被使用'
 }

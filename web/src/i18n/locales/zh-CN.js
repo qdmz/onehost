@@ -47,6 +47,7 @@ import adminConfig from './zh-CN/admin/config.js'
 import adminAnnouncements from './zh-CN/admin/announcements.js'
 import adminInviteCodes from './zh-CN/admin/inviteCodes.js'
 import adminRedemptionCodes from './zh-CN/admin/redemptionCodes.js'
+import adminVouchers from './zh-CN/admin/vouchers.js'
 import adminSystemImages from './zh-CN/admin/systemImages.js'
 import adminInstances from './zh-CN/admin/instances.js'
 import adminTasks from './zh-CN/admin/tasks.js'
@@ -106,6 +107,7 @@ export default {
     announcements: adminAnnouncements,
     inviteCodes: adminInviteCodes,
     redemptionCodes: adminRedemptionCodes,
+    vouchers: adminVouchers,
     systemImages: adminSystemImages,
     instances: adminInstances,
     tasks: adminTasks,
