@@ -239,6 +239,24 @@ type UserBalanceLog struct {
 	TradeNo   string `json:"tradeNo" gorm:"size:128;index"`  // 交易流水号
 }
 
+// RechargeOrder 易支付充值订单表
+// 与 UserBalanceLog 分离：用户发起充值即创建订单（status=0 未支付），
+// 仅易支付异步回调确认 TRADE_SUCCESS 后才会写入 UserBalanceLog 并置 status=1，
+// 从而避免未支付的充值以"+"流水形式出现在用户钱包的"全部记录"中。
+type RechargeOrder struct {
+	ID        uint      `json:"id" gorm:"primarykey"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+
+	UserID     uint    `json:"userId" gorm:"not null;index"`    // 发起充值的用户
+	RechargeNo string  `json:"rechargeNo" gorm:"size:64;index"` // 商户订单号 RCH...
+	Amount     float64 `json:"amount"`                          // 充值金额
+	Status     int     `json:"status" gorm:"default:0;index"`   // 0=未支付 1=已支付 2=已关闭/失败
+	TradeNo    string  `json:"tradeNo" gorm:"size:128;index"`   // 平台订单号（回调回传）
+	PayType    string  `json:"payType" gorm:"size:32"`          // alipay/wxpay/qqpay
+	Remark     string  `json:"remark" gorm:"size:512"`
+}
+
 // YiPayConfig 易支付配置表
 type YiPayConfig struct {
 	ID        uint      `json:"id" gorm:"primarykey"`

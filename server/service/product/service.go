@@ -799,15 +799,18 @@ func (s *Service) CreateYiPayOrder(userID uint, req productModel.CreateYiPayOrde
 	// 生成充值订单号
 	rechargeNo := s.yiPayService.GenerateOrderNo()
 
-	// 创建余额变动记录（初始状态为未支付）
-	log := productModel.UserBalanceLog{
-		UserID:  userID,
-		Type:    "recharge",
-		Amount:  req.Amount,
-		TradeNo: rechargeNo,
-		Remark:  fmt.Sprintf("易支付充值: %s", config.Name),
+	// 创建充值订单（初始状态为未支付）。
+	// 注意：下单不再预写余额变动流水，仅易支付回调确认成功后才会写入 UserBalanceLog，
+	// 避免未支付的充值以无效"+金额"记录出现在用户钱包的"全部记录"中。
+	order := productModel.RechargeOrder{
+		UserID:     userID,
+		RechargeNo: rechargeNo,
+		Amount:     req.Amount,
+		Status:     0,
+		PayType:    req.PayType,
+		Remark:     fmt.Sprintf("易支付充值: %s", config.Name),
 	}
-	if err := global.APP_DB.Create(&log).Error; err != nil {
+	if err := global.APP_DB.Create(&order).Error; err != nil {
 		return nil, common.NewError(common.CodeDatabaseError, err.Error())
 	}
 
@@ -845,20 +848,16 @@ func (s *Service) ProcessYiPayNotify(params map[string]string) error {
 	money, _ := strconv.ParseFloat(params["money"], 64)
 	tradeNo := params["trade_no"]
 
-	// 查询充值记录
-	var log productModel.UserBalanceLog
-	if err := global.APP_DB.Where("trade_no = ? AND type = ?", rechargeNo, "recharge").First(&log).Error; err != nil {
-		return common.NewError(common.CodeNotFound, "充值记录不存在")
+	// 查询充值订单（下单时创建，记录订单号→用户映射）
+	var order productModel.RechargeOrder
+	if err := global.APP_DB.Where("recharge_no = ?", rechargeNo).First(&order).Error; err != nil {
+		return common.NewError(common.CodeNotFound, "充值订单不存在")
 	}
 
-	// 已处理则直接返回
-	if log.BalanceAfter > 0 || log.ID == 0 {
-		// 检查是否已经处理过（通过查询用户余额是否有变动判断）
-		var existingLog productModel.UserBalanceLog
-		if err := global.APP_DB.Where("trade_no = ? AND balance_after > balance_before", rechargeNo).First(&existingLog).Error; err == nil {
-			global.APP_LOG.Info("易支付通知: 该订单已处理", zap.String("rechargeNo", rechargeNo))
-			return nil
-		}
+	// 已支付则幂等返回，避免重复加款
+	if order.Status == 1 {
+		global.APP_LOG.Info("易支付通知: 该订单已处理", zap.String("rechargeNo", rechargeNo))
+		return nil
 	}
 
 	// 验证金额
@@ -866,30 +865,40 @@ func (s *Service) ProcessYiPayNotify(params map[string]string) error {
 		return common.NewError(common.CodeBadRequest, "无效的支付金额")
 	}
 
-	// 使用事务处理充值
+	// 使用事务处理充值：仅支付成功时才写入余额与流水
 	err = global.APP_DB.Transaction(func(tx *gorm.DB) error {
 		// 查询用户当前余额
 		var user userModel.User
-		if err := tx.First(&user, log.UserID).Error; err != nil {
+		if err := tx.First(&user, order.UserID).Error; err != nil {
 			return err
 		}
 
 		balanceBefore := user.Balance
 		balanceAfter := user.Balance + money
 
-		// 增加余额
-		if err := tx.Model(&userModel.User{}).Where("id = ?", log.UserID).
+		// 增加用户余额
+		if err := tx.Model(&userModel.User{}).Where("id = ?", order.UserID).
 			Update("balance", balanceAfter).Error; err != nil {
 			return err
 		}
 
-		// 更新充值记录
-		if err := tx.Model(&log).Updates(map[string]interface{}{
-			"amount":         money,
-			"balance_before": balanceBefore,
-			"balance_after":  balanceAfter,
-			"remark":         fmt.Sprintf("易支付充值成功: %s", tradeNo),
-		}).Error; err != nil {
+		// 仅支付成功时写入余额变动流水（recharge），避免未支付订单污染"全部记录"
+		balanceLog := productModel.UserBalanceLog{
+			UserID:        order.UserID,
+			Type:          "recharge",
+			Amount:        money,
+			BalanceBefore: balanceBefore,
+			BalanceAfter:  balanceAfter,
+			TradeNo:       rechargeNo,
+			Remark:        fmt.Sprintf("易支付充值成功: %s", tradeNo),
+		}
+		if err := tx.Create(&balanceLog).Error; err != nil {
+			return err
+		}
+
+		// 标记订单为已支付
+		if err := tx.Model(&productModel.RechargeOrder{}).Where("id = ?", order.ID).
+			Update("status", 1).Error; err != nil {
 			return err
 		}
 
@@ -904,20 +913,20 @@ func (s *Service) ProcessYiPayNotify(params map[string]string) error {
 		zap.String("rechargeNo", rechargeNo),
 		zap.String("tradeNo", tradeNo),
 		zap.Float64("amount", money),
-		zap.Uint("userID", log.UserID))
+		zap.Uint("userID", order.UserID))
 
 	return nil
 }
 
 // GetRechargeList 获取用户充值记录
-func (s *Service) GetRechargeList(userID uint, page, pageSize int) ([]productModel.UserBalanceLog, int64, error) {
+func (s *Service) GetRechargeList(userID uint, page, pageSize int) ([]productModel.RechargeOrder, int64, error) {
 	page, pageSize = common.NormalizePagination(page, pageSize, common.DefaultPageSize)
 
 	var total int64
-	var logs []productModel.UserBalanceLog
+	var orders []productModel.RechargeOrder
 
-	db := global.APP_DB.Model(&productModel.UserBalanceLog{}).
-		Where("user_id = ? AND type = ?", userID, "recharge")
+	db := global.APP_DB.Model(&productModel.RechargeOrder{}).
+		Where("user_id = ?", userID)
 
 	if err := db.Count(&total).Error; err != nil {
 		return nil, 0, common.NewError(common.CodeDatabaseError, err.Error())
@@ -926,11 +935,11 @@ func (s *Service) GetRechargeList(userID uint, page, pageSize int) ([]productMod
 	if err := db.Order("created_at DESC").
 		Offset((page - 1) * pageSize).
 		Limit(pageSize).
-		Find(&logs).Error; err != nil {
+		Find(&orders).Error; err != nil {
 		return nil, 0, common.NewError(common.CodeDatabaseError, err.Error())
 	}
 
-	return logs, total, nil
+	return orders, total, nil
 }
 
 // ========== 管理员相关方法 ==========

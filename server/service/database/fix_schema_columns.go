@@ -262,6 +262,21 @@ func (ds *DatabaseService) FixSchemaColumns() error {
 		global.APP_LOG.Debug("vouchers 表已存在，跳过创建")
 	}
 
+	// === 8.7 创建 recharge_orders（易支付充值订单）表 ===
+	// 充值订单为新增功能表，已初始化的实例会跳过 AutoMigrate，因此在此按需创建。
+	// 下单时创建订单（status=0），仅易支付回调成功后写余额流水并置 status=1，
+	// 避免未支付充值出现在用户钱包"全部记录"中。
+	if !db.Migrator().HasTable("recharge_orders") {
+		global.APP_LOG.Info("正在创建 recharge_orders 表")
+		if err := db.AutoMigrate(&productModel.RechargeOrder{}); err != nil {
+			global.APP_LOG.Warn("创建 recharge_orders 表失败", zap.Error(err))
+		} else {
+			global.APP_LOG.Info("recharge_orders 表创建完成")
+		}
+	} else {
+		global.APP_LOG.Debug("recharge_orders 表已存在，跳过创建")
+	}
+
 	// === 9. 修复 system_configs 重复数据并重建唯一索引 ===
 	// 该修复在「已初始化」与「全新安装」两条路径都会执行（FixSchemaColumns 均被调用），
 	// 且早于 ConfigManager 加载配置，确保后续 upsert 真正去重。

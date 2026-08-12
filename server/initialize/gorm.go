@@ -214,6 +214,7 @@ func RegisterTables(db *gorm.DB) {
 		&productModel.TicketReply{},     // 工单回复表
 		&productModel.SiteConfig{},      // 站点前端配置表
 		&productModel.UserBalanceLog{},  // 用户余额变动记录表
+		&productModel.RechargeOrder{},   // 易支付充值订单表（下单创建，成功后写流水）
 		&productModel.YiPayConfig{},     // 易支付配置表
 		&productModel.Voucher{},         // 代金券表
 	)
