@@ -332,10 +332,51 @@ const filteredProviderOptions = computed(() => {
   return providerOptions.value.filter(p => ids.includes(String(p.id)))
 })
 
+// 镜像/节点类型兼容性（与后端 utils.SystemImageProviderTypeMatches 保持一致）
+const normalizeType = (v) => String(v || '').trim().toLowerCase()
+const normalizeSystemImageType = (v) => {
+  const n = normalizeType(v)
+  return (n === 'pve' || n === 'proxmoxve') ? 'proxmox' : n
+}
+// 判断某个节点类型能否使用某镜像（镜像 providerType 可能是逗号分隔的多类型）
+const systemImageProviderTypeMatches = (providerType, imageProviderType) => {
+  const raw = normalizeType(providerType)
+  if (!raw) return false
+  const normalized = normalizeSystemImageType(raw)
+  const image = normalizeType(imageProviderType)
+  if (!image) return false
+  return image.split(',').map(s => normalizeType(s)).some(token => {
+    if (!token) return false
+    const tNorm = normalizeSystemImageType(token)
+    return token === raw || tNorm === normalized || token === normalized || tNorm === raw
+  })
+}
+
+// 已选节点（默认节点 + 允许节点），仅取带 type 的，避免误判隐藏全部镜像
+const selectedProviderList = computed(() => {
+  const ids = new Set()
+  if (form.value.defaultProviderId) ids.add(String(form.value.defaultProviderId))
+  ;(form.value.providerIds || '').split(',').map(s => s.trim()).filter(Boolean).forEach(id => ids.add(id))
+  return providerOptions.value.filter(p => ids.has(String(p.id)) && p.type)
+})
+
+// 仅展示与所选节点类型兼容、且与产品实例类型匹配的镜像（编辑已有产品时保留已选镜像，避免丢失原值）
 const filteredImageOptions = computed(() => {
+  let list = imageOptions.value
+  if (selectedProviderList.value.length > 0) {
+    list = list.filter(img => selectedProviderList.value.some(p => systemImageProviderTypeMatches(p.type, img.providerType)))
+  }
+  const ptype = form.value.type
+  if (ptype) {
+    list = list.filter(img => img.instanceType === ptype)
+  }
+  // 编辑已有产品：保留已选镜像（即便因类型不匹配被过滤，也不丢失原值）
   const ids = (form.value.imageIds || '').split(',').map(s => s.trim()).filter(Boolean)
-  if (ids.length === 0) return imageOptions.value
-  return imageOptions.value.filter(img => ids.includes(String(img.id)))
+  if (ids.length > 0) {
+    const extra = imageOptions.value.filter(img => ids.includes(String(img.id)) && !list.includes(img))
+    list = [...list, ...extra]
+  }
+  return list
 })
 
 // 加载可用节点列表
