@@ -373,8 +373,20 @@ func (s *Service) PayOrderWithBalance(userID uint, orderID uint) error {
 		zap.String("orderNo", order.OrderNo),
 		zap.Float64("amount", order.TotalAmount))
 
-	// 支付成功后自动开通实例
-	go s.autoProvisionOrder(order.ID)
+	// 支付成功后处理
+	if order.IsRenewal {
+		// 续费订单：仅延长原订单与实例的到期时间，不开通新实例
+		if err := s.CompleteRenewal(&order); err != nil {
+			global.APP_LOG.Error("续费完成失败",
+				zap.Uint("orderID", order.ID),
+				zap.Uint("renewOrderID", order.RenewOrderID),
+				zap.Error(err))
+			// 余额已扣、订单已置已支付，此处不回滚，仅记录错误以免用户误以为支付失败
+		}
+	} else {
+		// 普通订单：自动开通实例
+		go s.autoProvisionOrder(order.ID)
+	}
 
 	return nil
 }
