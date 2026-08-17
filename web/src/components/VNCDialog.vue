@@ -106,7 +106,11 @@ async function connect() {
     const wsUrl = props.adminMode
       ? getAdminInstanceVNCWsUrl(props.instanceId)
       : getUserInstanceVNCWsUrl(props.instanceId)
-    const client = new RFB(screenRef.value, wsUrl)
+    const client = new RFB(
+      screenRef.value,
+      wsUrl,
+      info.password ? { credentials: { password: info.password } } : undefined
+    )
     client.scaleViewport = true
     client.resizeSession = false
     client.clipViewport = true

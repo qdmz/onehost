@@ -137,7 +137,15 @@ func (s *TaskService) executeStartInstanceTask(ctx context.Context, task *adminM
 	// 更新进度 (90%)
 	s.updateTaskProgress(task.ID, 90, "step.initMonitoring")
 
-	// 实例启动成功后，异步初始化流量监控和流量同步
+	// 实例状态已成功翻转为 running，主任务实质完成。
+	// 立即标记任务完成以释放实例操作锁（ensureNoActiveInstanceTask 依据 tasks 表状态判断），
+	// 避免后续 restart/reset/stop 在流量监控初始化（最长约数分钟）期间被 409 拦截。
+	stateManager := GetTaskStateManager()
+	if err := stateManager.CompleteMainTask(task.ID, true, "实例启动成功", nil); err != nil {
+		global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", task.ID), zap.Error(err))
+	}
+
+	// 实例启动成功后，异步初始化流量监控和流量同步（后台进行，不再持有任务锁）
 	s.wg.Add(1)
 	go func(taskCtx context.Context, instanceID uint, taskID uint) {
 		defer s.wg.Done()
@@ -147,10 +155,6 @@ func (s *TaskService) executeStartInstanceTask(ctx context.Context, task *adminM
 				global.APP_LOG.Error("启动实例后处理任务发生panic",
 					zap.Uint("instanceId", instanceID),
 					zap.Any("panic", r))
-				stateManager := GetTaskStateManager()
-				if err := stateManager.CompleteMainTask(taskID, true, "实例启动成功，但部分监控服务初始化失败", nil); err != nil {
-					global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", taskID), zap.Error(err))
-				}
 			}
 		}()
 
@@ -160,23 +164,11 @@ func (s *TaskService) executeStartInstanceTask(ctx context.Context, task *adminM
 		select {
 		case <-waitCtx.Done():
 			waitCancel()
-			// 检查是服务关闭还是正常超时
 			if taskCtx.Err() != nil {
-				// 服务正在关闭
-				global.APP_LOG.Debug("启动实例后处理被服务关闭中断",
-					zap.Uint("instanceId", instanceID),
-					zap.Uint("taskId", taskID))
-				stateManager := GetTaskStateManager()
-				_ = stateManager.CompleteMainTask(taskID, false, "任务已取消", nil)
 				return
 			}
 		case <-taskCtx.Done():
 			waitCancel()
-			global.APP_LOG.Debug("启动实例后处理被服务关闭中断",
-				zap.Uint("instanceId", instanceID),
-				zap.Uint("taskId", taskID))
-			stateManager := GetTaskStateManager()
-			_ = stateManager.CompleteMainTask(taskID, false, "任务已取消", nil)
 			return
 		}
 		// 正常超时，继续执行
@@ -227,15 +219,6 @@ func (s *TaskService) executeStartInstanceTask(ctx context.Context, task *adminM
 		}
 
 		// 标记任务完成
-		completionMessage := "实例启动成功"
-		if !pmacctSuccess && trafficEnabled {
-			completionMessage = "实例启动成功，但pmacct监控初始化失败"
-		}
-		stateManager := GetTaskStateManager()
-		if err := stateManager.CompleteMainTask(taskID, true, completionMessage, nil); err != nil {
-			global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", taskID), zap.Error(err))
-		}
-
 		global.APP_LOG.Debug("启动实例后处理任务完成",
 			zap.Uint("instanceId", instanceID),
 			zap.Bool("pmacctSuccess", pmacctSuccess))
@@ -488,7 +471,14 @@ func (s *TaskService) executeRestartInstanceTask(ctx context.Context, task *admi
 	// 更新进度 (80%)
 	s.updateTaskProgress(task.ID, 80, "step.reinitMonitoring")
 
-	// 实例重启成功后，异步重新初始化流量监控
+	// 实例状态已成功翻转为 running，主任务实质完成。
+	// 立即标记任务完成以释放实例操作锁，避免后续操作在监控重新初始化期间被 409 拦截。
+	stateManager := GetTaskStateManager()
+	if err := stateManager.CompleteMainTask(task.ID, true, "实例重启成功", nil); err != nil {
+		global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", task.ID), zap.Error(err))
+	}
+
+	// 实例重启成功后，异步重新初始化流量监控（后台进行，不再持有任务锁）
 	s.wg.Add(1)
 	go func(taskCtx context.Context, instanceID uint, taskID uint) {
 		defer s.wg.Done()
@@ -498,10 +488,6 @@ func (s *TaskService) executeRestartInstanceTask(ctx context.Context, task *admi
 				global.APP_LOG.Error("重启实例后处理任务发生panic",
 					zap.Uint("instanceId", instanceID),
 					zap.Any("panic", r))
-				stateManager := GetTaskStateManager()
-				if err := stateManager.CompleteMainTask(taskID, true, "实例重启成功，但部分监控服务初始化失败", nil); err != nil {
-					global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", taskID), zap.Error(err))
-				}
 			}
 		}()
 
@@ -511,23 +497,11 @@ func (s *TaskService) executeRestartInstanceTask(ctx context.Context, task *admi
 		select {
 		case <-waitCtx.Done():
 			waitCancel()
-			// 检查是服务关闭还是正常超时
 			if taskCtx.Err() != nil {
-				// 服务正在关闭
-				global.APP_LOG.Debug("重启实例后处理被服务关闭中断",
-					zap.Uint("instanceId", instanceID),
-					zap.Uint("taskId", taskID))
-				stateManager := GetTaskStateManager()
-				_ = stateManager.CompleteMainTask(taskID, false, "任务已取消", nil)
 				return
 			}
 		case <-taskCtx.Done():
 			waitCancel()
-			global.APP_LOG.Debug("重启实例后处理被服务关闭中断",
-				zap.Uint("instanceId", instanceID),
-				zap.Uint("taskId", taskID))
-			stateManager := GetTaskStateManager()
-			_ = stateManager.CompleteMainTask(taskID, false, "任务已取消", nil)
 			return
 		}
 		// 正常超时，继续执行
@@ -578,15 +552,6 @@ func (s *TaskService) executeRestartInstanceTask(ctx context.Context, task *admi
 		}
 
 		// 标记任务完成
-		completionMessage := "实例重启成功"
-		if !pmacctSuccess && trafficEnabled {
-			completionMessage = "实例重启成功，但pmacct监控重新初始化失败"
-		}
-		stateManager := GetTaskStateManager()
-		if err := stateManager.CompleteMainTask(taskID, true, completionMessage, nil); err != nil {
-			global.APP_LOG.Error("完成任务失败", zap.Uint("taskId", taskID), zap.Error(err))
-		}
-
 		global.APP_LOG.Debug("重启实例后处理任务完成",
 			zap.Uint("instanceId", instanceID),
 			zap.Bool("pmacctSuccess", pmacctSuccess))

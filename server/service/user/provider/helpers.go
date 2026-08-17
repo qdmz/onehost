@@ -69,7 +69,12 @@ func (s *Service) getInstanceDetailsAfterCreation(ctx context.Context, instance 
 	}
 
 	// 获取实例详细信息
-	actualInstance, err := providerInstance.GetInstance(ctx, instance.ProviderInstanceIdentifier())
+	// 为远程 GetInstance 调用设置独立超时，避免底层 Proxmox API/SSH 回退缺乏超时控制，
+	// 导致 finalize 阶段最长挂起 15 分钟（finalizeCtx 超时）才回退到后处理 goroutine。
+	timeoutCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	actualInstance, err := providerInstance.GetInstance(timeoutCtx, instance.ProviderInstanceIdentifier())
 	if err != nil {
 		return nil, fmt.Errorf("从Provider获取实例详情失败: %w", err)
 	}

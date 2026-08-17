@@ -14,7 +14,7 @@ func BuildInstanceVNCInfoForUser(instanceID uint, userID uint) (gin.H, error) {
 }
 
 func ProxyInstanceVNCForUser(c *gin.Context, instanceID uint, userID uint) {
-	host, port, err := resolveInstanceVNCTarget(instanceID, userID, false)
+	host, port, _, err := resolveInstanceVNCProxyTarget(instanceID, userID, false)
 	if err != nil {
 		common.ResponseWithError(c, common.ClassifyError(err))
 		return
@@ -44,7 +44,7 @@ func AdminInstanceVNCWebSocket(c *gin.Context) {
 		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "无效的实例ID"))
 		return
 	}
-	host, port, err := resolveInstanceVNCTarget(uint(instanceID), 0, true)
+	host, port, _, err := resolveInstanceVNCProxyTarget(uint(instanceID), 0, true)
 	if err != nil {
 		common.ResponseWithError(c, common.ClassifyError(err))
 		return

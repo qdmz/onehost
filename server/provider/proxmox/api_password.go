@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"oneclickvirt/global"
+	"oneclickvirt/utils"
 
 	"go.uber.org/zap"
 )
@@ -71,41 +72,30 @@ func (p *ProxmoxProvider) apiSetInstancePassword(ctx context.Context, instanceID
 	}
 }
 
-// apiSetContainerPassword 通过API为LXC容器设置密码
+// apiSetContainerPassword 为LXC容器设置密码。
+// 注意：Proxmox LXC exec API 以非 shell 方式直接执行命令，
+// 不支持 `echo 'root:X' | chpasswd` 之类的管道，API 会返回 200 但实际并未改密，
+// 导致上层误判成功、密码未生效。因此容器内改密统一走节点 SSH 的 `pct exec chpasswd`
+// （经 base64 传递凭据，已验证可靠），与 sshSetInstancePassword 容器内路径保持一致。
 func (p *ProxmoxProvider) apiSetContainerPassword(ctx context.Context, vmid, password string) error {
-	// 使用LXC容器的exec API执行chpasswd命令
-	url := fmt.Sprintf("https://%s:8006/api2/json/nodes/%s/lxc/%s/exec", p.config.Host, p.node, vmid)
-
-	// 构造执行命令的请求体
-	payload := map[string]interface{}{
-		"command": fmt.Sprintf("echo 'root:%s' | chpasswd", password),
+	// 容器改密依赖节点 SSH 执行 pct exec，确保 SSH 连接可用
+	if err := p.EnsureConnection(); err != nil {
+		return fmt.Errorf("容器改密需要 SSH 连接，但连接不可用: %w", err)
 	}
 
-	jsonData, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("序列化请求失败: %w", err)
+	script := utils.BuildTempScript(utils.TempScriptConfig{
+		PrimaryCmd:     buildProxmoxContainerChpasswdCommand(vmid, password),
+		FallbackCmd:    buildProxmoxContainerChpasswdCommand(vmid, password),
+		TimeoutSeconds: 60,
+	})
+	if _, err := p.sshClient.ExecuteViaTempScript(script, nil, 180*time.Second); err != nil {
+		global.APP_LOG.Error("通过SSH(pct exec)设置容器密码失败",
+			zap.String("vmid", vmid),
+			zap.Error(err))
+		return fmt.Errorf("设置容器密码失败: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(jsonData)))
-	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	p.setAPIAuth(req)
-
-	resp, err := p.apiClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("执行API请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var respData map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&respData)
-		return fmt.Errorf("设置容器密码失败: status %d, response: %v", resp.StatusCode, respData)
-	}
-
-	global.APP_LOG.Info("通过API成功设置容器密码", zap.String("vmid", vmid))
+	global.APP_LOG.Info("通过SSH(pct exec)成功设置容器密码", zap.String("vmid", vmid))
 	return nil
 }
 
