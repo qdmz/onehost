@@ -13,6 +13,7 @@ import (
 	"oneclickvirt/service/lifecycle"
 	"oneclickvirt/service/log"
 	"oneclickvirt/service/pmacct"
+	"oneclickvirt/service/product"
 	"oneclickvirt/service/remote"
 	"oneclickvirt/service/resources"
 	"oneclickvirt/service/scheduler"
@@ -447,6 +448,9 @@ func initializeSchedulers() {
 	// 延迟恢复控制端端口转发（内网穿透）
 	// 主控重启后需要等待 Agent 重新连接，多次尝试恢复直到成功
 	go recoverControllerPortForwardsWithRetry()
+
+	// 启动对账：自愈因进程重启/轮询超时而丢失回填的卡单（订单状态/续费按钮）
+	go product.NewService().ReconcileStuckProvisionOrders()
 }
 
 // InitializePostSystemInit 系统初始化完成后的完整初始化

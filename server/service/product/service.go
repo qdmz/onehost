@@ -641,8 +641,20 @@ func (s *Service) provisionInstance(order *productModel.ProductOrder) error {
 
 // trackProvisionTask 跟踪开通任务状态
 func (s *Service) trackProvisionTask(orderID uint, taskID uint) {
-	maxRetries := 120 // 最多跟踪10分钟（每5秒检查一次）
+	// 轮询直到任务进入终态，最长约 60 分钟（每 5 秒检查一次）。
+	// 旧上限仅 10 分钟，而实例实际开通耗时可达 20~35 分钟，
+	// 导致订单卡在「开通中」且 instance_id 永不回填（前端续费按钮也随之消失）。
+	maxRetries := 720
 	interval := 5 * time.Second
+
+	// 任务终态集合：进入这些状态即结束轮询
+	terminalStatus := map[string]bool{
+		"completed": true,
+		"failed":    true,
+		"timeout":   true,
+		"cancelled": true,
+		"error":     true,
+	}
 
 	for i := 0; i < maxRetries; i++ {
 		time.Sleep(interval)
@@ -685,7 +697,7 @@ func (s *Service) trackProvisionTask(orderID uint, taskID uint) {
 			return
 		}
 
-		if task.Status == "failed" || task.Status == "timeout" {
+		if terminalStatus[task.Status] && task.Status != "completed" {
 			if err := global.APP_DB.Model(&productModel.ProductOrder{}).Where("id = ?", orderID).
 				Update("provision_status", 3).Error; err != nil {
 				global.APP_LOG.Error("跟踪任务: 更新订单失败状态失败",
@@ -701,9 +713,125 @@ func (s *Service) trackProvisionTask(orderID uint, taskID uint) {
 		}
 	}
 
-	global.APP_LOG.Warn("跟踪任务超时",
+	global.APP_LOG.Warn("跟踪任务超过最大轮询时长仍未进入终态，交由启动对账自愈",
 		zap.Uint("orderID", orderID),
 		zap.Uint("taskID", taskID))
+}
+
+// ReconcileStuckProvisionOrders 启动对账：自愈因进程重启/轮询超时而丢失回填的卡单。
+// 将「已支付但开通中/待开通、且尚未关联实例」的订单，按「用户 + 创建任务时间最接近」
+// 匹配同一用户时间窗口内的已完成创建任务，回填 instance_id 并置为已开通(provision_status=2)；
+// 若仅匹配到失败/超时任务则置为开通失败(provision_status=3)。
+// 已在 initializeSchedulers 启动时调用一次，幂等（已关联实例的订单会被自动跳过）。
+func (s *Service) ReconcileStuckProvisionOrders() {
+	if global.APP_DB == nil {
+		return
+	}
+
+	var stuckOrders []productModel.ProductOrder
+	if err := global.APP_DB.
+		Where("payment_status = ? AND provision_status IN (?) AND instance_id = ?", 1, []int{0, 1}, 0).
+		Order("created_at asc").
+		Find(&stuckOrders).Error; err != nil {
+		global.APP_LOG.Error("对账: 查询卡单失败", zap.Error(err))
+		return
+	}
+	if len(stuckOrders) == 0 {
+		global.APP_LOG.Info("对账: 未发现需要修复的卡单")
+		return
+	}
+
+	// 收集候选「已完成」创建任务：仅限卡单用户、且实例未被其他订单占用
+	userIDs := map[uint]bool{}
+	for _, o := range stuckOrders {
+		userIDs[o.UserID] = true
+	}
+	var candidateTasks []adminModel.Task
+	if err := global.APP_DB.
+		Where("task_type = ? AND status = ? AND instance_id > 0", "create", "completed").
+		Find(&candidateTasks).Error; err != nil {
+		global.APP_LOG.Error("对账: 查询候选任务失败", zap.Error(err))
+		return
+	}
+	claimedInstances := map[uint]bool{}
+	var occupied []productModel.ProductOrder
+	global.APP_DB.Model(&productModel.ProductOrder{}).Where("instance_id > 0").Find(&occupied)
+	for _, o := range occupied {
+		claimedInstances[o.InstanceID] = true
+	}
+	var candidates []adminModel.Task
+	for i := range candidateTasks {
+		t := &candidateTasks[i]
+		if !userIDs[t.UserID] || t.InstanceID == nil || *t.InstanceID == 0 || claimedInstances[*t.InstanceID] {
+			continue
+		}
+		candidates = append(candidates, *t)
+	}
+
+	claimedTasks := map[uint]bool{}
+	for _, order := range stuckOrders {
+		// 找时间最接近且未被占用的候选任务
+		var best *adminModel.Task
+		var bestDiff int64 = -1
+		for i := range candidates {
+			t := &candidates[i]
+			if claimedTasks[t.ID] || t.UserID != order.UserID {
+				continue
+			}
+			diff := t.CreatedAt.Sub(order.CreatedAt).Nanoseconds()
+			if diff < 0 {
+				diff = -diff
+			}
+			if best == nil || diff < bestDiff {
+				best = t
+				bestDiff = diff
+			}
+		}
+
+		if best != nil {
+			claimedTasks[best.ID] = true
+			now := time.Now()
+			completedAt := best.CompletedAt
+			if completedAt == nil {
+				completedAt = &now
+			}
+			updates := map[string]interface{}{
+				"provision_status": 2,
+				"provisioned_at":   completedAt,
+				"instance_id":      *best.InstanceID,
+			}
+			if err := global.APP_DB.Model(&productModel.ProductOrder{}).Where("id = ?", order.ID).Updates(updates).Error; err != nil {
+				global.APP_LOG.Error("对账: 更新订单失败", zap.Uint("orderID", order.ID), zap.Error(err))
+				continue
+			}
+			if order.ExpireAt != nil {
+				global.APP_DB.Model(&providerModel.Instance{}).Where("id = ?", *best.InstanceID).
+					Update("expires_at", order.ExpireAt)
+			}
+			global.APP_LOG.Info("对账: 已修复卡单(置为已开通)",
+				zap.Uint("orderID", order.ID), zap.Uintp("instanceID", best.InstanceID))
+			continue
+		}
+
+		// 无已完成任务匹配：尝试匹配失败/超时任务，标记开通失败
+		lower := order.CreatedAt.Add(-30 * time.Minute)
+		upper := order.CreatedAt.Add(120 * time.Minute)
+		var failTask adminModel.Task
+		failErr := global.APP_DB.
+			Where("user_id = ? AND task_type = ? AND status IN (?) AND created_at BETWEEN ? AND ?",
+				order.UserID, "create", []string{"failed", "timeout", "cancelled", "error"}, lower, upper).
+			Order("created_at desc").
+			First(&failTask).Error
+		if failErr == nil {
+			if err := global.APP_DB.Model(&productModel.ProductOrder{}).Where("id = ?", order.ID).
+				Update("provision_status", 3).Error; err != nil {
+				global.APP_LOG.Error("对账: 标记失败订单出错", zap.Uint("orderID", order.ID), zap.Error(err))
+				continue
+			}
+			global.APP_LOG.Info("对账: 标记卡单为开通失败",
+				zap.Uint("orderID", order.ID), zap.String("taskStatus", failTask.Status))
+		}
+	}
 }
 
 // selectProvider 从产品配置的节点中选择一个可用节点
