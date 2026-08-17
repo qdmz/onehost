@@ -63,3 +63,30 @@ web/dist.upload.*.tar.gz
 # 本地运维/测试记录（可能含凭据，禁止提交）
 线上全面测试报告.md
 线上复查记录-*.md
+# 本次排障运维脚本（硬编码生产 root/DB 密码、IP、GitHub PAT，禁止提交）
+deploy/run_remote_sh.py
+deploy/capture_screen.py
+deploy/fix_alpine18.py
+deploy/ws_e2e_verify.py
+deploy/run_e2e_with_captcha_toggle.py
+deploy/ws_repro.py
+deploy/e2e_*.py
+deploy/test_ssh_*.py
+deploy/*.sh
+deploy/*.json
+deploy/.order1
+deploy/.order2
+deploy/.test_user_token
+deploy/screen119.bmp
+deploy/screen119.png
+deploy/E2E_TEST_REPORT.md
+deploy/bmp2png.py
+deploy/diag.py
+deploy/diag18.sh
+deploy/order_vm.py
+deploy/wait_provision.py
+deploy/find_broken_disk.sh
+deploy/delete_broken_disk.sh
+deploy/check_freedisk.sh
+deploy/du_top.sh
+deploy/du_var.sh
