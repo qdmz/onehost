@@ -94,37 +94,97 @@ func (s *Service) GetProductImages(productID uint) ([]systemModel.SystemImage, e
 		return nil, err
 	}
 
-	db := global.APP_DB.Model(&systemModel.SystemImage{}).Where("status = ?", "active")
+	// 产品配置的关联镜像白名单（为空表示不限制）
+	allowedImageIDs := parseUintList(product.ImageIDs)
 
-	// 如果产品配置了关联镜像，则只返回关联镜像
-	if product.ImageIDs != "" {
-		imageIDList := strings.Split(product.ImageIDs, ",")
-		var ids []uint
-		for _, idStr := range imageIDList {
-			idStr = strings.TrimSpace(idStr)
-			if idStr == "" {
-				continue
-			}
-			if id, err := strconv.ParseUint(idStr, 10, 32); err == nil {
-				ids = append(ids, uint(id))
+	// 产品 type 语义在历史数据里混用：多为实例类型(container/lxc/vm)，
+	// 也可能写成虚拟化类型(incus/qemu/...)。仅当能映射到实例类型时才按 instance_type 过滤。
+	instanceType := productInstanceType(product.Type)
+
+	queryImages := func(withAllowList bool) ([]systemModel.SystemImage, error) {
+		db := global.APP_DB.Model(&systemModel.SystemImage{}).Where("status = ?", "active")
+		if withAllowList && len(allowedImageIDs) > 0 {
+			db = db.Where("id IN ?", allowedImageIDs)
+		}
+		if instanceType != "" {
+			db = db.Where("instance_type = ?", instanceType)
+		}
+		var list []systemModel.SystemImage
+		if err := db.Order("id asc").Find(&list).Error; err != nil {
+			return nil, common.NewError(common.CodeDatabaseError, err.Error())
+		}
+		return list, nil
+	}
+
+	// 产品候选节点类型：用于剔除与节点不兼容的镜像（如 proxmox 节点不能用 qemu 镜像），
+	// 与下单校验 resolveOrderImage / 开通校验 validateProviderImageCompatibility 语义一致。
+	providerTypes, err := s.productCandidateProviderTypes(product)
+	if err != nil {
+		return nil, err
+	}
+
+	filterCompatible := func(list []systemModel.SystemImage) []systemModel.SystemImage {
+		out := make([]systemModel.SystemImage, 0, len(list))
+		for _, img := range list {
+			if imageCompatibleWithAnyProviderType(img.ProviderType, providerTypes) {
+				out = append(out, img)
 			}
 		}
-		if len(ids) > 0 {
-			db = db.Where("id IN ?", ids)
+		return out
+	}
+
+	images, err := queryImages(true)
+	if err != nil {
+		return nil, err
+	}
+	compatible := filterCompatible(images)
+
+	// 管理员把产品锁定到了与节点不兼容的镜像时，忽略白名单回退为「全部兼容镜像」，
+	// 避免商城页无可选镜像（否则用户无法下单，或被迫选到必失败的镜像）。
+	if len(compatible) == 0 && len(allowedImageIDs) > 0 {
+		global.APP_LOG.Warn("产品关联镜像与节点类型均不兼容，已回退为全部兼容镜像",
+			zap.Uint("productID", product.ID),
+			zap.String("productType", product.Type),
+			zap.String("imageIDs", product.ImageIDs))
+		fallback, ferr := queryImages(false)
+		if ferr != nil {
+			return nil, ferr
+		}
+		compatible = filterCompatible(fallback)
+	}
+
+	return compatible, nil
+}
+
+// productInstanceType 将产品 type 映射为镜像 instance_type（container/vm）。
+// 返回空字符串表示无法映射（此时不按实例类型过滤）。
+func productInstanceType(productType string) string {
+	switch utils.NormalizeInstanceType(productType) {
+	case "container", "lxc", "ct":
+		return "container"
+	case "vm", "kvm":
+		return "vm"
+	default:
+		return ""
+	}
+}
+
+// parseUintList 解析逗号分隔的 ID 列表
+func parseUintList(raw string) []uint {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var ids []uint
+	for _, idStr := range strings.Split(raw, ",") {
+		idStr = strings.TrimSpace(idStr)
+		if idStr == "" {
+			continue
+		}
+		if id, err := strconv.ParseUint(idStr, 10, 32); err == nil && id > 0 {
+			ids = append(ids, uint(id))
 		}
 	}
-
-	// 根据产品类型过滤镜像
-	if product.Type != "" {
-		db = db.Where("provider_type = ?", product.Type)
-	}
-
-	var images []systemModel.SystemImage
-	if err := db.Find(&images).Error; err != nil {
-		return nil, common.NewError(common.CodeDatabaseError, err.Error())
-	}
-
-	return images, nil
+	return ids
 }
 
 // ========== 订单相关方法 ==========
@@ -267,17 +327,7 @@ func (s *Service) productCandidateProviderTypes(product *productModel.Product) (
 	if product.DefaultProviderID > 0 {
 		ids = append(ids, product.DefaultProviderID)
 	}
-	if product.ProviderIDs != "" {
-		for _, idStr := range strings.Split(product.ProviderIDs, ",") {
-			idStr = strings.TrimSpace(idStr)
-			if idStr == "" {
-				continue
-			}
-			if pid, err := strconv.ParseUint(idStr, 10, 32); err == nil {
-				ids = append(ids, uint(pid))
-			}
-		}
-	}
+	ids = append(ids, parseUintList(product.ProviderIDs)...)
 
 	var providers []providerModel.Provider
 	if len(ids) > 0 {

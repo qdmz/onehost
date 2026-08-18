@@ -195,7 +195,7 @@ import {
   ArrowLeft, Cpu, Memo, Coin, TopRight, DataLine,
   OfficeBuilding, Monitor, Box, Grid
 } from '@element-plus/icons-vue'
-import { getProductDetail } from '@/api/product'
+import { getProductDetail, getProductImages } from '@/api/product'
 import { createOrder, payWithBalance, createYiPayOrder, getUserBalance } from '@/api/product'
 import { getSystemImages } from '@/api/user'
 import { formatMemorySize, formatDiskSize, formatBandwidthSpeed } from '@/utils/unit-formatter'
@@ -248,7 +248,8 @@ const canSubmit = computed(() => {
 const imageGroups = computed(() => {
   const groups = {}
   imageList.value.forEach(img => {
-    const category = img.category || t('user.store.other')
+    // 系统镜像本身没有 category 字段，按操作系统类型分组（否则全部落到「其他」）
+    const category = img.category || img.osType || t('user.store.other')
     if (!groups[category]) {
       groups[category] = []
     }
@@ -294,15 +295,48 @@ const loadProduct = async () => {
   }
 }
 
-// 加载系统镜像
+// 加载可选镜像
+// 优先使用「按产品过滤」的接口：后端会按产品关联镜像 + 实例类型 + 节点类型兼容性过滤，
+// 避免用户选到与产品节点不兼容的镜像（例如给 proxmox 产品选 qemu 镜像）导致开通必失败。
+// 仅在该接口异常/返回空时才回退到全量镜像，保证页面不至于无镜像可选。
 const loadImages = async () => {
+  const id = route.params.id
+  try {
+    if (id) {
+      const res = await getProductImages(id)
+      if (res.code === 200 && Array.isArray(res.data) && res.data.length > 0) {
+        imageList.value = res.data
+        applyDefaultImage()
+        return
+      }
+    }
+  } catch (error) {
+    console.error('加载产品可选镜像失败，回退为全量镜像:', error)
+  }
+
   try {
     const res = await getSystemImages()
     if (res.code === 200) {
       imageList.value = res.data || []
+      applyDefaultImage()
     }
   } catch (error) {
     console.error('加载系统镜像失败:', error)
+  }
+}
+
+// 默认选中产品配置的默认镜像（不存在时选第一个），减少用户误选
+const applyDefaultImage = () => {
+  const list = imageList.value || []
+  if (!list.length) return
+  const defaultId = product.value?.defaultImageId
+  const matched = defaultId && list.find(img => img.id === defaultId)
+  if (matched) {
+    selectedImage.value = matched.id
+    return
+  }
+  if (!list.find(img => img.id === selectedImage.value)) {
+    selectedImage.value = list[0].id
   }
 }
 
@@ -399,8 +433,9 @@ const goBack = () => {
   router.back()
 }
 
-onMounted(() => {
-  loadProduct()
+onMounted(async () => {
+  // 先加载产品（镜像过滤与默认镜像选中依赖产品信息），再加载镜像
+  await loadProduct()
   loadImages()
   loadBalance()
 })
