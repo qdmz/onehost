@@ -36,6 +36,17 @@ type Manager struct {
 	tableName string // nft table 名称，如 "qemu" "kubevirt" "docker"
 	subnet    string // 内网网段，如 "192.168.122.0/24"
 	detected  bool
+	// hostPublicIP 节点公网 IPv4。当 WebSSH/VNC 后端与实例同宿主、
+	// 后端拨号「公网IP:hostPort」时，连接走 OUTPUT 链而非 PREROUTING，
+	// 必须在 nat 表 OUTPUT 链也建立 DNAT 才能命中转发。为空则不做 OUTPUT DNAT
+	// （向后兼容，不影响老行为）。
+	hostPublicIP string
+}
+
+// SetHostPublicIP 设置节点公网 IPv4，用于补充 OUTPUT 链 DNAT。
+// 详见 Manager.hostPublicIP 字段注释。
+func (m *Manager) SetHostPublicIP(ip string) {
+	m.hostPublicIP = strings.TrimSpace(ip)
 }
 
 // NewManager 创建防火墙管理器
@@ -300,6 +311,8 @@ func (m *Manager) AddSingleDNAT(instanceIP string, hostPort, guestPort int, prot
 				global.APP_LOG.Warn("iptables MASQUERADE failed", zap.Error(err))
 			}
 		}
+		// 补充 OUTPUT 链 DNAT：本机/网关拨号公网IP时也能命中转发（WebSSH/VNC 同宿主场景）
+		m.addOutputDNAT(instanceIP, hostPort, guestPort, proto)
 	}
 	return nil
 }
@@ -334,8 +347,76 @@ func (m *Manager) RemoveSingleDNAT(instanceIP string, hostPort, guestPort int, p
 				m.sshClient.Execute(cmd)
 			}
 		}
+		// 清理 OUTPUT 链 DNAT（本机拨号所需），防止规则残留
+		m.RemoveOutputDNATForPort(instanceIP, hostPort, proto)
 	}
 	return nil
+}
+
+// addOutputDNAT 在 nat 表 OUTPUT 链为「本机/网关拨号 公网IP:hostPort」建立 DNAT，
+// 使 WebSSH/VNC 后端（与实例同宿主）拨号公网 IP 时也能命中转发。
+// 目标同时覆盖节点公网 IP 与 127.0.0.1（兼容回环拨号）。
+// 幂等：采用「先删后加」确保不堆叠（SSH 走 PTY，远程退出码不可靠，不能依赖 -C 判断）。
+// 仅用 iptables（与 nft 后端共存，已在生产验证）。
+func (m *Manager) addOutputDNAT(instanceIP string, hostPort, guestPort int, proto string) {
+	if m.hostPublicIP == "" {
+		return
+	}
+	targets := []string{m.hostPublicIP, "127.0.0.1"}
+	for _, t := range targets {
+		del := fmt.Sprintf("iptables -t nat -D OUTPUT -d %s/32 -p %s --dport %d -j DNAT --to-destination %s:%d 2>/dev/null || true",
+			t, proto, hostPort, instanceIP, guestPort)
+		m.sshClient.Execute(del)
+		add := fmt.Sprintf("iptables -t nat -A OUTPUT -d %s/32 -p %s --dport %d -j DNAT --to-destination %s:%d",
+			t, proto, hostPort, instanceIP, guestPort)
+		if _, err := m.sshClient.Execute(add); err != nil {
+			global.APP_LOG.Warn("iptables OUTPUT DNAT 添加失败", zap.String("target", t), zap.Int("hostPort", hostPort), zap.Error(err))
+		}
+	}
+}
+
+// RemoveOutputDNATForPort 删除 OUTPUT 链中「目标实例IP + 指定宿主机端口」的所有 DNAT 规则。
+// 同时覆盖 hostPublicIP 与 127.0.0.1 两个目标（无需 guestPort）。
+// 用于实例端口映射移除时清理本机拨号所需的 OUTPUT DNAT。
+func (m *Manager) RemoveOutputDNATForPort(instanceIP string, hostPort int, protocol string) {
+	protocols := expandProtocol(protocol)
+	for _, proto := range protocols {
+		search := fmt.Sprintf("iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- \"-p %s .* --dport %d .* DNAT .* --to-destination %s:\"",
+			proto, hostPort, instanceIP)
+		out, _ := m.sshClient.Execute(search)
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || !strings.Contains(line, "DNAT") {
+				continue
+			}
+			ruleBody := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "-A"), "-I"))
+			if ruleBody == "" {
+				continue
+			}
+			m.sshClient.Execute(fmt.Sprintf("iptables -t nat -D %s 2>/dev/null || true", ruleBody))
+		}
+	}
+}
+
+// RemoveOutputDNATForIP 删除 OUTPUT 链中所有指向指定实例IP的 DNAT 规则（按 --to-destination 前缀匹配）。
+// 用于实例整体销毁/清理防火墙规则时，连本机拨号 OUTPUT 规则一并清除。
+func (m *Manager) RemoveOutputDNATForIP(ip string) {
+	if ip == "" {
+		return
+	}
+	search := fmt.Sprintf("iptables -t nat -S OUTPUT 2>/dev/null | grep -- \"--to-destination %s:\" | grep DNAT", ip)
+	out, _ := m.sshClient.Execute(search)
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		ruleBody := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "-A"), "-I"))
+		if ruleBody == "" {
+			continue
+		}
+		m.sshClient.Execute(fmt.Sprintf("iptables -t nat -D %s 2>/dev/null || true", ruleBody))
+	}
 }
 
 // DeleteRulesByComment 删除 nft 表中指定 comment 的所有规则

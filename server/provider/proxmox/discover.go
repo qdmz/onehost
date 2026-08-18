@@ -120,6 +120,7 @@ func (p *ProxmoxProvider) enrichDiscoveredInstances(ctx context.Context, instanc
 	}
 
 	fwMgr := firewall.NewManager(p.sshClient, "proxmox", "")
+	fwMgr.SetHostPublicIP(p.config.Host)
 	rulesByIP := fwMgr.DiscoverAllDNATRules()
 	for index := range instances {
 		if err := ctx.Err(); err != nil {

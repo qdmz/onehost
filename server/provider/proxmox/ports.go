@@ -159,6 +159,7 @@ func (p *ProxmoxProvider) cleanupIptablesRulesForIP(ctx context.Context, ipAddre
 	global.APP_LOG.Debug("清理IP地址的防火墙规则", zap.String("ipAddress", ipAddress))
 
 	fwMgr := firewall.NewManager(p.sshClient, "proxmox", "")
+	fwMgr.SetHostPublicIP(p.config.Host)
 	fwMgr.DetectBackend("/usr/local/bin/proxmox_fw_backend")
 	fwMgr.DeleteRulesByIP(ipAddress)
 	fwMgr.SaveRules()
@@ -309,6 +310,7 @@ func (p *ProxmoxProvider) setupIptablesMappingWithIP(ctx context.Context, instan
 	}
 
 	fwMgr := firewall.NewManager(p.sshClient, "proxmox", "")
+	fwMgr.SetHostPublicIP(p.config.Host)
 	if _, err := fwMgr.DetectBackend("/usr/local/bin/proxmox_fw_backend"); err != nil {
 		return fmt.Errorf("防火墙后端检测失败: %w", err)
 	}
@@ -353,6 +355,7 @@ func (p *ProxmoxProvider) removeIptablesMapping(ctx context.Context, instanceNam
 	}
 
 	fwMgr := firewall.NewManager(p.sshClient, "proxmox", "")
+	fwMgr.SetHostPublicIP(p.config.Host)
 	fwMgr.DetectBackend("/usr/local/bin/proxmox_fw_backend")
 
 	// 尝试先按注释删除（新规则），再按IP+端口删除（旧规则）
@@ -374,6 +377,7 @@ func (p *ProxmoxProvider) removeIptablesMapping(ctx context.Context, instanceNam
 // saveIptablesRules 保存防火墙规则
 func (p *ProxmoxProvider) saveIptablesRules() error {
 	fwMgr := firewall.NewManager(p.sshClient, "proxmox", "")
+	fwMgr.SetHostPublicIP(p.config.Host)
 	fwMgr.DetectBackend("/usr/local/bin/proxmox_fw_backend")
 	fwMgr.SaveRules()
 	global.APP_LOG.Debug("防火墙规则保存成功")

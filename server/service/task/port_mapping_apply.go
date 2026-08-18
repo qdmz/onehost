@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -258,6 +259,15 @@ func (a *portMappingApplier) getFirewallManager() (*firewall.Manager, error) {
 	tableName, markerFile, subnet := firewallConfigForProvider(a.providerInfo.Type)
 	executor := &providerCommandExecutor{ctx: a.ctx, provider: a.providerInstance}
 	manager := firewall.NewManager(executor, tableName, subnet)
+	// 补充 OUTPUT 链 DNAT：WebSSH/VNC 与实例同宿主时需本机拨号公网IP也能命中转发
+	if a.providerInfo.PortIP != "" {
+		manager.SetHostPublicIP(a.providerInfo.PortIP)
+	} else if a.providerInfo.Endpoint != "" {
+		// Endpoint 可能是域名，先尝试提取 IP；若为 IP 直接用
+		if ip := net.ParseIP(a.providerInfo.Endpoint); ip != nil {
+			manager.SetHostPublicIP(ip.String())
+		}
+	}
 	if _, err := manager.DetectBackend(markerFile); err != nil {
 		return nil, err
 	}
