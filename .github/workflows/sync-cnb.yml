@@ -30,20 +30,20 @@ jobs:
           persist-credentials: false
 
       - name: Validate CNB credentials
+        id: validate
         env:
           CNB_PUSH_USERNAME: ${{ secrets.CNB_PUSH_USERNAME }}
           CNB_PUSH_TOKEN: ${{ secrets.CNB_PUSH_TOKEN }}
         run: |
-          if [ -z "${CNB_PUSH_USERNAME}" ]; then
-            echo "::error::Repository secret CNB_PUSH_USERNAME is not configured."
-            exit 1
-          fi
-          if [ -z "${CNB_PUSH_TOKEN}" ]; then
-            echo "::error::Repository secret CNB_PUSH_TOKEN is not configured."
-            exit 1
+          if [ -z "${CNB_PUSH_USERNAME}" ] || [ -z "${CNB_PUSH_TOKEN}" ]; then
+            echo "::warning::CNB 凭据未配置（仓库 Secrets 缺少 CNB_PUSH_USERNAME / CNB_PUSH_TOKEN），跳过同步到 cnb.cool。"
+            echo "cnb_enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "cnb_enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Push source only to CNB master
+        if: steps.validate.outputs.cnb_enabled == 'true'
         env:
           CNB_PUSH_USERNAME: ${{ secrets.CNB_PUSH_USERNAME }}
           CNB_PUSH_TOKEN: ${{ secrets.CNB_PUSH_TOKEN }}
