@@ -16,6 +16,7 @@ import (
 	systemModel "oneclickvirt/model/system"
 	userModel "oneclickvirt/model/user"
 	userService "oneclickvirt/service/user"
+	"oneclickvirt/utils"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -162,13 +163,10 @@ func (s *Service) CreateOrder(userID uint, req productModel.CreateOrderRequest) 
 		}
 	}
 
-	// 获取镜像信息
-	var image systemModel.SystemImage
-	if err := global.APP_DB.First(&image, req.ImageID).Error; err != nil {
-		return nil, common.NewError(common.CodeNotFound, "镜像不存在")
-	}
-	if image.Status != "active" {
-		return nil, common.NewError(common.CodeBadRequest, "所选镜像不可用")
+	// 获取并校验镜像：所选镜像必须与产品节点类型兼容，否则自动纠正为产品默认镜像
+	image, err := s.resolveOrderImage(&product, req.ImageID)
+	if err != nil {
+		return nil, err
 	}
 
 	// 计算总金额
@@ -198,7 +196,7 @@ func (s *Service) CreateOrder(userID uint, req productModel.CreateOrderRequest) 
 		TotalAmount:   totalAmount,
 		PaymentStatus: 0, // 未支付
 		ProvisionStatus: 0, // 待开通
-		ImageID:       req.ImageID,
+		ImageID:       image.ID,
 		ImageName:     image.Name,
 		ExpireAt:      &expireAt,
 	}
@@ -213,6 +211,108 @@ func (s *Service) CreateOrder(userID uint, req productModel.CreateOrderRequest) 
 		zap.Float64("totalAmount", totalAmount))
 
 	return &order, nil
+}
+
+// resolveOrderImage 校验下单镜像与产品节点类型的兼容性。
+// 若用户所选镜像与产品任一候选节点类型不兼容，则自动纠正为产品默认镜像（DefaultImageID），
+// 避免开通阶段因镜像/节点类型不匹配而必失败。
+func (s *Service) resolveOrderImage(product *productModel.Product, imageID uint) (*systemModel.SystemImage, error) {
+	var image systemModel.SystemImage
+	if err := global.APP_DB.First(&image, imageID).Error; err != nil {
+		return nil, common.NewError(common.CodeNotFound, "镜像不存在")
+	}
+	if image.Status != "active" {
+		return nil, common.NewError(common.CodeBadRequest, "所选镜像不可用")
+	}
+
+	providerTypes, err := s.productCandidateProviderTypes(product)
+	if err != nil {
+		return nil, err
+	}
+
+	// 所选镜像与任一候选节点类型兼容即可直接使用
+	if imageCompatibleWithAnyProviderType(image.ProviderType, providerTypes) {
+		return &image, nil
+	}
+
+	// 不兼容 → 自动纠正为产品默认镜像
+	if product.DefaultImageID == 0 {
+		return nil, common.NewError(common.CodeBadRequest,
+			fmt.Sprintf("所选镜像(%s)与产品节点类型不兼容，且产品未配置默认镜像", image.Name))
+	}
+	var defImage systemModel.SystemImage
+	if err := global.APP_DB.First(&defImage, product.DefaultImageID).Error; err != nil {
+		return nil, common.NewError(common.CodeBadRequest, "产品默认镜像不存在，请联系管理员")
+	}
+	if defImage.Status != "active" {
+		return nil, common.NewError(common.CodeBadRequest, "产品默认镜像不可用，请联系管理员")
+	}
+	if !imageCompatibleWithAnyProviderType(defImage.ProviderType, providerTypes) {
+		return nil, common.NewError(common.CodeBadRequest,
+			fmt.Sprintf("所选镜像与产品节点类型不兼容，且产品默认镜像(%s)也不兼容", defImage.Name))
+	}
+	global.APP_LOG.Warn("下单镜像与产品节点类型不兼容，已自动纠正为产品默认镜像",
+		zap.Uint("productID", product.ID),
+		zap.Uint("requestedImageID", imageID),
+		zap.Uint("resolvedImageID", defImage.ID),
+		zap.String("resolvedImageName", defImage.Name))
+	return &defImage, nil
+}
+
+// productCandidateProviderTypes 返回产品可使用的节点 provider 类型集合。
+// 与 selectProvider 逻辑保持一致：优先默认/指定节点，未配置则使用任意可用节点。
+// 返回 nil 表示无法确定（无可用节点），此时不做镜像纠正，交由开通阶段校验。
+func (s *Service) productCandidateProviderTypes(product *productModel.Product) ([]string, error) {
+	ids := []uint{}
+	if product.DefaultProviderID > 0 {
+		ids = append(ids, product.DefaultProviderID)
+	}
+	if product.ProviderIDs != "" {
+		for _, idStr := range strings.Split(product.ProviderIDs, ",") {
+			idStr = strings.TrimSpace(idStr)
+			if idStr == "" {
+				continue
+			}
+			if pid, err := strconv.ParseUint(idStr, 10, 32); err == nil {
+				ids = append(ids, uint(pid))
+			}
+		}
+	}
+
+	var providers []providerModel.Provider
+	if len(ids) > 0 {
+		if err := global.APP_DB.Where("id IN ?", ids).Find(&providers).Error; err != nil {
+			return nil, common.NewError(common.CodeDatabaseError, err.Error())
+		}
+	} else {
+		if err := global.APP_DB.Where("is_frozen = ? AND allow_claim = ?", false, true).
+			Find(&providers).Error; err != nil {
+			return nil, common.NewError(common.CodeDatabaseError, err.Error())
+		}
+	}
+
+	if len(providers) == 0 {
+		return nil, nil
+	}
+	types := make([]string, 0, len(providers))
+	for _, p := range providers {
+		types = append(types, p.Type)
+	}
+	return types, nil
+}
+
+// imageCompatibleWithAnyProviderType 判断镜像是否与任一给定 provider 类型兼容。
+// providerTypes 为 nil 表示无法确定（不限制），直接视为兼容。
+func imageCompatibleWithAnyProviderType(imageProviderType string, providerTypes []string) bool {
+	if providerTypes == nil {
+		return true
+	}
+	for _, pt := range providerTypes {
+		if utils.SystemImageProviderTypeMatches(pt, imageProviderType) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetOrderList 获取用户订单列表
