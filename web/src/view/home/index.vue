@@ -295,7 +295,7 @@
             :key="p.id"
             shadow="hover"
             class="recommended-card"
-            @click="goToStore"
+            @click="goToProduct(p.id)"
           >
             <div class="rec-card-head">
               <div class="rec-card-icon">
@@ -675,6 +675,10 @@ const fetchRecommendedProducts = async () => {
   } catch (error) {
     console.error('获取推荐产品失败', error)
   }
+}
+
+const goToProduct = (id) => {
+  router.push(`/user/store/${id}`)
 }
 
 const goToStore = () => {
