@@ -186,6 +186,7 @@ type UserInstanceDetailResponse struct {
 	ProviderName    string     `json:"providerName"`
 	ProviderType    string     `json:"providerType"`    // Provider虚拟化类型：docker, lxd, incus, proxmox
 	ProviderStatus  string     `json:"providerStatus"`  // Provider状态：active, inactive, partial
+	UpstreamType    string     `json:"upstreamType"`    // 上游对接类型（idcsmart 等）：非空表示由上游 API 管理
 	PortRangeStart  int        `json:"portRangeStart"`  // 端口范围起始
 	PortRangeEnd    int        `json:"portRangeEnd"`    // 端口范围结束
 	IPv4MappingType string     `json:"ipv4MappingType"` // IPv4映射类型：nat(NAT共享IP), dedicated(独立IPv4地址) (已弃用，保留向后兼容)

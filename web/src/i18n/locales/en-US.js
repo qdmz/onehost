@@ -67,6 +67,7 @@ import adminOrders from './en-US/admin/orders.js'
 import adminTickets from './en-US/admin/tickets.js'
 import adminSiteConfig from './en-US/admin/siteConfig.js'
 import adminYipayConfig from './en-US/admin/yipayConfig.js'
+import adminUpstream from './en-US/admin/upstream.js'
 
 export default {
   common,
@@ -126,7 +127,8 @@ export default {
     orders: adminOrders,
     tickets: adminTickets,
     siteConfig: adminSiteConfig,
-    yipayConfig: adminYipayConfig
+    yipayConfig: adminYipayConfig,
+    upstream: adminUpstream
   },
   validation,
   message,

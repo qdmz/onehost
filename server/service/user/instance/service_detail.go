@@ -95,6 +95,7 @@ func (s *Service) GetInstanceDetail(userID, instanceID uint) (*userModel.UserIns
 		Username:            instance.Username,
 		Password:            instance.Password,
 		ProviderName:        instance.Provider,
+		UpstreamType:        instance.UpstreamType, // 上游对接类型，供前端识别上游实例
 		HasSshMapping:       hasSshMapping,        // 是否有可用的SSH端口映射
 		NetworkType:         instance.NetworkType, // 默认使用实例的网络类型（创建时从Provider继承）
 		CreatedAt:           instance.CreatedAt,

@@ -537,6 +537,17 @@ const routes = [
           roles: ['admin', 'normal_admin'],
           icon: 'Wallet'
         }
+      },
+      {
+        path: 'upstream',
+        name: 'AdminUpstream',
+        component: () => import('@/view/admin/upstream/index.vue'),
+        meta: {
+          title: 'sidebar.upstreamManagement',
+          requiresAuth: true,
+          roles: ['admin', 'normal_admin'],
+          icon: 'Connection'
+        }
       }
     ]
   },

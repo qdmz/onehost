@@ -36,6 +36,7 @@ export default {
   apiTokenManagement: 'API Token',
   adminApiTokenManagement: 'API Tokens Management',
   yipayConfig: 'YiPay Config',
+  upstreamManagement: 'Upstream API (IDCsmart)',
   groupStore: 'Store',
   groupTickets: 'Tickets',
   store: 'Product Store',

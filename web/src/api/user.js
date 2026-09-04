@@ -253,6 +253,15 @@ export function performInstanceAction(data) {
   })
 }
 
+// 上游(智简魔方)实例操作：start/stop/reboot/reinstall/reset-password/console/delete
+export function performUpstreamInstanceAction(instanceId, data) {
+  return request({
+    url: `/v1/user/instances/${instanceId}/upstream-action`,
+    method: 'post',
+    data
+  })
+}
+
 export function performSharedInstanceAction(token, data) {
   return request({
     url: `/v1/public/instance-shares/${encodeURIComponent(token)}/action`,

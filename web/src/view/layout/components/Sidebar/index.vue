@@ -487,6 +487,14 @@ const userRoutes = computed(() => {
             }
           },
           {
+            path: '/admin/upstream',
+            name: 'AdminUpstream',
+            meta: {
+              title: 'sidebar.upstreamManagement',
+              icon: 'Connection'
+            }
+          },
+          {
             path: '/admin/block-rules',
             name: 'AdminBlockRules',
             meta: {

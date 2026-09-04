@@ -15,7 +15,8 @@ import {
   performSharedInstanceAction,
   resetSharedInstancePassword,
   getSharedInstanceNewPassword,
-  getSharedFilteredImages
+  getSharedFilteredImages,
+  performUpstreamInstanceAction
 } from '@/api/user'
 import { useSSHStore } from '@/pinia/modules/ssh'
 
@@ -27,6 +28,11 @@ export function useInstanceActions(instance, monitoring, loadInstanceDetail, sha
   const getShareToken = () => {
     if (typeof shareToken === 'string') return shareToken
     return shareToken?.value || ''
+  }
+
+  // 是否为上游(智简魔方)实例：这类实例不走本地任务执行器，直接调用上游 API
+  const isUpstreamInstance = () => {
+    return instance.value?.upstreamType === 'idcsmart'
   }
 
   const actionLoading = ref(false)
@@ -176,6 +182,27 @@ export function useInstanceActions(instance, monitoring, loadInstanceDetail, sha
             type: 'warning'
           }
         )
+        // 上游实例：直接调用上游重装（使用上游默认系统），不走本地镜像选择
+        if (isUpstreamInstance() && !getShareToken()) {
+          actionLoading.value = true
+          try {
+            const upRes = await performUpstreamInstanceAction(instance.value.id, { action: 'reinstall' })
+            if (upRes.code === 200) {
+              ElMessage.success(`${t('user.instanceDetail.actionReset')}${t('user.tasks.request')}${t('user.tasks.submitted')}${t('common.comma')}${t('user.tasks.processing')}${t('common.ellipsis')}`)
+              setTimeout(async () => {
+                await loadInstanceDetail()
+                actionLoading.value = false
+              }, 3000)
+            } else {
+              actionLoading.value = false
+            }
+          } catch (error) {
+            console.error('上游重装失败:', error)
+            ElMessage.error(getErrorMessage(error, `${t('user.instanceDetail.actionReset')}${t('user.instances.title')}${t('common.failed')}`))
+            actionLoading.value = false
+          }
+          return
+        }
         await loadResetImages()
         showResetImageDialog.value = true
       } catch (error) {
@@ -200,6 +227,25 @@ export function useInstanceActions(instance, monitoring, loadInstanceDetail, sha
       actionLoading.value = true
 
       const token = getShareToken()
+      // 上游实例：直接调用上游 API（同步返回），不走本地任务
+      if (isUpstreamInstance() && !token) {
+        const upRes = await performUpstreamInstanceAction(instance.value.id, { action })
+        if (upRes.code === 200) {
+          ElMessage.success(`${actionText}${t('user.tasks.request')}${t('user.tasks.submitted')}${t('common.comma')}${t('user.tasks.processing')}${t('common.ellipsis')}`)
+          if (action === 'delete') {
+            router.push('/user/instances')
+          } else {
+            setTimeout(async () => {
+              await loadInstanceDetail()
+              actionLoading.value = false
+            }, 3000)
+          }
+        } else {
+          actionLoading.value = false
+        }
+        return
+      }
+
       const payload = {
         instanceId: instance.value.id,
         action
@@ -350,6 +396,27 @@ export function useInstanceActions(instance, monitoring, loadInstanceDetail, sha
 
       try {
         const token = getShareToken()
+        // 上游实例：直接调用上游改密 API（同步返回新密码）
+        if (isUpstreamInstance() && !token) {
+          const upRes = await performUpstreamInstanceAction(instance.value.id, { action: 'reset-password' })
+          if (upRes.code === 200) {
+            const newPwd = upRes.data?.password || upRes.data?.newPassword
+            if (newPwd) {
+              await ElMessageBox.alert(
+                `<div style="word-break:break-all">${t('user.instanceDetail.newPassword')}: <strong style="user-select:all;font-family:monospace">${newPwd}</strong></div>`,
+                t('user.instanceDetail.resetPasswordTitle'),
+                { dangerouslyUseHTMLString: true, confirmButtonText: t('user.instanceDetail.confirm') }
+              )
+            } else {
+              ElMessage.success(t('user.instanceDetail.resetPassword') + t('common.period'))
+            }
+            await loadInstanceDetail()
+          } else {
+            ElMessage.error(upRes.message || t('user.instanceDetail.resetPasswordFailed'))
+          }
+          actionLoading.value = false
+          return
+        }
         const response = token
           ? await resetSharedInstancePassword(token)
           : await resetInstancePassword(instance.value.id)

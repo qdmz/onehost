@@ -47,5 +47,6 @@ export default {
   ticketManagement: '工单管理',
   siteConfig: '站点配置',
   siteLink: '站点链接',
-  yipayConfig: '易支付配置'
+  yipayConfig: '易支付配置',
+  upstreamManagement: '智简魔方上游对接'
 }
