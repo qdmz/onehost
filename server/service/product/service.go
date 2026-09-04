@@ -16,6 +16,7 @@ import (
 	systemModel "oneclickvirt/model/system"
 	userModel "oneclickvirt/model/user"
 	userService "oneclickvirt/service/user"
+	upstreamService "oneclickvirt/service/upstream"
 	"oneclickvirt/utils"
 
 	"go.uber.org/zap"
@@ -223,10 +224,20 @@ func (s *Service) CreateOrder(userID uint, req productModel.CreateOrderRequest) 
 		}
 	}
 
-	// 获取并校验镜像：所选镜像必须与产品节点类型兼容，否则自动纠正为产品默认镜像
-	image, err := s.resolveOrderImage(&product, req.ImageID)
-	if err != nil {
-		return nil, err
+	// 获取并校验镜像：上游（智简魔方）产品不需要本地镜像，使用上游默认 OS
+	var image *systemModel.SystemImage
+	if product.UpstreamType == constant.UpstreamTypeIDC {
+		osID := upstreamService.DefaultUpstreamOS(product.UpstreamConfig)
+		if osID == "" {
+			return nil, common.NewError(common.CodeBadRequest, "上游产品未配置操作系统，无法下单")
+		}
+		image = &systemModel.SystemImage{ID: 0, Name: osID}
+	} else {
+		img, err := s.resolveOrderImage(&product, req.ImageID)
+		if err != nil {
+			return nil, err
+		}
+		image = img
 	}
 
 	// 计算总金额
@@ -258,6 +269,8 @@ func (s *Service) CreateOrder(userID uint, req productModel.CreateOrderRequest) 
 		ProvisionStatus: 0, // 待开通
 		ImageID:       image.ID,
 		ImageName:     image.Name,
+		UpstreamType:  product.UpstreamType, // 上游代理产品标记
+		UpstreamOS:    image.Name,           // 上游操作系统标识（即 OS ID）
 		ExpireAt:      &expireAt,
 	}
 
@@ -726,6 +739,11 @@ func (s *Service) provisionInstance(order *productModel.ProductOrder) error {
 	var product productModel.Product
 	if err := global.APP_DB.First(&product, order.ProductID).Error; err != nil {
 		return fmt.Errorf("获取产品信息失败: %w", err)
+	}
+
+	// 上游代理产品（如智简魔方）：不落本地虚拟化栈，直接调用上游 API 开通
+	if product.UpstreamType == constant.UpstreamTypeIDC {
+		return upstreamService.ProvisionOrder(order)
 	}
 
 	// 选择节点（优先使用产品配置的默认节点）

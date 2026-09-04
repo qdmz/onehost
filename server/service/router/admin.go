@@ -247,6 +247,14 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		NormalAdminGroup.DELETE("/products/:id", admin.DeleteAdminProduct)
 		NormalAdminGroup.PUT("/products/:id/status", admin.UpdateProductStatus)
 
+		// 上游对接（智简魔方 API 代理销售，普通管理员可访问）
+		NormalAdminGroup.GET("/upstream/providers", admin.ListUpstreamProviders)
+		NormalAdminGroup.POST("/upstream/providers", admin.CreateUpstreamProvider)
+		NormalAdminGroup.PUT("/upstream/providers/:id", admin.UpdateUpstreamProvider)
+		NormalAdminGroup.DELETE("/upstream/providers/:id", admin.DeleteUpstreamProvider)
+		NormalAdminGroup.POST("/upstream/test", admin.TestUpstreamConnection)
+		NormalAdminGroup.POST("/upstream/sync", admin.SyncUpstreamProducts)
+
 		// 站点链接管理（虚拟化平台/赞助方）
 		NormalAdminGroup.GET("/site-links", admin.GetAdminSiteLinkList)
 		NormalAdminGroup.POST("/site-links", admin.CreateAdminSiteLink)

@@ -53,6 +53,10 @@ type Product struct {
 	// 默认节点和默认镜像(用户购买时可预选)
 	DefaultProviderID uint `json:"defaultProviderId" gorm:"default:0"` // 默认节点ID(0=不指定)
 	DefaultImageID    uint `json:"defaultImageId" gorm:"default:0"`   // 默认镜像ID(0=不指定)
+
+	// 上游对接（代理销售）相关字段：当 UpstreamType 非空时，本产品由上游 API（如智简魔方）提供
+	UpstreamType   string `json:"upstreamType" gorm:"size:32;default:'';index"` // 上游类型：idcsmart 等，空表示本地虚拟化产品
+	UpstreamConfig string `json:"upstreamConfig" gorm:"type:text"`             // 上游产品配置(JSON)：上游产品ID、默认OS、OS列表、套餐参数等
 }
 
 // ProductOrder 产品订单表
@@ -99,6 +103,10 @@ type ProductOrder struct {
 	// 镜像选择
 	ImageID   uint   `json:"imageId"`   // 选择的镜像ID
 	ImageName string `json:"imageName" gorm:"size:128"` // 镜像名称快照
+
+	// 上游对接（代理销售）订单扩展字段
+	UpstreamType string `json:"upstreamType" gorm:"size:32;default:''"` // 上游类型：idcsmart 等
+	UpstreamOS   string `json:"upstreamOs" gorm:"size:128;default:''"`   // 上游操作系统标识（智简魔方 OS id，如 centos7.6_cloud:1）
 
 	// 备注
 	Remark string `json:"remark" gorm:"type:text"`

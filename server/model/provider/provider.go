@@ -474,6 +474,7 @@ type Instance struct {
 	PmacctInterfaceV4  string     `json:"pmacctInterfaceV4" gorm:"size:32"`                   // pmacct 监控的IPv4网络接口名称
 	PmacctInterfaceV6  string     `json:"pmacctInterfaceV6" gorm:"size:32"`                   // pmacct 监控的IPv6网络接口名称
 	ProviderVMID       string     `json:"providerVmId" gorm:"column:provider_vm_id;size:512"` // 虚拟化平台的可操作实例ID（VMID、容器ID、VMX路径或远端实例名）
+	UpstreamType       string     `json:"upstreamType" gorm:"column:upstream_type;size:32;default:''"` // 上游对接类型（idcsmart 等）：非空表示本实例由上游 API 管理，ProviderVMID 存上游实例ID
 
 	// 生命周期和冻结管理
 	ExpiresAt       *time.Time `json:"expiresAt" gorm:"index:idx_expires_at;column:expires_at"` // 实例到期时间（默认与节点同步，手动设置优先级更高）

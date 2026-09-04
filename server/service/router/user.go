@@ -58,6 +58,9 @@ func InitUserRouter(Router *gin.RouterGroup) {
 		UserGroup.POST("/user/instances/action", user.InstanceAction)
 		UserGroup.POST("/user/instances/batch-action", user.BatchInstanceAction)
 
+		// 上游(智简魔方)实例管理：开机/关机/重启/重装/改密/控制台/销毁
+		UserGroup.POST("/user/instances/:id/upstream-action", user.UpstreamInstanceAction)
+
 		// 端口映射
 		UserGroup.GET("/user/port-mappings", user.GetUserPortMappings)
 

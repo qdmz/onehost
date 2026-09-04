@@ -34,6 +34,15 @@ const (
 	ProviderTypeVirtualBox ProviderType = "virtualbox"
 	ProviderTypeMultipass  ProviderType = "multipass"
 	ProviderTypeVagrant    ProviderType = "vagrant"
+	// ProviderTypeIdcsmart 智简魔方上游 API 代理类型：本系统作为代理商，调用智简魔方开放 API
+	// 读取上游产品/价格、支付后自动开通、并代理管理上游虚拟机。不开通本地虚拟化，不依赖 agent。
+	ProviderTypeIdcsmart ProviderType = "idcsmart"
+)
+
+// UpstreamType 上游对接类型（与 Provider 的 Type 对应，用于标记实例/订单由上游 API 管理）
+const (
+	UpstreamTypeIDC           string = "idcsmart"
+	UpstreamConnectionType    string = "upstream" // Provider.ConnectionType 取值，区别于 agent/ssh/local
 )
 
 // Architecture 架构类型
