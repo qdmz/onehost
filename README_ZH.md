@@ -1,20 +1,196 @@
-# OneClickVirt 虚拟化管理平台
+# OneHost 云计算平台
 
-[![Build and Release oneclickvirt](https://github.com/oneclickvirt/oneclickvirt/actions/workflows/build.yml/badge.svg)](https://github.com/oneclickvirt/oneclickvirt/actions/workflows/build.yml) 
+> 基于 [OneClickVirt](https://github.com/oneclickvirt/oneclickvirt) 的定制发行版，面向 **IDC / 云主机售卖** 场景。
+> 在原有统一虚拟化管理能力之上，新增 **易支付、代金券、余额钱包、商城售卖** 等商业化闭环能力，
+> 并针对低配 VPS（1 核 1G 级别）做了完整的部署优化。
 
-[![Build and Push Docker Images](https://github.com/oneclickvirt/oneclickvirt/actions/workflows/build_docker.yml/badge.svg)](https://github.com/oneclickvirt/oneclickvirt/actions/workflows/build_docker.yml)
+[![Build and Release](https://github.com/qdmz/onehost/actions/workflows/build.yml/badge.svg)](https://github.com/qdmz/onehost/actions/workflows/build.yml)
 
-[![Integration Tests](https://github.com/oneclickvirt/oneclickvirt/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/oneclickvirt/oneclickvirt/actions/workflows/integration-tests.yml)
+[![Build and Push Docker Images](https://github.com/qdmz/onehost/actions/workflows/build_docker.yml/badge.svg)](https://github.com/qdmz/onehost/actions/workflows/build_docker.yml)
 
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Foneclickvirt%2Foneclickvirt.svg?type=shield&issueType=license)](https://app.fossa.com/projects/git%2Bgithub.com%2Foneclickvirt%2Foneclickvirt?ref=badge_shield&issueType=license) [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Foneclickvirt%2Foneclickvirt.svg?type=shield&issueType=security)](https://app.fossa.com/projects/git%2Bgithub.com%2Foneclickvirt%2Foneclickvirt?ref=badge_shield&issueType=security)
+[![Integration Tests](https://github.com/qdmz/onehost/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/qdmz/onehost/actions/workflows/integration-tests.yml)
 
-一个可扩展的通用虚拟化管理平台，支持 LXD、Incus、Docker、Podman、Containerd、Proxmox VE、QEMU/KVM 和 KubeVirt。
+## 项目简介
 
-前端控制台基于 Vue 3、Vite 和 Element Plus 构建，已针对桌面、平板、安卓尺寸和 iOS 尺寸视口进行响应式布局检查。
+OneHost 是一套开箱即用的云计算售卖与管理平台。后端统一调度 LXD、Incus、Docker、Podman、Containerd、
+Proxmox VE、QEMU/KVM、KubeVirt 等虚拟化后端；前端同时提供**用户自助控制台**与**功能完整的管理后台**。
 
-## **语言**
+它解决的是「把虚拟化资源当成商品卖出去」的完整链路：
 
-[English Docs](README.md) | [中文文档](README_ZH.md)
+```
+产品定价 → 用户下单 → 在线支付 → 自动开通 → 自助运维 → 到期续费 → 流量/快照/重装 → 工单支持
+```
+
+**与上游 OneClickVirt 的主要差异**：上游是通用的虚拟化资源管理平台，本 fork 补齐了商业化售卖闭环
+（产品、库存、限购、订单、支付、代金券、余额、续费），并针对国内低配服务器与国内支付网关做了适配。
+详见 [本 fork 定制功能](#本-fork-定制功能)。
+
+前端控制台基于 Vue 3、Vite 和 Element Plus 构建，已针对桌面、平板、安卓尺寸和 iOS 尺寸视口进行响应式布局检查，
+界面支持中英文双语切换。
+
+## 语言
+
+- **简体中文**：当前文档（`README.md` 与 `README_ZH.md` 内容一致）
+- **English**：暂未同步，可参考[上游 OneClickVirt 英文文档](https://github.com/oneclickvirt/oneclickvirt#readme)
+
+平台界面本身支持中英文双语切换（基于 vue-i18n），可在后台「系统配置」中调整默认语言。
+
+## 功能总览
+
+平台分为**用户端**与**管理后台**两套界面，共 40+ 功能模块、1700+ 个 API 接口、62 张业务数据表。
+
+| 能力域 | 用户端 | 管理后台 |
+|--------|--------|----------|
+| 实例（云主机/容器） | 创建、开关机、重装、VNC、续费、快照、端口映射 | 全局实例管理、批量操作、机型权限、配额 |
+| 资源节点 | 查看可用节点与规格 | 接入/配置多虚拟化节点、IPv4 池、系统镜像 |
+| 交易 | 商城选购、下单、支付、续费 | 产品定价、库存、订单管理、代金券、兑换码 |
+| 资金 | 余额、充值、代金券兑换、流水 | 易支付配置、余额调整、充值订单 |
+| 用户 | 注册登录、实名认证、邀请码 | 用户管理、用户组、KYC 审核、权限 |
+| 网络 | 端口映射、域名解析 | 端口池、防火墙规则、域名配置 |
+| 运维 | 任务中心、流量查看 | 流量监控、性能监控、日志审计、快照计划 |
+| 运营 | 签到、工单、公告浏览 | 公告发布、工单处理、邀新、站点配置 |
+
+## 用户端功能
+
+### 实例管理
+- **开通实例**：选择节点、系统镜像、机型规格后一键开通，任务进度实时可查
+- **生命周期操作**：开机、关机、重启、强制停止、重装系统、重置密码
+- **远程接入**：Web VNC 控制台（noVNC）、WebSSH 终端（xterm.js）
+- **快照**：创建/恢复/删除快照，界面显示允许数量配额，超限自动禁用新建
+- **续费**：实例到期前自助续费（本 fork 新增入口）
+- **端口映射**：自助添加/删除端口映射规则
+- **共享链接**：生成临时分享链接，便于协作或技术支持
+- **流量与监控**：实时流量曲线、历史流量、资源占用（CPU/内存/磁盘）
+
+### 商城与订单
+- 按机型、节点、价格浏览在售产品，列表直接显示**库存余量**
+- 下单购买，受后台设置的**每人限购数量**约束
+- 订单详情完整展示规格、周期、金额、支付状态与开通结果
+- 支持 0 元免费产品（后台可配置）
+
+### 钱包与支付（本 fork 新增）
+- 账户余额查看与充值，对接易支付网关（支付宝/微信）
+- **代金券兑换**：输入券码充值到余额
+- 余额流水明细，每笔变动可追溯
+- 充值订单记录与状态查询
+
+### 账号与运营
+- 注册/登录（支持邮箱验证码、OAuth2 第三方登录）
+- **实名认证**（KYC）：提交证件资料，等待后台审核
+- **每日签到**：领取签到奖励
+- **工单系统**：提交问题、上传截图、跟踪处理进度
+- **邀请码**：使用邀请码注册，查看邀请记录
+- **API 令牌**：生成令牌供程序化调用开放接口
+- **个人中心**：修改资料、修改密码、绑定邮箱
+
+## 管理后台功能
+
+| 模块 | 说明 |
+|------|------|
+| 仪表盘 | 平台总览：实例数、用户数、收入、节点健康度 |
+| 用户管理 | 用户列表、启停、余额调整、用户组、权限分配 |
+| 用户组 | 分组管理与差异化配额、机型权限 |
+| 实例管理 | 全局实例查看与管控、批量操作、强制删除 |
+| 节点管理 | 接入 LXD/Incus/Docker/PVE/QEMU 等节点，配置 IPv4 池 |
+| 系统镜像 | 镜像的拉取、同步、删除与可见性控制 |
+| 产品管理 | 产品定价、库存、限购、机型绑定、上下架 |
+| 订单管理 | 产品订单与充值订单查询、状态处理 |
+| 代金券 | 批量生成、作废、删除、统计（本 fork 新增） |
+| 兑换码 | 兑换码生成与核销记录 |
+| 邀请码 | 邀请码管理与邀请关系追踪 |
+| 易支付配置 | 商户号、密钥、网关地址配置（本 fork 新增） |
+| 站点配置 | 站名、Logo、Favicon、首页栏目开关、自定义页头页脚 |
+| 站点链接 | 导航链接、友情链接管理 |
+| 公告管理 | 公告发布、置顶、定时上下线 |
+| 工单管理 | 工单分派、回复、分类、关闭 |
+| 实名审核 | KYC 资料审核、通过/驳回 |
+| 快照管理 | 快照查看、批量操作、定时计划任务 |
+| 端口映射 | 端口池管理、映射规则审核 |
+| 防火墙规则 | 黑名单/白名单规则下发 |
+| 域名管理 | 域名解析配置与模板 |
+| 流量管理 | 流量统计、异常流量预警、限流策略 |
+| 性能监控 | 节点与实例性能指标采集与展示 |
+| 日志审计 | 操作日志、登录日志、安全事件 |
+| 任务中心 | 异步任务队列、失败重试、执行日志 |
+| OAuth2 | 第三方登录 provider 配置 |
+| API 令牌 | 后台令牌管理与权限范围 |
+| 系统配置 | SMTP 邮件、验证码、注册开关、语言、安全策略 |
+
+## 本 fork 定制功能
+
+以下是 OneHost 相对上游 OneClickVirt **新增或增强**的能力，也是本项目的核心价值所在。
+
+### 1. 易支付集成（新增）
+内置国内主流第四方支付网关「易支付」，打通在线充值链路。
+
+- 后台「易支付配置」页填写商户号（PID）、商户密钥、网关地址即可启用
+- 支持 MD5 签名，签名算法已针对网关特性做过适配（小写签名 + 密钥自检按钮）
+- 用户充值生成支付订单 → 跳转网关 → 异步回调 → 自动入账
+- 相关代码：`server/api/v1/admin/yipay.go`、`server/service/product/yipay.go`
+
+### 2. 代金券系统（新增）
+上游原本没有此能力，本 fork 实现了完整的代金券体系。
+
+- 后台批量生成券码（指定面额、数量、有效期），支持作废、删除、统计
+- 用户在钱包页输入券码兑换，余额实时到账
+- 兑换走数据库事务 + 行锁，杜绝并发重复兑换
+- 相关代码：`server/api/v1/admin/voucher.go`、`server/model/product/voucher.go`
+
+### 3. 余额钱包（新增）
+与代金券配套的资金账户体系。
+
+- 用户余额账户，支持充值、消费、退款
+- 每笔变动写入 `user_balance_logs` 流水，全程可追溯
+- 后台可直接调整指定用户余额（带流水记录）
+- 余额扣减走 gorm 事务 + 行锁，避免并发超扣
+
+### 4. 商城产品增强
+在原产品模块上补齐售卖所需的细节：
+
+| 增强点 | 说明 |
+|--------|------|
+| 支持 0 元定价 | 修复 Element Plus 把数字 0 当空值拦截的问题，允许免费产品 |
+| 每人限购数量 | 新增 `maxPerUser` 字段（0 = 不限），防止恶意囤货 |
+| 库存显示 | 商城列表与详情页展示实时库存 |
+| 订单详情字段补齐 | 完整展示规格、周期、金额、支付与开通状态 |
+
+### 5. 站点配置动态化
+让平台外观完全可在后台配置，无需改代码：
+
+- **站名 / Logo / Favicon 动态化**：浏览器标签页标题与图标随后台配置实时变化
+- **首页栏目开关**：平台介绍、赞助方、推荐产品等区块可独立开关
+- **自定义页头页脚**：支持注入自定义 HTML（如备案号、统计代码）
+- **站点链接管理**：导航栏与页脚链接可配置
+
+### 6. 公告系统改进
+- 公告内容区分 `content`（纯文本）与 `contentHtml`（富文本），避免前端重复包裹 `<p>` 标签
+- 支持置顶、定时上下线
+
+### 7. 快照配额管控
+- 快照页面显示"已用/允许"数量
+- 达到配额或配额为 0 时，自动禁用新建与上传按钮，避免用户无效操作
+
+### 8. 实例详情增强
+- 补齐 **VNC 连接菜单**与**续费按钮**入口
+- 节点未启用 IPv6 时，概览自动隐藏 IPv6 信息，避免误导用户
+
+### 9. 国际化修复
+- 修复工单分类、产品管理、商城页面等处未汉化或翻译丢失的问题
+- 管理后台与用户端均支持中英文切换
+
+### 10. 低配 VPS 部署优化（v0.18）
+针对 1 核 1G ~ 2 核 2G 的入门级服务器做了专项优化，详见 [低配 VPS 部署优化](#低配-vps-部署优化)。
+
+## 技术栈
+
+| 层次 | 技术 |
+|------|------|
+| 后端 | Go 1.25、Gin、GORM、JWT、Zap、WebSocket、cron |
+| 前端 | Vue 3、Vite、Element Plus、Pinia、Vue Router、vue-i18n |
+| 可视化 | ECharts（流量/性能图表）、xterm.js（WebSSH）、noVNC（VNC） |
+| 数据库 | MySQL 5.7+ / MariaDB 10.11+（可选 Redis 缓存） |
+| 网关 | Nginx（反向代理、静态资源、WebSocket 透传、限流） |
+| 部署 | Docker / Docker Compose，支持裸机与二进制部署 |
 
 ## 详细说明
 
@@ -363,6 +539,111 @@ go run main.go
 ## 配置文件
 
 主要配置文件位于 `server/config.yaml`
+
+> **注意**：该文件会被运行时写入数据库明文密码，**请勿提交到版本库**。
+> `.gitignore` 已忽略 `.env`、`*.log`、`data/`，提交前建议自检：`git diff --cached | grep -iE 'password|secret|"'`
+
+## 低配 VPS 部署优化
+
+在 **1 核 1G / 2 核 2G** 级别的入门级服务器上，默认的 MariaDB 配置会直接触发 OOM
+（进程被系统杀掉，容器退出码 `137`）。v0.18 已内置低配优化配置：
+
+| 参数 | 原默认值 | 低配优化值 | 原因 |
+|------|---------|-----------|------|
+| `innodb_buffer_pool_size` | 256M | **64M** | 1G 内存机器上 256M 缓冲池过大 |
+| `max_connections` | 500 | **80** | 每连接都有内存开销 |
+| `performance_schema` | 开启 | **关闭** | 可省约 100MB 内存 |
+| `bind-address` | 127.0.0.1 | **注释掉** | 否则 api 容器无法通过 `mysql:3306` 连接 |
+| `innodb_redo_log_capacity` | 256M | **移除** | MySQL 8.0.30+ 专有参数，MariaDB 不识别会导致启动失败 |
+
+配置文件位于 [`deploy/my.cnf`](deploy/my.cnf)。实测效果：**MariaDB 内存占用由 400MB+ 降至 12.5MB**，
+整机（2 核 960Mi）跑完 web + api + mysql 三容器后仍有 350MB 以上可用内存。
+
+其他低配部署建议：
+
+- **构建必须串行**：先 `docker compose build api`（2 核机器上约 2.5 小时），再 `docker compose build web`（约 25 分钟）。并行构建必然 OOM。
+- **提前准备 swap**：建议 2G 以上，`go build -a` 编译期会大量占用。
+- **磁盘预留 10G 以上**：构建中间层与镜像较占空间。
+
+## HTTPS 配置
+
+v0.18 起的 nginx 配置已原生支持 HTTPS：**80 端口仅保留 `/.well-known/acme-challenge/` 供证书续期，
+其余请求 301 跳转 HTTPS**；443 端口承载全部业务（API、WebSocket、静态资源、前端路由），并启用 HTTP/2 与 HSTS。
+
+配置步骤（以 Docker Compose 部署为例）：
+
+```bash
+# 1. 安装 certbot
+apt-get update && apt-get install -y certbot
+
+# 2. 申请证书（webroot 模式，无需停机）
+certbot certonly --webroot -w /opt/onehost/data/certbot-webroot -d 你的域名 \
+  --non-interactive --agree-tos -m 你的邮箱
+
+# 3. 重启 web 容器使证书生效
+cd /opt/onehost && docker compose restart web
+
+# 4. 验证续期（certbot 自带 systemd timer，到期前自动续期）
+certbot renew --dry-run
+```
+
+**关键设计**：`deploy/default.conf` 与 `/etc/letsencrypt` 都是通过 volume 挂载进容器的，
+所以修改 nginx 配置或证书续期后，**只需 `docker compose restart web`，无需重建镜像**（重建要 25 分钟）。
+
+证书续期后会自动触发 `/etc/letsencrypt/renewal-hooks/deploy/reload-web.sh` 重新加载 nginx。
+
+## 版本历史
+
+| 版本 | 主要变更 |
+|------|---------|
+| **v0.18** | 低配 VPS 部署优化（MariaDB 内存 400MB+ → 12.5MB）；HTTPS 支持（80 跳 443、ACME 续期路径）；修复 `.dockerignore` 排除整个 `deploy/` 导致前端镜像构建失败；nginx 配置改为 volume 挂载（改配置免重建）；加固 `.gitignore` 防止数据库密码误提交 |
+| v0.17 | 首页推荐产品卡片点击跳转到具体产品详情页 |
+| v0.07 | 易支付签名小写 + 密钥自检按钮；默认节点 / OS 选项恢复；`selectProvider` 默认节点优先兜底；站点链接类型映射修复 |
+| v0.06 | Owner 15 项需求收尾：续费入口、快照配额、订单详情、库存显示、站名动态化、代金券与余额体系 |
+| v0.05 | 修复首页栏目开关失效（gorm 模型列名与迁移列名不匹配，导致开关存不进去） |
+| v0.04 | 修复站点配置保存 500（JSON 键名未映射为真实数据库列名） |
+| v0.03 | 首页动态化、站点配置 `Save()` 全列覆盖修复、SMTP 配置唯一索引缺陷修复 |
+
+> v0.08 ~ v0.16 的变更详见 [提交历史](https://github.com/qdmz/onehost/commits/main)。
+
+## 常见问题
+
+### 初始化页「测试数据库连接」提示"系统内部错误"
+
+数据库主机必须填**容器名 `mysql`**，不能填 `127.0.0.1` 或 `localhost`。
+数据库运行在独立的 mysql 容器中，api 容器内的 `127.0.0.1` 并没有数据库服务，两者靠 compose 内部网络通信。
+
+### 初始化完成后状态一直是 `starting`
+
+正常现象。初始化后配置管理器需要重载，执行一次即可变为 `ready`：
+
+```bash
+docker compose restart api
+```
+
+### 前端构建报错 `deploy/default.conf: not found`
+
+原 `.dockerignore` 中的 `deploy/*` 规则排除了整个 deploy 目录，导致构建上下文拿不到该文件。
+**v0.18 已修复**（放行 `default.conf` 与 `nginx.dockerfile`）。若使用旧版本，需手动在 `.dockerignore` 末尾追加：
+
+```
+!deploy/default.conf
+!deploy/nginx.dockerfile
+```
+
+### 修改了 nginx 配置但不生效
+
+配置是 volume 挂载的，执行 `docker compose restart web` 即可，**不要重建镜像**。
+
+### MariaDB 容器启动后很快退出（退出码 137）
+
+这是 OOM（内存不足）被系统杀掉的典型表现。请确认使用的是 v0.18 的 `deploy/my.cnf`，
+并参考 [低配 VPS 部署优化](#低配-vps-部署优化) 调低内存参数、增加 swap。
+
+### 易支付提示"MD5 签名校验失败"
+
+签名算法本身已验证无误，绝大多数情况是**后台填写的商户密钥与支付网关侧不一致**。
+请从易支付商户后台重新复制密钥填入「易支付配置」页，页面提供密钥自检按钮可辅助排查。
 
 ## 赞助方
 
