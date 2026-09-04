@@ -11,11 +11,17 @@ services:
       dockerfile: deploy/nginx.dockerfile
     container_name: web
     ports:
-      - "8888:80"
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./data/certbot-webroot:/var/www/certbot
+      - ./deploy/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     networks:
       - default
     depends_on:
       - api
+    restart: unless-stopped
     logging: *default-logging
 
   api:
@@ -30,6 +36,8 @@ services:
       DB_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env before running docker compose}
       DB_NAME: oneclickvirt
       DB_TYPE: mariadb
+      FRONTEND_URL: http://webhost.ypvps.com
+      TZ: Asia/Shanghai
     volumes:
       - ./data/app/:/app/storage
       - ./server/config.yaml:/app/config.yaml:rw
@@ -45,8 +53,6 @@ services:
     image: mariadb:10.11
     container_name: mysql
     restart: always
-    ports:
-      - "3306:3306"
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env before running docker compose}
       MYSQL_DATABASE: oneclickvirt

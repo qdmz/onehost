@@ -90,3 +90,8 @@ deploy/delete_broken_disk.sh
 deploy/check_freedisk.sh
 deploy/du_top.sh
 deploy/du_var.sh
+# 部署安全：含密钥/密码，禁止提交
+.env
+*.log
+data/
+deploy/ssl/

@@ -1,5 +1,6 @@
 # 构建前端
 FROM node:22-slim AS builder
+ENV NODE_OPTIONS=--max-old-space-size=3072
 ARG TARGETARCH
 
 WORKDIR /app
