@@ -26,6 +26,7 @@ export default {
   onSale: '上架',
   offSale: '下架',
   editProvider: '编辑上游节点',
+  editHint: '提示：API 配置出于安全考虑不会回显。编辑时若 BaseURL 留空，则保留原有 API 配置不变；填写新 BaseURL 则整组 API 配置将被替换。',
   authType: '鉴权方式',
   baseUrl: 'API地址',
   baseUrlPlaceholder: '如: https://panel.example.com',

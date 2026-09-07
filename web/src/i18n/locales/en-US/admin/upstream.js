@@ -26,6 +26,7 @@ export default {
   onSale: 'On Sale',
   offSale: 'Off Sale',
   editProvider: 'Edit Upstream Provider',
+  editHint: 'Note: API config is not echoed for security. If BaseURL is left blank during edit, the existing API config is preserved; filling in a BaseURL replaces the entire API config.',
   authType: 'Auth Type',
   baseUrl: 'API Base URL',
   baseUrlPlaceholder: 'e.g. https://panel.example.com',

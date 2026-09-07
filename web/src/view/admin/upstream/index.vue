@@ -108,7 +108,16 @@
       width="620px"
       destroy-on-close
     >
-      <el-form ref="formRef" :model="form" :rules="formRules" label-width="120px">
+      <el-alert
+        v-if="editingId"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+      >
+        {{ $t('admin.upstream.editHint') }}
+      </el-alert>
+      <el-form ref="formRef" :model="form" :rules="activeFormRules" label-width="120px">
         <el-form-item :label="$t('admin.upstream.name')" prop="name">
           <el-input v-model="form.name" :placeholder="$t('admin.upstream.namePlaceholder')" />
         </el-form-item>
@@ -193,7 +202,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import {
@@ -241,6 +250,16 @@ const formRules = {
   name: [{ required: true, message: '请输入节点名称', trigger: 'blur' }],
   'authConfig.baseUrl': [{ required: true, message: '请输入API地址', trigger: 'blur' }]
 }
+
+// 编辑模式：baseUrl 留空则保留原有配置，不校验必填
+const activeFormRules = computed(() => {
+  if (editingId.value) {
+    return {
+      name: [{ required: true, message: '请输入节点名称', trigger: 'blur' }]
+    }
+  }
+  return formRules
+})
 
 // 测试连接对话框
 const testDialogVisible = ref(false)
@@ -297,7 +316,8 @@ const handleSave = async () => {
     const payload = {
       name: form.name,
       region: form.region,
-      authConfig: form.authConfig
+      // 编辑模式下 baseUrl 留空 = 保留原有 API 配置；有值 = 更新配置
+      authConfig: (editingId.value && !form.authConfig.baseUrl) ? undefined : form.authConfig
     }
     if (editingId.value) {
       await updateUpstreamProvider(editingId.value, payload)
