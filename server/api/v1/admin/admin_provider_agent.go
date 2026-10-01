@@ -20,7 +20,6 @@ import (
 	"oneclickvirt/utils"
 
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 )
 
 // GenerateAgentSecret godoc
@@ -30,7 +29,7 @@ import (
 //	@Tags			admin/providers
 //	@Param			id	path	int	true	"Provider ID"
 //	@Produce		json
-//	@Router			/v1/admin/providers/{id}/agent-secret [post]
+//	@Router			/admin/providers/{id}/agent-secret [post]
 func GenerateAgentSecret(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.Atoi(idStr)
@@ -145,7 +144,7 @@ func GenerateAgentSecret(c *gin.Context) {
 //	@Tags			admin/providers
 //	@Param			id	path	int	true	"Provider ID"
 //	@Produce		json
-//	@Router			/v1/admin/providers/{id}/stopped-containers [get]
+//	@Router			/admin/providers/{id}/stopped-containers [get]
 func GetStoppedContainers(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.Atoi(idStr)
@@ -314,7 +313,7 @@ func GetStoppedContainers(c *gin.Context) {
 //	@Param			id		path	int		true	"Provider ID"
 //	@Param			command	body	string	true	"命令（JSON: {\"command\":\"...\",\"timeout\":30}）"
 //	@Produce		json
-//	@Router			/v1/admin/providers/{id}/exec [post]
+//	@Router			/admin/providers/{id}/exec [post]
 func ExecOnProvider(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.Atoi(idStr)
@@ -398,25 +397,10 @@ func ExecOnProvider(c *gin.Context) {
 	}
 
 	if execFailed {
-		if dbProvider.ConnectionType == "agent" {
-			errLower := strings.ToLower(stderr)
-			looksDisconnected := strings.Contains(errLower, "agent not connected") ||
-				strings.Contains(errLower, "节点未连接") ||
-				strings.Contains(errLower, "connection closed") ||
-				strings.Contains(errLower, "websocket")
-			if looksDisconnected {
-				if err := global.APP_DB.Model(&providerModel.Provider{}).
-					Where("id = ?", dbProvider.ID).
-					Updates(map[string]interface{}{
-						"agent_status":       "offline",
-						"agent_connected_at": nil,
-					}).Error; err != nil {
-					global.APP_LOG.Warn("执行失败后回写 Agent 离线状态失败",
-						zap.Uint("providerID", dbProvider.ID), zap.Error(err))
-				}
-			}
-		}
-
+		// AgentHub owns connection status under its per-provider lifecycle lock.
+		// A request can report an old connection's write error after a reconnect.
+		// Error text is not a connection identity and must not mark the current
+		// connection offline or clear its connection time.
 		msg := "命令执行失败"
 		if stderr != "" {
 			msg = msg + ": " + stderr

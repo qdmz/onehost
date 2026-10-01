@@ -21,7 +21,7 @@ run_module_26() {
         "" "$group" "$ADMIN_TOKEN"
 
     # ---- Update instance type permissions ----
-    test_api "Update type perms (both)" "PUT" "/api/v1/admin/instance-type-permissions" "200|400" \
+    test_api "Update type perms (both)" "PUT" "/api/v1/admin/instance-type-permissions" "200" \
         '{"minLevelForContainer":1,"minLevelForVM":1,"minLevelForDeleteContainer":1,"minLevelForDeleteVM":1,"minLevelForResetContainer":1,"minLevelForResetVM":1}' "$group" "$ADMIN_TOKEN"
 
     ensure_provider_health_ready "$PROVIDER_ID" "$ADMIN_TOKEN" || {
@@ -63,9 +63,19 @@ run_module_26() {
         fi
 
         # Create container instance
-        local ct_resp; ct_resp=$(test_api "Create container instance" "POST" "/api/v1/admin/instances" "200|201|400" \
-            "{\"provider_id\":${PROVIDER_ID},\"name\":\"type-test-ct\",\"instance_type\":\"container\",\"image\":\"${ct_image}\",\"cpu\":${ACTION_TEST_CONTAINER_CPU},\"memory\":${ACTION_TEST_CONTAINER_MEMORY},\"disk\":${ACTION_TEST_CONTAINER_DISK},\"bandwidth\":1000}" \
-            "$group" "$ADMIN_TOKEN")
+        # A type-specific create assertion must only accept a successful
+        # creation response.  Treating 400/409 as success hides validation,
+        # permission, and backend regressions and turns all dependent checks
+        # into misleading SKIPs.  Infrastructure-only skips are classified
+        # from the asynchronous task detail below.
+        local ct_resp="" ct_request_ok=true
+        if ct_resp=$(test_api "Create container instance" "POST" "/api/v1/admin/instances" "200|201" \
+            "{\"provider_id\":${PROVIDER_ID},\"name\":\"type-test-ct\",\"instance_type\":\"container\",\"image\":\"${ct_image}\",\"cpu\":${ACTION_TEST_CONTAINER_CPU},\"memory\":${ACTION_TEST_CONTAINER_MEMORY},\"disk\":${ACTION_TEST_CONTAINER_DISK},\"bandwidth\":1000,\"network_type\":\"nat_ipv4\"}" \
+            "$group" "$ADMIN_TOKEN"); then
+            ct_request_ok=true
+        else
+            ct_request_ok=false
+        fi
         local ct_task; ct_task=$(echo "$ct_resp" | jq -r '.data.task_id // .data.taskId // empty' 2>/dev/null)
         local ct_id=""
         local ct_created=false
@@ -94,9 +104,14 @@ run_module_26() {
                     fi
                 fi
             fi
-        else
+        elif [[ "$ct_request_ok" == "true" ]]; then
             ct_id=$(echo "$ct_resp" | jq -r '.data.id // .data.ID // empty' 2>/dev/null)
-            [[ -n "$ct_id" ]] && ct_created=true
+            if [[ -n "$ct_id" ]]; then
+                ct_created=true
+            else
+                record_fail_result "Create type-test container result" "POST" \
+                    "/api/v1/admin/instances" "instance id" "missing" "$ct_resp" "$group"
+            fi
         fi
 
         if [[ "$ct_created" == "true" && -n "$ct_id" ]]; then
@@ -117,10 +132,13 @@ run_module_26() {
             [[ -n "$ct_delete_resp" ]] && wait_instance_operation_settled "$ct_id" "$ct_delete_resp" "deleted" "delete type-test container ${ct_id}" "$ADMIN_TOKEN" || true
         elif [[ -n "$ct_id" ]]; then
             delete_instance_safe "$ct_id" "$ADMIN_TOKEN" 180 || true
+        else
+            record_skip_result "Container-specific operations" "HARNESS" "create type-test container" \
+                "container creation did not yield a usable instance; dependent checks are skipped" "$group"
         fi
 
         # Disable container permission and verify rejection
-        test_api "Disable container perm" "PUT" "/api/v1/admin/instance-type-permissions" "200|400" \
+        test_api "Disable container perm" "PUT" "/api/v1/admin/instance-type-permissions" "200" \
             '{"minLevelForContainer":99,"minLevelForVM":1,"minLevelForDeleteContainer":99,"minLevelForDeleteVM":1,"minLevelForResetContainer":99,"minLevelForResetVM":1}' "$group" "$ADMIN_TOKEN"
 
         if [[ -n "$USER_TOKEN" ]]; then
@@ -130,7 +148,7 @@ run_module_26() {
         fi
 
         # Re-enable
-        test_api "Re-enable container perm" "PUT" "/api/v1/admin/instance-type-permissions" "200|400" \
+        test_api "Re-enable container perm" "PUT" "/api/v1/admin/instance-type-permissions" "200" \
             '{"minLevelForContainer":1,"minLevelForVM":1,"minLevelForDeleteContainer":1,"minLevelForDeleteVM":1,"minLevelForResetContainer":1,"minLevelForResetVM":1}' "$group" "$ADMIN_TOKEN"
     fi
 
@@ -162,9 +180,17 @@ run_module_26() {
         fi
 
         # Create VM instance
-        local vm_resp; vm_resp=$(test_api "Create VM instance" "POST" "/api/v1/admin/instances" "200|201|400" \
-            "{\"provider_id\":${PROVIDER_ID},\"name\":\"type-test-vm\",\"instance_type\":\"vm\",\"image\":\"${vm_image}\",\"cpu\":${ACTION_TEST_VM_CPU},\"memory\":${ACTION_TEST_VM_MEMORY},\"disk\":${ACTION_TEST_VM_DISK},\"bandwidth\":1000}" \
-            "$group" "$ADMIN_TOKEN")
+        # As with containers, only 2xx responses prove that a VM was created.
+        # A 4xx response is a product/test failure unless an accepted task
+        # later identifies a classified infrastructure condition.
+        local vm_resp="" vm_request_ok=true
+        if vm_resp=$(test_api "Create VM instance" "POST" "/api/v1/admin/instances" "200|201" \
+            "{\"provider_id\":${PROVIDER_ID},\"name\":\"type-test-vm\",\"instance_type\":\"vm\",\"image\":\"${vm_image}\",\"cpu\":${ACTION_TEST_VM_CPU},\"memory\":${ACTION_TEST_VM_MEMORY},\"disk\":${ACTION_TEST_VM_DISK},\"bandwidth\":1000,\"network_type\":\"nat_ipv4\"}" \
+            "$group" "$ADMIN_TOKEN"); then
+            vm_request_ok=true
+        else
+            vm_request_ok=false
+        fi
         local vm_task; vm_task=$(echo "$vm_resp" | jq -r '.data.task_id // .data.taskId // empty' 2>/dev/null)
         local vm_id=""
         local vm_created=false
@@ -182,6 +208,9 @@ run_module_26() {
                 vm_id=$(echo "$vm_task_resp" | jq -r '.data.instance_id // .data.instanceId // .data.result.id // empty' 2>/dev/null)
                 if is_infrastructure_failure_detail "$vm_task_resp"; then
                     local vm_infra_detail; vm_infra_detail=$(echo "$vm_task_resp" | jq -c '.data.errorMessage // .message // .msg // .' 2>/dev/null || printf '%s' "$vm_task_resp")
+                    if is_vm_runtime_infrastructure_failure_detail "$vm_task_resp"; then
+                        mark_vm_runtime_infrastructure_unavailable "$vm_infra_detail"
+                    fi
                     record_skip_result "Create type-test VM task (infrastructure)" "GET" "/api/v1/admin/tasks/${vm_task}" "${vm_infra_detail}" "$group"
                 else
                     local vm_task_actual; vm_task_actual=$(safe_jq "$vm_task_resp" '.data.status // .message // .msg // "failed"' 'failed')
@@ -193,9 +222,14 @@ run_module_26() {
                     fi
                 fi
             fi
-        else
+        elif [[ "$vm_request_ok" == "true" ]]; then
             vm_id=$(echo "$vm_resp" | jq -r '.data.id // .data.ID // empty' 2>/dev/null)
-            [[ -n "$vm_id" ]] && vm_created=true
+            if [[ -n "$vm_id" ]]; then
+                vm_created=true
+            else
+                record_fail_result "Create type-test VM result" "POST" \
+                    "/api/v1/admin/instances" "instance id" "missing" "$vm_resp" "$group"
+            fi
         fi
 
         if [[ "$vm_created" == "true" && -n "$vm_id" ]]; then
@@ -213,10 +247,13 @@ run_module_26() {
             [[ -n "$vm_delete_resp" ]] && wait_instance_operation_settled "$vm_id" "$vm_delete_resp" "deleted" "delete type-test VM ${vm_id}" "$ADMIN_TOKEN" || true
         elif [[ -n "$vm_id" ]]; then
             delete_instance_safe "$vm_id" "$ADMIN_TOKEN" 180 || true
+        else
+            record_skip_result "VM-specific operations" "HARNESS" "create type-test VM" \
+                "VM creation did not yield a usable instance; dependent checks are skipped" "$group"
         fi
 
         # Disable VM permission
-        test_api "Disable VM perm" "PUT" "/api/v1/admin/instance-type-permissions" "200|400" \
+        test_api "Disable VM perm" "PUT" "/api/v1/admin/instance-type-permissions" "200" \
             '{"minLevelForContainer":1,"minLevelForVM":99,"minLevelForDeleteContainer":1,"minLevelForDeleteVM":99,"minLevelForResetContainer":1,"minLevelForResetVM":99}' "$group" "$ADMIN_TOKEN"
 
         if [[ -n "$USER_TOKEN" ]]; then
@@ -226,8 +263,11 @@ run_module_26() {
         fi
 
         # Re-enable
-        test_api "Re-enable all perms" "PUT" "/api/v1/admin/instance-type-permissions" "200|400" \
+        test_api "Re-enable all perms" "PUT" "/api/v1/admin/instance-type-permissions" "200" \
             '{"minLevelForContainer":1,"minLevelForVM":1,"minLevelForDeleteContainer":1,"minLevelForDeleteVM":1,"minLevelForResetContainer":1,"minLevelForResetVM":1}' "$group" "$ADMIN_TOKEN"
+    elif should_test_type "vm" && [[ -n "${VM_RUNTIME_INFRA_UNAVAILABLE_REASON:-}" ]]; then
+        record_skip_result "VM-specific operations" "HARNESS" "env_supports_vm" \
+            "${VM_RUNTIME_INFRA_UNAVAILABLE_REASON}" "$group"
     fi
 
     # ---- User-side type permission check ----

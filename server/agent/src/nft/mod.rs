@@ -1,5 +1,6 @@
 mod block;
 mod counter;
+mod device_counter;
 mod gc;
 
 use crate::error::ApiError;
@@ -41,7 +42,12 @@ const DEFAULT_EXCLUDE_V6: &[&str] = &[
 static EXCLUDE_V4: OnceLock<Vec<String>> = OnceLock::new();
 static EXCLUDE_V6: OnceLock<Vec<String>> = OnceLock::new();
 static CONFIG_TAG: OnceLock<String> = OnceLock::new();
-const RULES_VERSION: &str = "v2";
+const RULES_VERSION: &str = "v4";
+// This is the compatibility backend for kernels without the netdev egress
+// hook. Running before a forward-chain `flow add` rule captures setup packets,
+// but flowtable-accelerated packets bypass forward entirely. Modern kernels use
+// per-device ingress/egress chains from device_counter instead.
+const TRAFFIC_CHAIN_PRIORITY: i64 = -2;
 
 #[derive(Copy, Clone)]
 struct Scope {
@@ -109,6 +115,20 @@ fn current_config_tag() -> &'static String {
     })
 }
 
+fn binding_config_tag(addresses: &[String], families: &[String]) -> String {
+    let mut normalized = addresses.to_vec();
+    normalized.sort();
+    let mut normalized_families = families.to_vec();
+    normalized_families.sort();
+    let combined = format!(
+        "{}|{}|{}",
+        current_config_tag(),
+        normalized_families.join(","),
+        normalized.join(",")
+    );
+    format!("{:x}", fnv1a_64(combined.as_bytes()))
+}
+
 fn run_nft(args: &[&str]) -> Result<std::process::Output, ApiError> {
     Command::new("nft")
         .args(args)
@@ -116,9 +136,9 @@ fn run_nft(args: &[&str]) -> Result<std::process::Output, ApiError> {
         .map_err(|e| ApiError::internal(format!("failed to run nft {:?}: {e}", args)))
 }
 
-fn run_nft_script(script: &str) -> Result<(), ApiError> {
+fn run_nft_script_with_args(args: &[&str], script: &str) -> Result<(), ApiError> {
     let mut child = Command::new("nft")
-        .args(["-f", "-"])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -145,34 +165,125 @@ fn run_nft_script(script: &str) -> Result<(), ApiError> {
     )))
 }
 
+fn run_nft_script(script: &str) -> Result<(), ApiError> {
+    run_nft_script_with_args(&["-f", "-"], script)
+}
+
+fn check_nft_script(script: &str) -> Result<(), ApiError> {
+    run_nft_script_with_args(&["-c", "-f", "-"], script)
+}
+
 fn is_not_found(stderr: &str) -> bool {
     stderr.contains("No such file or directory") || stderr.contains("No such file")
 }
 
+fn add_base_chain_statement(scope: Scope) -> String {
+    format!(
+        "add chain {} {} {} {{ type filter hook {} priority {}; policy accept; }}\n",
+        scope.family, scope.table, scope.chain, scope.hook, TRAFFIC_CHAIN_PRIORITY
+    )
+}
+
+fn chain_definition_matches(scope: Scope, json: &serde_json::Value) -> bool {
+    json.get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                let chain = item.get("chain")?;
+                (chain.get("family").and_then(serde_json::Value::as_str) == Some(scope.family)
+                    && chain.get("table").and_then(serde_json::Value::as_str) == Some(scope.table)
+                    && chain.get("name").and_then(serde_json::Value::as_str) == Some(scope.chain))
+                .then_some(chain)
+            })
+        })
+        .is_some_and(|chain| {
+            chain.get("type").and_then(serde_json::Value::as_str) == Some("filter")
+                && chain.get("hook").and_then(serde_json::Value::as_str) == Some(scope.hook)
+                && chain.get("prio").and_then(serde_json::Value::as_i64)
+                    == Some(TRAFFIC_CHAIN_PRIORITY)
+                && chain.get("policy").and_then(serde_json::Value::as_str) == Some("accept")
+        })
+}
+
 fn ensure_base_objects(scope: Scope) -> Result<(), ApiError> {
     let out = run_nft(&["list", "table", scope.family, scope.table])?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !is_not_found(&stderr) {
-        return Err(ApiError::internal(format!(
-            "failed listing nft table {} {}: {}",
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !is_not_found(&stderr) {
+            return Err(ApiError::internal(format!(
+                "failed listing nft table {} {}: {}",
+                scope.family,
+                scope.table,
+                stderr.trim()
+            )));
+        }
+
+        let script = format!(
+            "add table {} {}\n{}",
             scope.family,
             scope.table,
-            stderr.trim()
-        )));
+            add_base_chain_statement(scope)
+        );
+        run_nft_script(&script)?;
+        info!(
+            family = scope.family,
+            table = scope.table,
+            priority = TRAFFIC_CHAIN_PRIORITY,
+            "created nft runtime table/chain"
+        );
+        return Ok(());
     }
 
+    let chain_out = run_nft(&[
+        "-j",
+        "list",
+        "chain",
+        scope.family,
+        scope.table,
+        scope.chain,
+    ])?;
+    if !chain_out.status.success() {
+        let stderr = String::from_utf8_lossy(&chain_out.stderr);
+        if !is_not_found(&stderr) {
+            return Err(ApiError::internal(format!(
+                "failed listing nft chain {} {} {}: {}",
+                scope.family,
+                scope.table,
+                scope.chain,
+                stderr.trim()
+            )));
+        }
+        run_nft_script(&add_base_chain_statement(scope))?;
+        return Ok(());
+    }
+
+    let chain_json: serde_json::Value = serde_json::from_slice(&chain_out.stdout)
+        .map_err(|e| ApiError::internal(format!("failed parsing nft chain json: {e}")))?;
+    if chain_definition_matches(scope, &chain_json) {
+        return Ok(());
+    }
+
+    // This table and chain are Agent-owned. Recreate only the base chain in
+    // one nft transaction so named counters (and their accumulated bytes)
+    // survive while stale rules are removed atomically. Bootstrap/reconcile
+    // restores rules from SQLite immediately after this call.
     let script = format!(
-        "add table {} {}\nadd chain {} {} {} {{ type filter hook {} priority 0; policy accept; }}\n",
-        scope.family, scope.table, scope.family, scope.table, scope.chain, scope.hook
+        "flush chain {} {} {}\ndelete chain {} {} {}\n{}",
+        scope.family,
+        scope.table,
+        scope.chain,
+        scope.family,
+        scope.table,
+        scope.chain,
+        add_base_chain_statement(scope)
     );
     run_nft_script(&script)?;
-    info!(
+    warn!(
         family = scope.family,
         table = scope.table,
-        "created nft runtime table/chain"
+        chain = scope.chain,
+        priority = TRAFFIC_CHAIN_PRIORITY,
+        "migrated nft fallback traffic chain"
     );
     Ok(())
 }
@@ -212,29 +323,39 @@ fn interface_aliases(interface: &str) -> Vec<String> {
     aliases.push(interface.to_string());
 
     let master_link = format!("/sys/class/net/{interface}/master");
-    if let Ok(target) = std::fs::read_link(master_link) {
-        if let Some(name) = std::path::Path::new(&target)
+    if let Ok(target) = std::fs::read_link(master_link)
+        && let Some(name) = std::path::Path::new(&target)
             .file_name()
             .and_then(|x| x.to_str())
-        {
-            if !name.is_empty() && !aliases.iter().any(|v| v == name) {
-                aliases.push(name.to_string());
-            }
-        }
+        && !name.is_empty()
+        && !aliases.iter().any(|v| v == name)
+    {
+        aliases.push(name.to_string());
     }
     aliases
 }
 
-fn expected_rule_count(scope: Scope, alias_count: usize, has_inner_ip: bool) -> usize {
+fn expected_rule_count(
+    scope: Scope,
+    alias_count: usize,
+    addresses: &[String],
+    families: &[String],
+) -> usize {
     match scope.tag {
         "inet" => {
-            if has_inner_ip {
-                // Per-IP: 2 rules per alias (inbound to _in counter + outbound to _out counter)
-                alias_count * 2
-            } else {
-                // Fallback: 4 rules per alias (IPv4 in/out + IPv6 in/out)
-                alias_count * 4
-            }
+            let expects_v4 = families.is_empty() || families.iter().any(|family| family == "ipv4");
+            let expects_v6 = families.is_empty() || families.iter().any(|family| family == "ipv6");
+            let v4_count = addresses
+                .iter()
+                .filter(|address| !address.contains(':'))
+                .count();
+            let v6_count = addresses
+                .iter()
+                .filter(|address| address.contains(':'))
+                .count();
+            let rules_per_alias = (if expects_v4 { v4_count.max(1) * 2 } else { 0 })
+                + (if expects_v6 { v6_count.max(1) * 2 } else { 0 });
+            alias_count * rules_per_alias
         }
         _ => 0,
     }
@@ -390,7 +511,8 @@ mod tests {
             "counter_in",
             "counter_out",
             "veth123",
-            Some("172.16.0.2"),
+            &["172.16.0.2".to_string()],
+            &["ipv4".to_string()],
         )
         .expect("script should build");
 
@@ -402,13 +524,110 @@ mod tests {
 
     #[test]
     fn fallback_rules_keep_same_directionality() {
-        let script =
-            build_rules_for_counter(SCOPE_INET, "counter_in", "counter_out", "tap101i0", None)
-                .expect("script should build");
+        let script = build_rules_for_counter(
+            SCOPE_INET,
+            "counter_in",
+            "counter_out",
+            "tap101i0",
+            &[],
+            &["ipv4".to_string(), "ipv6".to_string()],
+        )
+        .expect("script should build");
 
         assert!(script.contains("oifname \"tap101i0\" ip daddr !="));
         assert!(script.contains("iifname \"tap101i0\" ip saddr !="));
         assert!(script.contains("oifname \"tap101i0\" ip6 daddr !="));
         assert!(script.contains("iifname \"tap101i0\" ip6 saddr !="));
+    }
+
+    #[test]
+    fn dual_stack_rules_include_both_families() {
+        let script = build_rules_for_counter(
+            SCOPE_INET,
+            "counter_in",
+            "counter_out",
+            "veth123",
+            &["10.0.0.2".to_string(), "2001:db8::2".to_string()],
+            &["ipv4".to_string(), "ipv6".to_string()],
+        )
+        .expect("script should build");
+
+        assert!(script.contains("ip daddr 10.0.0.2"));
+        assert!(script.contains("ip6 daddr 2001:db8::2"));
+    }
+
+    #[test]
+    fn missing_ipv6_address_uses_family_fallback_rule() {
+        let script = build_rules_for_counter(
+            SCOPE_INET,
+            "counter_in",
+            "counter_out",
+            "veth123",
+            &["10.0.0.2".to_string()],
+            &["ipv4".to_string(), "ipv6".to_string()],
+        )
+        .expect("script should build");
+
+        assert!(script.contains("ip daddr 10.0.0.2"));
+        assert!(script.contains("oifname \"veth123\" ip6 daddr !="));
+        assert!(script.contains("iifname \"veth123\" ip6 saddr !="));
+    }
+
+    #[test]
+    fn routed_ipv6_pve_tap_uses_i1_and_counts_both_directions() {
+        let script = build_rules_for_counter(
+            SCOPE_INET,
+            "counter_in",
+            "counter_out",
+            "tap102i1",
+            &["2001:470:6d:69d::102".to_string()],
+            &["ipv6".to_string()],
+        )
+        .expect("script should build");
+
+        assert!(script.contains(
+            "oifname \"tap102i1\" ip6 saddr != { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32 } ip6 daddr 2001:470:6d:69d::102 counter name counter_in"
+        ));
+        assert!(script.contains(
+            "iifname \"tap102i1\" ip6 saddr 2001:470:6d:69d::102 ip6 daddr != { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32 } counter name counter_out"
+        ));
+        assert!(!script.contains("tap102i0"));
+        assert!(!script.contains(" ip daddr "));
+    }
+
+    #[test]
+    fn fallback_chain_runs_before_forward_flow_add_rule() {
+        let statement = add_base_chain_statement(SCOPE_INET);
+        assert!(statement.contains("hook forward priority -2"));
+
+        let matching = serde_json::json!({
+            "nftables": [{
+                "chain": {
+                    "family": "inet",
+                    "table": "vm_traffic_monitor",
+                    "name": "forward",
+                    "type": "filter",
+                    "hook": "forward",
+                    "prio": -2,
+                    "policy": "accept"
+                }
+            }]
+        });
+        assert!(chain_definition_matches(SCOPE_INET, &matching));
+
+        let bypassed = serde_json::json!({
+            "nftables": [{
+                "chain": {
+                    "family": "inet",
+                    "table": "vm_traffic_monitor",
+                    "name": "forward",
+                    "type": "filter",
+                    "hook": "forward",
+                    "prio": 0,
+                    "policy": "accept"
+                }
+            }]
+        });
+        assert!(!chain_definition_matches(SCOPE_INET, &bypassed));
     }
 }

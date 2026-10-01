@@ -23,10 +23,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout full source history
+      - name: Checkout source
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Validate CNB credentials
@@ -42,8 +42,14 @@ jobs:
             echo "cnb_enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push source only to CNB master
-        if: steps.validate.outputs.cnb_enabled == 'true'
+      - name: Build history-free public snapshot
+        run: |
+          set -euo pipefail
+          bash scripts/tests/cnb_snapshot_test.sh
+          export_commit=$(bash scripts/build_cnb_snapshot.sh HEAD)
+          printf 'CNB_EXPORT_COMMIT=%s\n' "${export_commit}" >> "${GITHUB_ENV}"
+
+      - name: Replace CNB public branches
         env:
           CNB_PUSH_USERNAME: ${{ secrets.CNB_PUSH_USERNAME }}
           CNB_PUSH_TOKEN: ${{ secrets.CNB_PUSH_TOKEN }}
@@ -51,5 +57,8 @@ jobs:
           GIT_TERMINAL_PROMPT: '0'
         run: |
           git remote add cnb "${CNB_REPOSITORY_URL}"
+          # shellcheck disable=SC2016 # Git expands the credential helper at invocation, not in this shell.
           git -c credential.helper='!f() { test "$1" = get || exit 0; printf "%s\n" "username=${CNB_PUSH_USERNAME}" "password=${CNB_PUSH_TOKEN}"; }; f' \
-            push --force cnb HEAD:refs/heads/master
+            push --force cnb \
+              "${CNB_EXPORT_COMMIT}:refs/heads/main" \
+              "${CNB_EXPORT_COMMIT}:refs/heads/master"

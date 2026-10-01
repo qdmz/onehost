@@ -14,6 +14,18 @@
 set -uo pipefail
 export noninteractive=true
 
+# Handle CLI-only requests before sourcing providers or creating reports. In
+# particular, --help must never provision a worker or create --help-results.
+case "${1:-}" in
+    -h|--help)
+        printf 'Usage: bash run_env_test.sh <env_type> [modules] [instance_types]\n'
+        printf 'Environments: docker podman containerd lxd incus proxmoxve kubevirt qemu\n'
+        exit 0
+        ;;
+    ''|docker|podman|containerd|lxd|incus|proxmoxve|kubevirt|qemu) ;;
+    *) printf 'Unknown environment: %s\n' "$1" >&2; exit 2 ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMMON_DIR="${SCRIPT_DIR}/common"
 REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/reports}"
@@ -30,6 +42,7 @@ if [[ "${ACTION_TEST_PARALLEL_LOCAL:-${PLATFORM_ALLOW_CONCURRENT_INSTANCES:-fals
 fi
 
 source "${COMMON_DIR}/test_framework.sh"
+source "${COMMON_DIR}/result_integrity.sh"
 source "${COMMON_DIR}/node_manager.sh"
 # Restore SCRIPT_DIR: sourced files above set SCRIPT_DIR to their own directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,39 +54,9 @@ NODE_HOURS="${NODE_HOURS:-8}"
 MASTER_PORT="${MASTER_PORT:-8888}"
 EXIT_CODE=0
 
-case "$ENV_TYPE" in
-    kubevirt)
-        export WORKER_SWAP_MB="${KUBEVIRT_WORKER_SWAP_MB:-4096}"
-        export ACTION_TEST_VM_CPU="${ACTION_TEST_KUBEVIRT_VM_CPU:-1}"
-        export ACTION_TEST_VM_MEMORY="${ACTION_TEST_KUBEVIRT_VM_MEMORY:-512}"
-        export ACTION_TEST_VM_DISK="${ACTION_TEST_KUBEVIRT_VM_DISK:-${ACTION_TEST_VM_DISK:-8}}"
-        log_info "KubeVirt VM test size: ${ACTION_TEST_VM_CPU}C/${ACTION_TEST_VM_MEMORY}MB/${ACTION_TEST_VM_DISK}G"
-        ;;
-    lxd)
-        export ACTION_TEST_VM_CPU="${ACTION_TEST_LXD_VM_CPU:-1}"
-        export ACTION_TEST_VM_MEMORY="${ACTION_TEST_LXD_VM_MEMORY:-1024}"
-        export ACTION_TEST_VM_DISK="${ACTION_TEST_LXD_VM_DISK:-${ACTION_TEST_VM_DISK:-20}}"
-        log_info "LXD VM test size: ${ACTION_TEST_VM_CPU}C/${ACTION_TEST_VM_MEMORY}MB/${ACTION_TEST_VM_DISK}G"
-        ;;
-    incus)
-        export ACTION_TEST_VM_CPU="${ACTION_TEST_INCUS_VM_CPU:-1}"
-        export ACTION_TEST_VM_MEMORY="${ACTION_TEST_INCUS_VM_MEMORY:-1024}"
-        export ACTION_TEST_VM_DISK="${ACTION_TEST_INCUS_VM_DISK:-${ACTION_TEST_VM_DISK:-20}}"
-        log_info "Incus VM test size: ${ACTION_TEST_VM_CPU}C/${ACTION_TEST_VM_MEMORY}MB/${ACTION_TEST_VM_DISK}G"
-        ;;
-    proxmoxve)
-        export ACTION_TEST_VM_CPU="${ACTION_TEST_PROXMOXVE_VM_CPU:-1}"
-        export ACTION_TEST_VM_MEMORY="${ACTION_TEST_PROXMOXVE_VM_MEMORY:-1024}"
-        export ACTION_TEST_VM_DISK="${ACTION_TEST_PROXMOXVE_VM_DISK:-${ACTION_TEST_VM_DISK:-8}}"
-        log_info "ProxmoxVE VM test size: ${ACTION_TEST_VM_CPU}C/${ACTION_TEST_VM_MEMORY}MB/${ACTION_TEST_VM_DISK}G"
-        ;;
-    qemu)
-        export ACTION_TEST_VM_CPU="${ACTION_TEST_QEMU_VM_CPU:-1}"
-        export ACTION_TEST_VM_MEMORY="${ACTION_TEST_QEMU_VM_MEMORY:-1024}"
-        export ACTION_TEST_VM_DISK="${ACTION_TEST_QEMU_VM_DISK:-${ACTION_TEST_VM_DISK:-8}}"
-        log_info "QEMU VM test size: ${ACTION_TEST_VM_CPU}C/${ACTION_TEST_VM_MEMORY}MB/${ACTION_TEST_VM_DISK}G"
-        ;;
-esac
+configure_action_test_resources_for_env "$ENV_TYPE"
+log_info "Container test size: ${ACTION_TEST_CONTAINER_CPU}C/${ACTION_TEST_CONTAINER_MEMORY}MB/${ACTION_TEST_CONTAINER_DISK}G"
+log_info "VM test size: ${ACTION_TEST_VM_CPU}C/${ACTION_TEST_VM_MEMORY}MB/${ACTION_TEST_VM_DISK}G"
 
 # =============================================================
 # Phase 0: Validate platform and instance types
@@ -86,49 +69,42 @@ log_info "Instance types: ${INSTANCE_TYPES} (requested: ${RAW_INSTANCE_TYPES})"
 log_info "Execution rule: ${EXECUTION_RULE}"
 log_info "Node hours: ${NODE_HOURS}h"
 
-# Preflight: check that at least one platform is enabled and has credentials
-ENABLED_PLATFORMS=$(get_enabled_platforms)
-if [[ -z "${ENABLED_PLATFORMS}" ]]; then
-    log_error "No cloud platforms are enabled."
-    log_error "Set PLATFORM_<NAME>_ENABLED=true and provide the corresponding secrets."
-    log_error "Example: export PLATFORM_ALICE_ENABLED=true ALICE_CLIENT_ID=xxx ALICE_CLIENT_SECRET=xxx"
-    exit 1
-fi
-log_info "Enabled platforms: ${ENABLED_PLATFORMS}"
-log_info "Active platform will be selected automatically with fallback"
-
-preflight_require_commands jq curl go mysql || exit 75
-preflight_check_runner_resources 20 4096 "${SCRIPT_DIR}/.." || exit 75
-preflight_check_port_available "$MASTER_PORT" || exit 75
-wait_for_mysql_ready 90 3 || exit 75
-
-# -- Report & results init --
+# Initialize reports before any preflight can exit.  This keeps successful
+# harness checks and an actionable infrastructure skip in the same JSONL file.
+export RESULTS_FILE="${REPORT_DIR}/${ENV_TYPE}-results.jsonl"
+export RESULTS_FILE_SHARED=true
 report_init "${REPORT_DIR}/${ENV_TYPE}-report.md" "${ENV_TYPE}"
-init_results_file "${REPORT_DIR}/${ENV_TYPE}-results.jsonl"
-
+init_results_file "$RESULTS_FILE"
 CREATED_IDS=""
 
 record_harness_skip_and_exit() {
     local reason="$1"
-    record_skip_result "Harness infrastructure skip (${ENV_TYPE})" "HARNESS" "run_env_test.sh" "$reason" "infrastructure"
-    generate_html_report "${REPORT_DIR}/${ENV_TYPE}-report.html" "${ENV_TYPE}" 2>/dev/null || true
+    record_skip_result "Harness infrastructure skip (${ENV_TYPE})" "HARNESS" "run_env_test.sh" "$reason" "HARNESS"
     report_finalize 2>/dev/null || true
+    generate_html_report "${REPORT_DIR}/${ENV_TYPE}-report.html" "${ENV_TYPE}" 2>/dev/null || true
     exit 75
 }
 
-# Error handler: capture logs and cleanup on unexpected exit
+# Error handler: capture logs and cleanup on unexpected exit.  Install it
+# before preflight so early exits still finalize the report.
 _cleanup_on_exit() {
     local exit_code=$?
-    if [[ $exit_code -ne 0 ]]; then
+    if [[ $exit_code -eq 75 ]]; then
+        log_skip "Harness skipped due to a transient infrastructure condition (exit 75)"
+    elif [[ $exit_code -ne 0 ]]; then
         log_error "Script exiting with code ${exit_code}"
         log_info "Capturing service logs for debugging..."
         fetch_full_service_logs "${REPORT_DIR}/${ENV_TYPE}-crash-logs.txt" 2>/dev/null || true
     fi
     if [[ -n "$CREATED_IDS" ]]; then
         log_info "Cleaning up nodes: ${CREATED_IDS}"
-        cleanup_all_nodes "$CREATED_IDS" 2>/dev/null || true
+        if ! cleanup_all_nodes "$CREATED_IDS" 2>/dev/null; then
+            # Keep CREATED_IDS intact so an EXIT-trap retry can make another
+            # bounded cleanup attempt; never report a failed cleanup as a
+            # successful test run.
+            log_error "Worker cleanup failed; retaining IDs for retry: ${CREATED_IDS}"
+        fi
     fi
-    # Kill the Go server process started by deploy_master_local
     if [[ -f "$SERVER_PID_FILE" ]]; then
         kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
         rm -f "$SERVER_PID_FILE"
@@ -140,6 +116,41 @@ _cleanup_on_exit() {
     report_finalize 2>/dev/null || true
 }
 trap _cleanup_on_exit EXIT
+
+# Preflight: check that at least one platform is enabled and has credentials
+ENABLED_PLATFORMS=$(get_enabled_platforms)
+if [[ -z "${ENABLED_PLATFORMS}" ]]; then
+    record_harness_skip_and_exit "No cloud platforms are enabled or credentials are unavailable"
+fi
+record_pass_result "Platform resolution" "PREFLIGHT" "platforms" "at least one enabled" "$ENABLED_PLATFORMS" "Enabled platforms resolved" "HARNESS"
+log_info "Enabled platforms: ${ENABLED_PLATFORMS}"
+log_info "Active platform will be selected automatically with fallback"
+
+if preflight_require_commands jq curl go; then
+    if command -v mysql >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
+        record_pass_result "Required commands" "PREFLIGHT" "commands" "jq,curl,go,mysql-or-mariadb" "available" "All required commands are installed" "HARNESS"
+    else
+        log_error "Neither mysql nor mariadb client is installed"
+        record_harness_skip_and_exit "A MySQL-compatible client is required for the local database readiness check"
+    fi
+else
+    record_harness_skip_and_exit "Required command preflight failed"
+fi
+if preflight_check_runner_resources 20 4096 "${SCRIPT_DIR}/.."; then
+    record_pass_result "Runner resources" "PREFLIGHT" "runner" "disk>=20GB,memory>=4096MB" "available" "Runner resource budget satisfied" "HARNESS"
+else
+    record_harness_skip_and_exit "Runner resources are below the harness minimum"
+fi
+if preflight_check_port_available "$MASTER_PORT"; then
+    record_pass_result "Master port availability" "PREFLIGHT" "port:${MASTER_PORT}" "available" "available" "Master service port is free" "HARNESS"
+else
+    record_harness_skip_and_exit "Master service port ${MASTER_PORT} is already in use"
+fi
+if wait_for_mysql_ready 90 3; then
+    record_pass_result "MySQL readiness" "PREFLIGHT" "mysql" "ready" "ready" "MySQL TCP endpoint is ready" "HARNESS"
+else
+    record_harness_skip_and_exit "MySQL did not become ready during preflight"
+fi
 
 # =============================================================
 # Phase 1: Deploy master service on runner (source build + local MySQL)
@@ -157,7 +168,7 @@ deploy_master_local "$MASTER_PORT" || {
     sleep 30
     deploy_master_local "$MASTER_PORT" || {
         log_error "Failed to deploy master on runner after retry"
-        # Treat as transient infrastructure failure so the Action doesn't hard-fail
+        # Report an infrastructure abort; the workflow must mark it incomplete.
         exit 75
     }
 }
@@ -172,15 +183,16 @@ log_section "Phase 2: Create worker node"
 WORKER_INFO=$(create_test_node "$ENV_TYPE" "$NODE_HOURS") || {
     _worker_rc=$?
     if [[ $_worker_rc -eq 75 ]]; then
-        log_error "Failed to create worker node: all cloud platforms temporarily out of resources"
-        record_skip_result "Worker node provisioning" "HARNESS" "create_test_node" "No usable worker node satisfied ${ENV_TYPE} infrastructure requirements" "infrastructure"
+        log_warning "Worker node provisioning skipped: all cloud platforms are temporarily out of resources"
+        record_skip_result "Worker node provisioning" "HARNESS" "create_test_node" "No usable worker node satisfied ${ENV_TYPE} infrastructure requirements" "HARNESS"
     else
-        log_error "Failed to create worker node (infrastructure failure, exit=${_worker_rc})"
-        record_skip_result "Worker node provisioning" "HARNESS" "create_test_node" "Worker node provisioning failed with exit ${_worker_rc}" "infrastructure"
+        log_warning "Worker node provisioning skipped due to an infrastructure failure (exit=${_worker_rc})"
+        record_skip_result "Worker node provisioning" "HARNESS" "create_test_node" "Worker node provisioning failed with exit ${_worker_rc}" "HARNESS"
     fi
     log_info "This is a transient infrastructure condition, not a test failure."
     log_info "Re-run the workflow when resources are available, or add more cloud platform accounts."
-    # Exit 75 (EX_TEMPFAIL) for any cloud/infrastructure failure — keeps Action green
+    # Exit 75 distinguishes unavailable infrastructure from product failures.
+    # The workflow reports an incomplete run, not a green integration result.
     exit 75
 }
 if [[ -z "$WORKER_INFO" ]]; then
@@ -221,17 +233,24 @@ log_section "Phase 3: Install ${ENV_TYPE} on worker node"
 install_rc=0
 install_env "$WORKER_ID_VAL" "$WORKER_IP" "$ENV_TYPE" || install_rc=$?
 if (( install_rc != 0 )); then
-    log_warning "Environment installation may have issues, continuing..."
-fi
-if (( install_rc == 75 )); then
-    record_harness_skip_and_exit "${ENV_TYPE} installation lost required worker connectivity or hit a transient infrastructure failure"
+    if (( install_rc == 75 )); then
+        record_harness_skip_and_exit "${ENV_TYPE} installation lost required worker connectivity or hit a transient infrastructure failure"
+    fi
+    # A non-transient installer error means the requested runtime was not
+    # installed. Continuing into runtime/module checks would turn every real
+    # assertion into a misleading SKIP and previously made CI appear to test
+    # an environment that did not exist.
+    record_fail_result "${ENV_TYPE} environment installation" "HARNESS" "install_env" \
+        "installer exit 0" "installer exit ${install_rc}" \
+        "Environment installation failed; runtime and module assertions were not run" "HARNESS"
+    exit 1
 fi
 
 runtime_rc=0
 verify_worker_runtime "$WORKER_ID_VAL" "$WORKER_IP" "$ENV_TYPE" || runtime_rc=$?
 if (( runtime_rc != 0 )); then
     if (( runtime_rc == 75 )); then
-        record_harness_skip_and_exit "Worker SSH became unavailable while verifying the ${ENV_TYPE} runtime after installation"
+        record_harness_skip_and_exit "Worker runtime verification lost connectivity or the worker fell below the ${ENV_TYPE}/${INSTANCE_TYPES} peak resource budget"
     fi
     if [[ "$ENV_TYPE" == "kubevirt" ]]; then
         log_error "KubeVirt/CDI runtime prerequisites are incomplete; treating as transient infrastructure failure"
@@ -239,7 +258,7 @@ if (( runtime_rc != 0 )); then
     fi
     log_error "${ENV_TYPE} runtime prerequisites are incomplete after installation"
     record_fail_result "Worker runtime verification (${ENV_TYPE})" "HARNESS" "verify_worker_runtime" "ready" "not ready" \
-        "Required runtime services or state are unavailable after installation" "infrastructure"
+        "Required runtime services or state are unavailable after installation" "HARNESS"
     exit 1
 fi
 worker_arch_raw=$(platform_ssh_exec "$WORKER_IP" "uname -m 2>/dev/null || echo unknown" 30 2>/dev/null | tr -d '\r' | tail -1 || true)
@@ -261,7 +280,7 @@ fi
 # =============================================================
 log_section "Phase 4: Prepare worker with pre-existing instances"
 dirty_node_rc=0
-prepare_dirty_node "$WORKER_ID_VAL" "$WORKER_IP" "$ENV_TYPE" || dirty_node_rc=$?
+prepare_dirty_node "$WORKER_ID_VAL" "$WORKER_IP" "$ENV_TYPE" "$INSTANCE_TYPES" || dirty_node_rc=$?
 if (( dirty_node_rc != 0 )); then
     log_warning "Dirty node preparation had issues, continuing..."
 fi
@@ -269,8 +288,14 @@ if (( dirty_node_rc == 75 )); then
     record_harness_skip_and_exit "No deterministic pre-existing ${ENV_TYPE} instance fixture could be prepared on the worker"
 fi
 if (( dirty_node_rc != 0 )); then
-    record_skip_result "Partial dirty-node fixture preparation (${ENV_TYPE})" "HARNESS" "prepare_dirty_node" \
-        "Only the successfully prepared instance types will be asserted" "infrastructure"
+    # A partial fixture is not a supported-feature skip when the caller
+    # requested that instance type. Discovery/import coverage would otherwise
+    # run against one type and silently omit the other, which makes a broad
+    # matrix look complete while testing only a subset of its contract.
+    record_fail_result "Partial dirty-node fixture preparation (${ENV_TYPE})" "HARNESS" "prepare_dirty_node" \
+        "all requested instance types have deterministic fixtures" "only a subset of requested fixtures is ready" \
+        "The requested discovery matrix is incomplete; module assertions were not run" "HARNESS"
+    exit 1
 fi
 
 # =============================================================
@@ -411,6 +436,9 @@ cp "${REPORT_DIR}/${ENV_TYPE}-${_current_rule}-output.log" "${REPORT_DIR}/${ENV_
 # Phase 9: Generate HTML report
 # =============================================================
 log_section "Phase 9: Generate reports"
+# Finalize Markdown/counters before generating the combined HTML report so
+# early harness checks and module assertions have a stable authoritative set.
+report_finalize
 # The per-rule reports were generated inside the loop above.
 # Generate a final combined/summary report using the last run's state (always present).
 generate_html_report "${REPORT_DIR}/${ENV_TYPE}-report.html" "${ENV_TYPE}"
@@ -420,8 +448,18 @@ generate_html_report "${REPORT_DIR}/${ENV_TYPE}-report.html" "${ENV_TYPE}"
 # =============================================================
 log_section "Phase 10: Cleanup"
 # Explicit cleanup (trap will also fire but that's OK)
-cleanup_all_nodes "$CREATED_IDS" 2>/dev/null || true
-CREATED_IDS=""  # Prevent double cleanup in trap
+cleanup_rc=0
+if [[ -n "$CREATED_IDS" ]]; then
+    cleanup_all_nodes "$CREATED_IDS" 2>/dev/null || cleanup_rc=$?
+    if [[ "$cleanup_rc" -ne 0 ]]; then
+        record_fail_result "Worker cleanup" "HARNESS" "cleanup_all_nodes" \
+            "all created worker resources removed" "cleanup exit ${cleanup_rc}" \
+            "Cleanup failed; IDs are retained for the EXIT-trap retry" "HARNESS"
+        EXIT_CODE=1
+    else
+        CREATED_IDS=""  # Prevent double cleanup in trap
+    fi
+fi
 # Kill the Go server process
 if [[ -f "$SERVER_PID_FILE" ]]; then
     kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
@@ -429,19 +467,17 @@ if [[ -f "$SERVER_PID_FILE" ]]; then
 fi
 rm -f "$SERVER_BINARY"
 
-# -- Finalize --
-report_finalize
-
 log_section "Test completed"
 if [[ -f "${RESULTS_FILE:-}" ]]; then
     _jsonl_fail_count=$(jq -r 'select((.status // "") == "FAIL") | 1' "$RESULTS_FILE" 2>/dev/null | wc -l | tr -d ' ')
     if [[ "${_jsonl_fail_count:-0}" != "0" ]]; then
         log_error "Detected ${_jsonl_fail_count} failed assertion(s) in ${RESULTS_FILE}"
         EXIT_CODE=1
-    elif [[ $EXIT_CODE -ne 0 ]]; then
-        log_warning "Ignoring non-zero module exit_code=${EXIT_CODE} because ${RESULTS_FILE} contains no failed assertions"
-        EXIT_CODE=0
     fi
+fi
+if ! validate_test_run_results "$EXIT_CODE" "${RESULTS_FILE:-}"; then
+    log_error "Environment execution failed or result records are missing/invalid"
+    EXIT_CODE=1
 fi
 log_info "Exit code: ${EXIT_CODE}"
 if [[ $EXIT_CODE -ne 0 ]]; then

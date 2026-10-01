@@ -21,6 +21,7 @@ type SSHConnectionPool struct {
 	logger         *zap.Logger         // 日志记录器
 	ctx            context.Context     // 生命周期控制
 	cancel         context.CancelFunc  // 取消函数
+	closed         bool                // 连接池已永久关闭，不再创建新连接
 }
 
 const (
@@ -55,6 +56,11 @@ func NewSSHConnectionPool(maxIdleTime time.Duration, logger *zap.Logger) *SSHCon
 func (p *SSHConnectionPool) GetOrCreate(providerID uint, config SSHConfig) (*SSHClient, error) {
 	// 先尝试获取现有连接（读锁）
 	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("SSH connection pool is closed")
+	}
+	readLockHeld := true
 	if client, exists := p.conns[providerID]; exists {
 		// 检查配置是否变更
 		oldConfig, configExists := p.configs[providerID]
@@ -62,11 +68,12 @@ func (p *SSHConnectionPool) GetOrCreate(providerID uint, config SSHConfig) (*SSH
 
 		// 检查连接年龄
 		createTime, hasTime := p.lastUsed[providerID]
-		tooOld := hasTime && time.Since(createTime) > p.maxAge
+		tooOld := hasTime && time.Since(createTime) > p.maxAge && !client.inUse()
 
 		// 如果配置未变更且连接健康且未过期，尝试复用
 		if !configChanged && !tooOld && client.IsHealthy() {
 			p.mu.RUnlock()
+			readLockHeld = false
 			p.mu.Lock()
 			// 双重检查：连接可能在读写锁切换窗口期被驱逐
 			recheck, recheckExists := p.conns[providerID]
@@ -97,11 +104,16 @@ func (p *SSHConnectionPool) GetOrCreate(providerID uint, config SSHConfig) (*SSH
 			}
 		}
 	}
-	p.mu.RUnlock()
+	if readLockHeld {
+		p.mu.RUnlock()
+	}
 
 	// 需要创建新连接（写锁）
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("SSH connection pool is closed")
+	}
 
 	// 双重检查：可能其他goroutine已经创建了连接
 	if client, exists := p.conns[providerID]; exists {
@@ -109,7 +121,7 @@ func (p *SSHConnectionPool) GetOrCreate(providerID uint, config SSHConfig) (*SSH
 		configChanged := !configExists || !p.isSameConfig(oldConfig, config)
 
 		createTime, hasTime := p.lastUsed[providerID]
-		tooOld := hasTime && time.Since(createTime) > p.maxAge
+		tooOld := hasTime && time.Since(createTime) > p.maxAge && !client.inUse()
 
 		if !configChanged && !tooOld && client.IsHealthy() {
 			p.lastUsed[providerID] = time.Now()
@@ -119,12 +131,21 @@ func (p *SSHConnectionPool) GetOrCreate(providerID uint, config SSHConfig) (*SSH
 			}
 			return client, nil
 		}
+		// Check before dialing the replacement: an active lease must never be
+		// interrupted by a provider credential/endpoint change, and there is no
+		// reason to spend the connect timeout on a client we cannot publish yet.
+		if configChanged && client.inUse() {
+			return nil, fmt.Errorf("SSH connection for provider %d has active sessions; retry after they finish", providerID)
+		}
 	}
 
 	// 检查连接数限制
-	if len(p.conns) >= p.maxConnections {
+	if _, replacing := p.conns[providerID]; !replacing && len(p.conns) >= p.maxConnections {
 		// 达到上限，强制清理最旧的连接
 		p.evictOldestConnection()
+		if len(p.conns) >= p.maxConnections {
+			return nil, fmt.Errorf("SSH connection pool is busy; no idle connection to evict")
+		}
 	}
 
 	// 创建新连接
@@ -135,6 +156,22 @@ func (p *SSHConnectionPool) GetOrCreate(providerID uint, config SSHConfig) (*SSH
 
 	// 关闭旧连接（如果存在）
 	if oldClient, exists := p.conns[providerID]; exists {
+		if p.isSameConfig(p.configs[providerID], config) && oldClient.IsHealthy() && !oldClient.retireIfIdle() {
+			client.Close()
+			p.lastUsed[providerID] = time.Now()
+			return oldClient, nil
+		}
+		// A provider credential/endpoint update must not tear down an active
+		// WebSSH/SFTP/tunnel session.  The pool currently stores one canonical
+		// client per provider, so it cannot safely publish the replacement while
+		// the old client is still leased.  Keep the old client intact, discard
+		// the speculative connection, and let the caller retry after the active
+		// operation releases its lease.  This is preferable to a successful-looking
+		// config update that disconnects unrelated users mid-session.
+		if oldClient.inUse() {
+			client.Close()
+			return nil, fmt.Errorf("SSH connection for provider %d has active sessions; retry after they finish", providerID)
+		}
 		oldClient.Close()
 		if p.logger != nil {
 			p.logger.Info("关闭旧SSH连接（配置变更或失效）",
@@ -167,6 +204,9 @@ func (p *SSHConnectionPool) evictOldestConnection() {
 	first := true
 
 	for id, t := range p.lastUsed {
+		if client := p.conns[id]; client == nil || client.inUse() {
+			continue
+		}
 		if first || t.Before(oldestTime) {
 			oldestID = id
 			oldestTime = t
@@ -174,18 +214,26 @@ func (p *SSHConnectionPool) evictOldestConnection() {
 		}
 	}
 
-	if client, exists := p.conns[oldestID]; exists {
-		// 在持有写锁的情况下删除所有 Map 中的引用
-		delete(p.conns, oldestID)
-		delete(p.configs, oldestID)
-		delete(p.lastUsed, oldestID)
-		// 异步关闭连接，避免在持有锁时调用可能阻塞的 Close
-		go client.Close()
+	// If every connection is active there is no eviction candidate. Do not
+	// probe the zero-value ID here: provider ID 0 can exist during bootstrap
+	// and must never be closed merely because no idle connection was found.
+	if !first {
+		if client, exists := p.conns[oldestID]; exists {
+			if !client.retireIfIdle() {
+				return
+			}
+			// 在持有写锁的情况下删除所有 Map 中的引用
+			delete(p.conns, oldestID)
+			delete(p.configs, oldestID)
+			delete(p.lastUsed, oldestID)
+			// 异步关闭连接，避免在持有锁时调用可能阻塞的 Close
+			go client.Close()
 
-		if p.logger != nil {
-			p.logger.Warn("达到连接数上限，驱逐最旧连接并清理所有相关资源",
-				zap.Uint("providerID", oldestID),
-				zap.Duration("age", time.Since(oldestTime)))
+			if p.logger != nil {
+				p.logger.Warn("达到连接数上限，驱逐最旧连接并清理所有相关资源",
+					zap.Uint("providerID", oldestID),
+					zap.Duration("age", time.Since(oldestTime)))
+			}
 		}
 	}
 }
@@ -231,19 +279,44 @@ func (p *SSHConnectionPool) CloseAll() {
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for providerID, client := range p.conns {
-		client.Close()
-		if p.logger != nil {
-			p.logger.Debug("关闭SSH连接",
-				zap.Uint("providerID", providerID))
-		}
+	if p.closed {
+		p.mu.Unlock()
+		return
 	}
-
+	p.closed = true
+	clients := make([]struct {
+		providerID uint
+		client     *SSHClient
+	}, 0, len(p.conns))
+	for providerID, client := range p.conns {
+		clients = append(clients, struct {
+			providerID uint
+			client     *SSHClient
+		}{providerID: providerID, client: client})
+	}
 	p.conns = make(map[uint]*SSHClient)
 	p.configs = make(map[uint]SSHConfig)
 	p.lastUsed = make(map[uint]time.Time)
+	p.mu.Unlock()
+
+	// Detach the map before doing network I/O. Closing each client in parallel
+	// bounds shutdown by one client-close interval instead of serialising up to
+	// maxConnections * 3 seconds while blocking GetOrCreate.
+	var wg sync.WaitGroup
+	for _, item := range clients {
+		if item.client == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(providerID uint, client *SSHClient) {
+			defer wg.Done()
+			_ = client.Close()
+			if p.logger != nil {
+				p.logger.Debug("关闭SSH连接", zap.Uint("providerID", providerID))
+			}
+		}(item.providerID, item.client)
+	}
+	wg.Wait()
 
 	if p.logger != nil {
 		p.logger.Info("已关闭所有SSH连接")
@@ -455,6 +528,9 @@ func (p *SSHConnectionPool) cleanup() {
 		}
 
 		if shouldRemove {
+			if reason != "unhealthy" && !client.retireIfIdle() {
+				continue
+			}
 			toRemove = append(toRemove, providerID)
 			toClose = append(toClose, client)
 			if p.logger != nil {

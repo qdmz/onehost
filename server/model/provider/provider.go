@@ -17,6 +17,15 @@ const (
 	TrafficStatsModeCustom   = "custom"   // 自定义模式
 )
 
+// InstanceDesiredState is the controller-side lifecycle intent.  Runtime
+// Status is a fact observed from the task system or a provider; DesiredState
+// answers the separate question of whether a recovered node may bring an
+// instance back up automatically.
+const (
+	InstanceDesiredStateRunning = "running"
+	InstanceDesiredStateStopped = "stopped"
+)
+
 // TrafficStatsPreset 流量统计预设配置
 type TrafficStatsPreset struct {
 	SQLiteCollectInterval int // SQLite采集间隔（秒），采集后自动同步统计
@@ -140,6 +149,16 @@ type Provider struct {
 	LastAPICheck    *time.Time `json:"lastApiCheck"`                             // 最后一次API健康检查时间
 	LastSSHCheck    *time.Time `json:"lastSshCheck"`                             // 最后一次SSH健康检查时间
 
+	// 恢复调度内部状态。离线起点只在节点首次确认 inactive 时写入；恢复任务
+	// 成功完成一次远端核对后清空，避免每轮健康检查都重复探测或重复启动。
+	// LeaseToken / LeaseExpiresAt make the recovery claim cross-controller:
+	// periodic and manually queued recovery can never discover the same node at
+	// the same time, while a stale worker cannot release a newer worker's lease.
+	RecoveryOfflineSince          *time.Time `json:"-" gorm:"column:recovery_offline_since;index:idx_recovery_offline_since"`
+	RecoveryLastRecoveryAttemptAt *time.Time `json:"-" gorm:"column:recovery_last_recovery_attempt_at"`
+	RecoveryLeaseToken            string     `json:"-" gorm:"column:recovery_lease_token;size:36"`
+	RecoveryLeaseExpiresAt        *time.Time `json:"-" gorm:"column:recovery_lease_expires_at;index:idx_recovery_lease_expires_at"`
+
 	// 配置管理字段
 	AuthConfig       string     `json:"-" gorm:"type:text"`                  // 完整认证配置JSON（不返回给前端）
 	ConfigVersion    int        `json:"configVersion" gorm:"default:0"`      // 配置版本号
@@ -199,12 +218,15 @@ type Provider struct {
 	VMLimitDisk   bool `json:"vmLimitDisk" gorm:"default:true"`   // 虚拟机硬盘是否计入Provider总量预算，默认true（严格限制）
 
 	// 端口映射配置
-	DefaultPortCount  int    `json:"defaultPortCount" gorm:"default:10"`                   // 每个实例默认映射端口数量
-	PortRangeStart    int    `json:"portRangeStart" gorm:"default:10000"`                  // 端口映射范围起始
-	PortRangeEnd      int    `json:"portRangeEnd" gorm:"default:65535"`                    // 端口映射范围结束
-	NextAvailablePort int    `json:"nextAvailablePort" gorm:"default:10000"`               // 下一个可用端口
-	FixedPorts        []int  `json:"fixedPorts" gorm:"serializer:json;type:text"`          // 固定实例内端口，宿主机端口仍从端口池分配；22 强制保留
-	NetworkType       string `json:"networkType" gorm:"default:nat_ipv4;size:32;not null"` // 网络配置类型：nat_ipv4, nat_ipv4_ipv6, dedicated_ipv4, dedicated_ipv4_ipv6, ipv6_only
+	DefaultPortCount         int        `json:"defaultPortCount" gorm:"default:10"`                   // 每个实例默认映射端口数量
+	PortRangeStart           int        `json:"portRangeStart" gorm:"default:10000"`                  // 端口映射范围起始
+	PortRangeEnd             int        `json:"portRangeEnd" gorm:"default:65535"`                    // 端口映射范围结束
+	NextAvailablePort        int        `json:"nextAvailablePort" gorm:"default:10000"`               // 下一个可用端口
+	FixedPorts               []int      `json:"fixedPorts" gorm:"serializer:json;type:text"`          // 固定实例内端口，宿主机端口仍从端口池分配；22 强制保留
+	NetworkType              string     `json:"networkType" gorm:"default:nat_ipv4;size:32;not null"` // 网络配置类型：nat_ipv4, nat_ipv4_ipv6, dedicated_ipv4, dedicated_ipv4_ipv6, ipv6_only
+	IPv6AddressFilePath      string     `json:"ipv6AddressFilePath" gorm:"size:512"`                  // 节点侧IPv6地址/CIDR文件；为空时使用主控地址池或自动探测
+	IPv6AddressFileSyncedAt  *time.Time `json:"ipv6AddressFileSyncedAt"`                              // 节点IPv6地址文件最近成功同步时间
+	IPv6AddressFileSyncError string     `json:"ipv6AddressFileSyncError" gorm:"size:1024"`            // 最近同步错误；成功后清空
 
 	// 带宽配置（Mbps为单位）
 	DefaultInboundBandwidth  int `json:"defaultInboundBandwidth" gorm:"default:300"`  // 默认入站带宽限制（Mbps）
@@ -422,6 +444,16 @@ func (p *Provider) GetAuthMethod() string {
 	return ""
 }
 
+// IsReverseAgent reports whether a Provider uses the controller-facing
+// WebSocket Agent transport. An api_only Provider may still have
+// ConnectionType=agent for historical configuration compatibility, but its
+// lifecycle operations are performed through the provider API and it must not
+// be made to wait for, or repair, a reverse Agent tunnel.
+func (p Provider) IsReverseAgent() bool {
+	return strings.EqualFold(strings.TrimSpace(p.ConnectionType), "agent") &&
+		!strings.EqualFold(strings.TrimSpace(p.ExecutionRule), "api_only")
+}
+
 // Instance 实例模型
 type Instance struct {
 	// 基础字段
@@ -437,6 +469,7 @@ type Instance struct {
 	Provider     string `json:"provider" gorm:"not null;size:64;index:idx_provider_name"`                                                                                // Provider名称
 	ProviderID   uint   `json:"providerId" gorm:"uniqueIndex:idx_instance_name_provider,priority:2;index:idx_provider_id;index:idx_provider_status,priority:1;not null"` // 关联的Provider ID（与name组合唯一）
 	Status       string `json:"status" gorm:"size:32;index:idx_status;index:idx_provider_status,priority:2"`                                                             // 实例状态：creating, running, stopped, failed等
+	DesiredState string `json:"desiredState" gorm:"column:desired_state;size:16;default:stopped"`                                                                        // 持久化运行意图：running / stopped；用于节点恢复时避免误启动手工停机实例
 	Image        string `json:"image" gorm:"size:512"`                                                                                                                   // 使用的镜像名称（多容器场景可包含多个镜像）
 	InstanceType string `json:"instance_type" gorm:"size:16;default:container;index:idx_instance_type"`                                                                  // 实例类型：container, vm
 
@@ -452,14 +485,20 @@ type Instance struct {
 	PublicIP       string `json:"publicIP" gorm:"size:64"`                     // 公网IPv4地址
 	IPv6Address    string `json:"ipv6Address" gorm:"size:128"`                 // 内网IPv6地址
 	PublicIPv6     string `json:"publicIPv6" gorm:"size:128"`                  // 公网IPv6地址
+	SSHHost        string `json:"sshHost" gorm:"size:255"`                     // 管理员可选的SSH目标覆盖地址；为空时沿用既有端口映射/实例IP解析
 	SSHPort        int    `json:"sshPort" gorm:"default:22"`                   // SSH访问端口
 	PortRangeStart int    `json:"portRangeStart"`                              // 端口映射范围起始
 	PortRangeEnd   int    `json:"portRangeEnd"`                                // 端口映射范围结束
 	NetworkType    string `json:"networkType" gorm:"size:32;default:nat_ipv4"` // 创建时继承的网络类型（用于reset时恢复IPv6配置）
+	// EgressProfileID binds this instance to a node-side transparent egress
+	// profile.  The Rust Agent treats the binding as desired state and keeps
+	// traffic fail-closed until the host route plan is reconciled successfully.
+	EgressProfileID string `json:"egressProfileId,omitempty" gorm:"size:128;index"`
 
 	// 访问凭据
 	Username string `json:"username" gorm:"size:64"`  // 登录用户名
 	Password string `json:"password" gorm:"size:128"` // 登录密码
+	SSHKey   string `json:"-" gorm:"type:text"`       // 实例SSH私钥，仅管理员更新接口可写入
 
 	// 系统信息
 	OSType string `json:"osType" gorm:"size:64"` // 操作系统类型：ubuntu, centos, debian等
@@ -511,7 +550,29 @@ func (i *Instance) BeforeCreate(tx *gorm.DB) error {
 	if strings.TrimSpace(i.UUID) == "" {
 		i.UUID = uuid.New().String()
 	}
+	// A newly discovered/imported runtime must never become eligible for
+	// controller-initiated recovery until an administrator explicitly starts
+	// it.  Normal create flows begin in creating/running intent instead.
+	switch strings.ToLower(strings.TrimSpace(i.DesiredState)) {
+	case InstanceDesiredStateRunning, InstanceDesiredStateStopped:
+		i.DesiredState = strings.ToLower(strings.TrimSpace(i.DesiredState))
+	default:
+		if !i.IsImported && instanceStatusImpliesRunningIntent(i.Status) {
+			i.DesiredState = InstanceDesiredStateRunning
+		} else {
+			i.DesiredState = InstanceDesiredStateStopped
+		}
+	}
 	return nil
+}
+
+func instanceStatusImpliesRunningIntent(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "creating", "running", "starting", "restarting", "traffic_stopped", "expiry_stopped":
+		return true
+	default:
+		return false
+	}
 }
 
 func (i Instance) ProviderInstanceIdentifier() string {

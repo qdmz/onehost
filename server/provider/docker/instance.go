@@ -100,8 +100,8 @@ fi
 
 		vethOutput, err := d.sshClient.Execute(vethCmd)
 		if err == nil {
-			vethInterface := utils.CleanCommandOutput(vethOutput)
-			if vethInterface != "" {
+			vethInterface, parseErr := utils.ParseFirstNetworkInterfaceOutput(vethOutput)
+			if parseErr == nil {
 				if instance.Metadata == nil {
 					instance.Metadata = make(map[string]string)
 				}
@@ -117,8 +117,8 @@ fi
 			cmd := fmt.Sprintf("%s inspect %s --format '{{.NetworkSettings.IPAddress}}'", d.runtime.CLI, shellSingleQuote(instance.Name))
 			output, err := d.sshClient.Execute(cmd)
 			if err == nil {
-				ipAddress := strings.TrimSpace(output)
-				if ipAddress != "" && ipAddress != "<no value>" {
+				ipAddress, parseErr := utils.ParseFirstIPv4AddressOutput(output)
+				if parseErr == nil {
 					instance.PrivateIP = ipAddress
 					instance.IP = ipAddress
 					global.APP_LOG.Debug("通过默认网络获取到容器IP地址",
@@ -136,8 +136,8 @@ fi
 			cmd = fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{if $config.GlobalIPv6Address}}{{$config.GlobalIPv6Address}}{{end}}{{end}}'", d.runtime.CLI, shellSingleQuote(instance.Name))
 			output, err = d.sshClient.Execute(cmd)
 			if err == nil {
-				ipv6Address := strings.TrimSpace(output)
-				if ipv6Address != "" && ipv6Address != "<no value>" {
+				ipv6Address, parseErr := utils.ParseFirstIPv6AddressOutput(output)
+				if parseErr == nil {
 					instance.IPv6Address = ipv6Address
 					global.APP_LOG.Debug("获取到容器IPv6地址",
 						zap.String("instance", instance.Name),
@@ -299,11 +299,13 @@ func (d *DockerProvider) sshCreateInstanceWithProgress(ctx context.Context, conf
 
 				// 打标为 oneclickvirt_ 前缀以匹配后续流程
 				tagCmd := fmt.Sprintf("%s tag %s %s", d.runtime.CLI, shellSingleQuote(config.Image), shellSingleQuote(imageNameWithPrefix))
-				if _, tagErr := d.sshClient.Execute(tagCmd); tagErr != nil {
+				if tagOutput, tagErr := d.sshClient.Execute(tagCmd); tagErr != nil {
 					global.APP_LOG.Warn("镜像打标失败，后续流程可能使用原始镜像名",
 						zap.String("rawImage", utils.TruncateString(config.Image, 64)),
 						zap.String("targetImage", utils.TruncateString(imageNameWithPrefix, 64)),
+						zap.String("output", utils.TruncateString(tagOutput, 500)),
 						zap.Error(tagErr))
+					return fmt.Errorf("registry镜像打标失败: %w; output: %s", tagErr, utils.TruncateString(strings.TrimSpace(tagOutput), 2000))
 				}
 				registryFallback = true // 原始镜像无持久进程，后续 docker run 需附加 keep-alive
 				updateProgress(55, "原始镜像拉取并打标完成")
@@ -351,9 +353,27 @@ func (d *DockerProvider) sshCreateInstanceWithProgress(ctx context.Context, conf
 		}
 	}
 
-	hasIPv6 := networkType == "nat_ipv4_ipv6" || networkType == "dedicated_ipv4_ipv6" || networkType == "ipv6_only"
-	if hasIPv6 && d.checkIPv6NetworkAvailable() {
-		cmd += fmt.Sprintf(" --network=%s", shellSingleQuote(d.runtime.IPv6Network))
+	hasIPv6 := utils.NetworkTypeHasIPv6(networkType)
+	staticIPv6 := ""
+	if config.Metadata != nil {
+		staticIPv6 = strings.TrimSpace(config.Metadata["static_ipv6"])
+	}
+	networkSelection, routedPresent, err := d.routedNetworkSelection(config, networkType)
+	if !routedPresent {
+		networkSelection, err = d.resolveDockerContainerNetwork(networkType, staticIPv6)
+	}
+	if err != nil {
+		return err
+	}
+	cmd = appendDockerNetworkOptions(cmd, networkSelection)
+	if networkSelection.RoutedVeth {
+		labelArgs, labelErr := provider.RoutedIPv6RuntimeLabelArgs(networkSelection)
+		if labelErr != nil {
+			return fmt.Errorf("构造隧道路由IPv6运行时标签失败: %w", labelErr)
+		}
+		cmd += " " + labelArgs
+	}
+	if networkSelection.IPv6 {
 		global.APP_LOG.Debug("启用IPv6网络",
 			zap.String("name", utils.TruncateString(config.Name, 32)),
 			zap.String("provider", d.config.Name))
@@ -362,10 +382,6 @@ func (d *DockerProvider) sshCreateInstanceWithProgress(ctx context.Context, conf
 			global.APP_LOG.Warn("Provider配置启用IPv6但 IPv6 网络不可用",
 				zap.String("name", utils.TruncateString(config.Name, 32)),
 				zap.String("provider", d.config.Name))
-		}
-		// 如果运行时指定了 IPv4 网络（如 podman-net / containerd-net），显式指定
-		if d.runtime.IPv4Network != "" {
-			cmd += fmt.Sprintf(" --network=%s", shellSingleQuote(d.runtime.IPv4Network))
 		}
 	}
 
@@ -614,6 +630,9 @@ func (d *DockerProvider) sshCreateInstanceWithProgress(ctx context.Context, conf
 			return fmt.Errorf("failed to create container: %w; output: %s; diagnostics: %s", err, utils.TruncateString(strings.TrimSpace(output), 8000), utils.TruncateString(strings.TrimSpace(diagnostics), 8000))
 		}
 	}
+	if err := d.connectDockerAdditionalNetworks(config.Name, networkSelection); err != nil {
+		return err
+	}
 
 	// 等待容器完全启动并验证状态
 	updateProgress(96, "等待容器完全启动...")
@@ -694,6 +713,59 @@ func (d *DockerProvider) sshCreateInstanceWithProgress(ctx context.Context, conf
 
 	updateProgress(100, "Docker实例创建完成")
 	global.APP_LOG.Info("容器实例创建成功", zap.String("name", utils.TruncateString(config.Name, 32)))
+	return nil
+}
+
+func appendDockerNetworkOptions(command string, selection utils.ContainerNetworkSelection) string {
+	if selection.Network != "" {
+		command += fmt.Sprintf(" --network=%s", shellSingleQuote(selection.Network))
+	}
+	// An IPv6 address belongs to the initial runtime network only when that
+	// network is itself the IPv6 network. Routed dual-stack allocations are
+	// connected after create so Docker keeps NAT IPv4 as the primary network.
+	if selection.StaticIPv6 != "" && !selection.RoutedVeth && (selection.IPv6Network == "" || selection.IPv6Network == selection.Network) {
+		command += fmt.Sprintf(" --ip6=%s", shellSingleQuote(selection.StaticIPv6))
+	}
+	return command
+}
+
+func dockerNetworkOptionFlags(selection utils.ContainerNetworkSelection) string {
+	return appendDockerNetworkOptions("", selection)
+}
+
+func (d *DockerProvider) connectDockerAdditionalNetworks(name string, selection utils.ContainerNetworkSelection) error {
+	if selection.RoutedVeth {
+		command, err := provider.RoutedIPv6VethAttachCommand(d.runtime.CLI, name, selection)
+		if err != nil {
+			return fmt.Errorf("构造隧道路由IPv6 veth命令失败: %w", err)
+		}
+		output, execErr := d.sshClient.Execute(command)
+		if execErr == nil {
+			return nil
+		}
+		_, _ = d.sshClient.Execute(fmt.Sprintf("%s rm -f %s 2>/dev/null || true", d.runtime.CLI, shellSingleQuote(name)))
+		diagnostics := d.collectCreateDiagnostics(name)
+		return fmt.Errorf("附加隧道路由IPv6 veth失败，已删除新建容器: %w; output: %s; diagnostics: %s",
+			execErr, utils.TruncateString(strings.TrimSpace(output), 4000), utils.TruncateString(strings.TrimSpace(diagnostics), 6000))
+	}
+	for _, network := range selection.AdditionalNetworks {
+		if strings.TrimSpace(network) == "" {
+			continue
+		}
+		command := fmt.Sprintf("%s network connect", d.runtime.CLI)
+		if network == selection.IPv6Network && selection.StaticIPv6 != "" {
+			command += fmt.Sprintf(" --ip6=%s", shellSingleQuote(selection.StaticIPv6))
+		}
+		command += fmt.Sprintf(" %s %s", shellSingleQuote(network), shellSingleQuote(name))
+		output, err := d.sshClient.Execute(command)
+		if err == nil {
+			continue
+		}
+		_, _ = d.sshClient.Execute(fmt.Sprintf("%s rm -f %s 2>/dev/null || true", d.runtime.CLI, shellSingleQuote(name)))
+		diagnostics := d.collectCreateDiagnostics(name)
+		return fmt.Errorf("附加隧道路由IPv6网络失败，已删除新建容器: %w; output: %s; diagnostics: %s",
+			err, utils.TruncateString(strings.TrimSpace(output), 4000), utils.TruncateString(strings.TrimSpace(diagnostics), 6000))
+	}
 	return nil
 }
 

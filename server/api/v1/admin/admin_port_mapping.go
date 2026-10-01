@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"oneclickvirt/global"
 	"oneclickvirt/middleware"
 	"oneclickvirt/model/admin"
@@ -137,6 +138,7 @@ func GetPortMappingList(c *gin.Context) {
 		// 从预加载的map中获取Provider信息
 		var providerName string
 		var publicIP string
+		var publicIPv6 string
 
 		// 获取Provider信息用于判断是否为agent+no_port_mapping模式
 		providerInfo, hasProvider := providerMap[port.ProviderID]
@@ -157,13 +159,21 @@ func GetPortMappingList(c *gin.Context) {
 				// agent+no_port_mapping模式：不显示公网IP
 				publicIP = ""
 			} else {
-				// 优先使用PortIP，如果为空则使用Endpoint
+				// 优先使用PortIP，如果为空则使用Endpoint。IPv6映射不能展示
+				// IPv4的PortIP，否则页面会让用户误以为IPv6规则没有生效。
 				ipSource := providerInfo.PortIP
 				if ipSource == "" {
 					ipSource = providerInfo.Endpoint
 				}
 				// 提取纯IP地址，移除端口号
 				publicIP = extractIPFromEndpoint(ipSource)
+				if port.IPv6Enabled || strings.TrimSpace(port.IPv6Address) != "" {
+					if candidate := extractFamilyIP(ipSource, true); candidate != "" {
+						publicIPv6 = candidate
+					} else if candidate := extractFamilyIP(providerInfo.Endpoint, true); candidate != "" {
+						publicIPv6 = candidate
+					}
+				}
 			}
 		} else {
 			// 兜底：没有Provider信息时也使用请求主机名
@@ -187,6 +197,8 @@ func GetPortMappingList(c *gin.Context) {
 			"guestPortEnd": port.GuestPortEnd,
 			"portCount":    port.PortCount,
 			"publicIP":     publicIP, // 仅IP地址，不含端口
+			"publicIPv6":   publicIPv6,
+			"ipv6Address":  port.IPv6Address,
 			"protocol":     port.Protocol,
 			"status":       port.Status,
 			"description":  port.Description,
@@ -200,6 +212,15 @@ func GetPortMappingList(c *gin.Context) {
 	}
 
 	common.ResponseSuccessWithPagination(c, formattedPorts, total, req.Page, req.PageSize)
+}
+
+func extractFamilyIP(endpoint string, ipv6 bool) string {
+	host := extractIPFromEndpoint(endpoint)
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil || (ip.To4() == nil) != ipv6 {
+		return ""
+	}
+	return host
 }
 
 // CreatePortMapping 创建端口映射
@@ -660,7 +681,7 @@ func CheckPortAvailability(c *gin.Context) {
 
 // SyncPortMappings godoc
 // @Summary 同步端口映射
-// @Description 创建一个后台任务，检测并清理孤立的端口映射（实例已删除但数据库记录仍存在）。为每个Provider创建独立的同步任务
+// @Description 先使用 dryRun 预览，再提交 includedPortIds 创建后台任务，检测并清理孤立的端口映射。为每个Provider创建独立的同步任务
 // @Tags Admin-Port-Mapping
 // @Accept json
 // @Produce json

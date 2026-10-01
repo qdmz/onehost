@@ -2,12 +2,15 @@ package initialize
 
 import (
 	"context"
+	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
 	"oneclickvirt/global"
 	"oneclickvirt/initialize/internal"
 	"oneclickvirt/model/config"
+	systemService "oneclickvirt/service/system"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -26,6 +29,8 @@ type DatabaseManager struct {
 	heartbeatTicker      *time.Ticker
 	heartbeatStop        chan struct{}
 	reconnecting         bool
+	lastError            string
+	lastErrorAt          time.Time
 	maxReconnectRetry    int
 	reconnectInterval    time.Duration
 	onConnectionRestored func(*gorm.DB)
@@ -44,6 +49,7 @@ func GetDatabaseManager() *DatabaseManager {
 			ctx:               ctx,
 			cancel:            cancel,
 		}
+		global.APP_DB_CONNECTION_ADOPTER = dbManager
 	})
 	return dbManager
 }
@@ -58,8 +64,14 @@ func (dm *DatabaseManager) Initialize(cfg config.MysqlConfig) (*gorm.DB, error) 
 	db, err := dm.connect()
 	if err != nil {
 		global.APP_LOG.Error("数据库初始化失败", zap.Error(err))
+		// Keep an already healthy pool published while the replacement endpoint
+		// is retried. Clearing dm.db here turns a transient reconfiguration or
+		// database restart into an avoidable outage. The reconnect loop will
+		// atomically replace it after a validated connection is available.
 		dm.mu.Lock()
-		dm.db = nil
+		if dm.ctx == nil {
+			dm.ctx, dm.cancel = context.WithCancel(context.Background())
+		}
 		dm.mu.Unlock()
 		// Initial connection failures previously left the process permanently in
 		// partial-init mode. Keep the heartbeat alive and retry immediately; later
@@ -82,6 +94,24 @@ func (dm *DatabaseManager) Initialize(cfg config.MysqlConfig) (*gorm.DB, error) 
 
 	global.APP_LOG.Info("数据库连接管理器初始化成功")
 	return db, nil
+}
+
+// AdoptConnection installs a pool that was validated by another entry point,
+// such as the public initialization form.  Returning the previous pointer
+// allows callers to close a non-managed APP_DB as well; the manager itself
+// closes its old pool after publishing the replacement.
+func (dm *DatabaseManager) AdoptConnection(newDB *gorm.DB) *gorm.DB {
+	if newDB == nil {
+		return nil
+	}
+	dm.mu.Lock()
+	oldDB := dm.db
+	dm.db = newDB
+	dm.mu.Unlock()
+	closeDatabasePool(oldDB, newDB)
+	dm.clearConnectionError()
+	dm.updateGlobalStats()
+	return oldDB
 }
 
 // SetConnectionRestoredHandler registers the system-level recovery hook. The
@@ -125,37 +155,103 @@ func (dm *DatabaseManager) GetStats() global.DBManagerStats {
 		HeartbeatActive:   dm.heartbeatTicker != nil,
 		MaxReconnectRetry: dm.maxReconnectRetry,
 		ReconnectInterval: dm.reconnectInterval.String(),
+		LastError:         dm.lastError,
+		LastErrorAt: func() string {
+			if dm.lastErrorAt.IsZero() {
+				return ""
+			}
+			return dm.lastErrorAt.Format(time.RFC3339)
+		}(),
 	}
 }
 
 // updateGlobalStats 更新全局统计信息（供性能监控使用）
 func (dm *DatabaseManager) updateGlobalStats() {
 	stats := dm.GetStats()
-	global.APP_DB_MANAGER_STATS = &stats
+	global.SetDBManagerStats(stats)
 }
 
 // connect 建立数据库连接
 func (dm *DatabaseManager) connect() (*gorm.DB, error) {
 	global.APP_LOG.Info("正在连接数据库...")
 
-	db, err := GormMysqlConnect(dm.config)
+	connectionConfig := dm.refreshConnectionConfig()
+	db, err := GormMysqlConnect(connectionConfig)
 	if err != nil {
+		dm.recordConnectionError(err)
 		return nil, err
 	}
 
 	// 验证连接
 	if err := validateDatabaseConnection(db); err != nil {
+		if pool, poolErr := db.DB(); poolErr == nil {
+			pool.Close()
+		}
+		dm.recordConnectionError(err)
 		return nil, err
 	}
 
+	dm.clearConnectionError()
 	global.APP_LOG.Info("数据库连接成功")
 	return db, nil
+}
+
+func (dm *DatabaseManager) refreshConnectionConfig() config.MysqlConfig {
+	runtimeConfig := global.GetAppConfig().Mysql
+	latest := config.MysqlConfig{
+		Path:         strings.TrimSpace(runtimeConfig.Path),
+		Port:         strings.TrimSpace(runtimeConfig.Port),
+		Config:       runtimeConfig.Config,
+		Dbname:       runtimeConfig.Dbname,
+		Username:     runtimeConfig.Username,
+		Password:     runtimeConfig.Password,
+		MaxIdleConns: runtimeConfig.MaxIdleConns,
+		MaxOpenConns: runtimeConfig.MaxOpenConns,
+		LogMode:      runtimeConfig.LogMode,
+		LogZap:       runtimeConfig.LogZap,
+		MaxLifetime:  runtimeConfig.MaxLifetime,
+		AutoCreate:   runtimeConfig.AutoCreate,
+	}
+
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if hasRuntimeDatabaseConfig(latest) {
+		dm.config = latest
+	}
+	return dm.config
+}
+
+func hasRuntimeDatabaseConfig(cfg config.MysqlConfig) bool {
+	return cfg.Path != "" || cfg.Port != "" || cfg.Config != "" || cfg.Dbname != "" ||
+		cfg.Username != "" || cfg.Password != "" || cfg.MaxIdleConns != 0 ||
+		cfg.MaxOpenConns != 0 || cfg.LogMode != "" || cfg.LogZap || cfg.MaxLifetime != 0 || cfg.AutoCreate
+}
+
+func (dm *DatabaseManager) recordConnectionError(err error) {
+	dm.mu.Lock()
+	dm.lastError = err.Error()
+	dm.lastErrorAt = time.Now()
+	dm.mu.Unlock()
+	dm.updateGlobalStats()
+}
+
+func (dm *DatabaseManager) clearConnectionError() {
+	dm.mu.Lock()
+	dm.lastError = ""
+	dm.lastErrorAt = time.Time{}
+	dm.mu.Unlock()
 }
 
 // startHeartbeat 启动心跳检测
 func (dm *DatabaseManager) startHeartbeat() {
 	// 如果已经在运行，先停止（通过dm.mu保护，防止并发双关闭）
 	dm.mu.Lock()
+	if dm.ctx == nil {
+		dm.ctx, dm.cancel = context.WithCancel(context.Background())
+	}
+	if dm.heartbeatStop == nil {
+		dm.heartbeatStop = make(chan struct{})
+	}
 	dm.stopHeartbeat()
 	dm.heartbeatTicker = time.NewTicker(30 * time.Second) // 每30秒检测一次
 	// 捕获当前 channel 和 ticker 引用（goroutine启动后字段可能被替换，必须提前捕获）
@@ -247,11 +343,13 @@ func (dm *DatabaseManager) reconnect() {
 	}
 	dm.reconnecting = true
 	dm.mu.Unlock()
+	dm.updateGlobalStats()
 
 	defer func() {
 		dm.mu.Lock()
 		dm.reconnecting = false
 		dm.mu.Unlock()
+		dm.updateGlobalStats()
 	}()
 
 	global.APP_LOG.Warn("开始数据库重连...")
@@ -275,7 +373,9 @@ func (dm *DatabaseManager) reconnect() {
 
 			// 如果不是最后一次尝试，等待后再试
 			if i < dm.maxReconnectRetry-1 {
-				time.Sleep(dm.reconnectInterval)
+				if !dm.waitForReconnect(i) {
+					return
+				}
 			}
 			continue
 		}
@@ -286,14 +386,12 @@ func (dm *DatabaseManager) reconnect() {
 		dm.db = newDB
 		dm.mu.Unlock()
 
-		if oldDB != nil {
-			if sqlDB, err := oldDB.DB(); err == nil {
-				sqlDB.Close()
-			}
-		}
-
 		// 更新全局变量
 		global.APP_DB = newDB
+		// Publish the global pointer before retiring the old pool.  Requests that
+		// already captured the old GORM handle can finish against the still-open
+		// pool instead of observing sql.ErrDBClosed during the hand-off.
+		closeDatabasePool(oldDB, newDB)
 
 		// 更新全局统计信息
 		dm.updateGlobalStats()
@@ -306,12 +404,54 @@ func (dm *DatabaseManager) reconnect() {
 	global.APP_LOG.Error("数据库重连失败，已达到最大重试次数", zap.Int("max_retry", dm.maxReconnectRetry))
 }
 
+func closeDatabasePool(oldDB, replacement *gorm.DB) {
+	if oldDB == nil || oldDB == replacement {
+		return
+	}
+	if sqlDB, err := oldDB.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+}
+
+func (dm *DatabaseManager) waitForReconnect(attempt int) bool {
+	delay := dm.reconnectDelay(attempt)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-dm.ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (dm *DatabaseManager) reconnectDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	shift := attempt
+	if shift > 3 {
+		shift = 3
+	}
+	base := dm.reconnectInterval * time.Duration(1<<shift)
+	if base > time.Minute {
+		base = time.Minute
+	}
+	jitterWindow := base / 2
+	if jitterWindow <= 0 {
+		return base
+	}
+	return base + time.Duration(rand.Int63n(int64(jitterWindow)+1))
+}
+
 // Shutdown 关闭数据库连接管理器
 func (dm *DatabaseManager) Shutdown() {
 	global.APP_LOG.Info("正在关闭数据库连接管理器...")
 
 	// 停止心跳检测（先取锁再关闭，未避免并发双关闭）
-	dm.cancel()
+	if dm.cancel != nil {
+		dm.cancel()
+	}
 	dm.mu.Lock()
 	dm.stopHeartbeat()
 	dm.mu.Unlock()
@@ -334,33 +474,24 @@ func (dm *DatabaseManager) Shutdown() {
 
 // GormMysqlConnect 直接连接数据库（不经过管理器）
 func GormMysqlConnect(cfg config.MysqlConfig) (*gorm.DB, error) {
-	m := global.GetAppConfig().Mysql
-	dbType := global.GetAppConfig().System.DbType
-	if dbType == "" {
-		dbType = "mysql"
-	}
+	appConfig := global.GetAppConfig()
+	m := appConfig.Mysql
+	configuredType := appConfig.System.DbType
 
 	// 使用传入的配置或全局配置
 	if cfg.Path == "" {
-		cfg = config.MysqlConfig{
-			Path:         m.Path,
-			Port:         m.Port,
-			Config:       m.Config,
-			Dbname:       m.Dbname,
-			Username:     m.Username,
-			Password:     m.Password,
-			MaxIdleConns: m.MaxIdleConns,
-			MaxOpenConns: m.MaxOpenConns,
-			LogMode:      m.LogMode,
-			LogZap:       m.LogZap,
-			MaxLifetime:  m.MaxLifetime,
-			AutoCreate:   m.AutoCreate,
-		}
+		cfg = m.ConnectionConfig()
 	}
 
-	db, err := internal.GormMysql(cfg)
+	db, info, err := internal.GormMysqlWithInfo(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if repairErr := (&systemService.InitService{}).PersistDetectedDatabaseConfig(cfg, configuredType, info); repairErr != nil && global.APP_LOG != nil {
+		// The connection is already healthy; a read-only or unusual deployment
+		// may reject automatic file repair. Keep service availability and report
+		// the actionable persistence failure for the next restart.
+		global.APP_LOG.Warn("数据库已连接，但自动持久化引擎兼容修复失败", zap.Error(repairErr))
 	}
 
 	db.InstanceSet("gorm:table_options", "ENGINE="+m.Engine)

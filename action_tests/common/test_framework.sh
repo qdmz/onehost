@@ -3,12 +3,93 @@
 set -uo pipefail
 export noninteractive=true
 
+# Action tests frequently start the API locally.  A developer/CI environment
+# may export HTTP(S)_PROXY, which must not turn requests to the local test
+# server into remote proxy traffic (and false 503/connection failures).  Keep
+# proxy handling for remote endpoints unchanged by extending the standard
+# curl bypass lists only with loopback hosts.
+_append_loopback_no_proxy() {
+    local current="${1:-}"
+    case ",${current}," in
+        *,localhost,*) ;;
+        *) current="${current:+${current},}localhost" ;;
+    esac
+    case ",${current}," in
+        *,127.0.0.1,*) ;;
+        *) current="${current},127.0.0.1" ;;
+    esac
+    case ",${current}," in
+        *,::1,*) ;;
+        *) current="${current},::1" ;;
+    esac
+    printf '%s' "$current"
+}
+
+NO_PROXY="$(_append_loopback_no_proxy "${NO_PROXY:-}")"
+no_proxy="$(_append_loopback_no_proxy "${no_proxy:-}")"
+export NO_PROXY no_proxy
+
 ACTION_TEST_CONTAINER_CPU="${ACTION_TEST_CONTAINER_CPU:-2}"
 ACTION_TEST_CONTAINER_MEMORY="${ACTION_TEST_CONTAINER_MEMORY:-2048}"
-ACTION_TEST_CONTAINER_DISK="${ACTION_TEST_CONTAINER_DISK:-20}"
+# Native container runners retain a shared guest plus an imported dirty-node
+# guest while module 26 creates a second guest. 20 GiB per guest exhausted a
+# 50 GiB worker; use a small real disk allocation, not disabled quota checks.
+# LXD/Incus and VM-based runtimes have their own sizes below.
+ACTION_TEST_CONTAINER_DISK="${ACTION_TEST_CONTAINER_DISK:-5}"
 ACTION_TEST_VM_CPU="${ACTION_TEST_VM_CPU:-2}"
 ACTION_TEST_VM_MEMORY="${ACTION_TEST_VM_MEMORY:-4096}"
 ACTION_TEST_VM_DISK="${ACTION_TEST_VM_DISK:-20}"
+
+configure_action_test_resources_for_env() {
+    local env_type="$1"
+    case "$env_type" in
+        kubevirt)
+            WORKER_SWAP_MB="${KUBEVIRT_WORKER_SWAP_MB:-4096}"
+            ACTION_TEST_CONTAINER_CPU="${ACTION_TEST_KUBEVIRT_CONTAINER_CPU:-1}"
+            ACTION_TEST_CONTAINER_MEMORY="${ACTION_TEST_KUBEVIRT_CONTAINER_MEMORY:-1024}"
+            ACTION_TEST_CONTAINER_DISK="${ACTION_TEST_KUBEVIRT_CONTAINER_DISK:-4}"
+            ACTION_TEST_VM_CPU="${ACTION_TEST_KUBEVIRT_VM_CPU:-1}"
+            ACTION_TEST_VM_MEMORY="${ACTION_TEST_KUBEVIRT_VM_MEMORY:-512}"
+            ACTION_TEST_VM_DISK="${ACTION_TEST_KUBEVIRT_VM_DISK:-4}"
+            export WORKER_SWAP_MB
+            ;;
+        lxd)
+            ACTION_TEST_CONTAINER_CPU="${ACTION_TEST_LXD_CONTAINER_CPU:-1}"
+            ACTION_TEST_CONTAINER_MEMORY="${ACTION_TEST_LXD_CONTAINER_MEMORY:-1024}"
+            ACTION_TEST_CONTAINER_DISK="${ACTION_TEST_LXD_CONTAINER_DISK:-20}"
+            ACTION_TEST_VM_CPU="${ACTION_TEST_LXD_VM_CPU:-1}"
+            ACTION_TEST_VM_MEMORY="${ACTION_TEST_LXD_VM_MEMORY:-1024}"
+            ACTION_TEST_VM_DISK="${ACTION_TEST_LXD_VM_DISK:-20}"
+            ;;
+        incus)
+            ACTION_TEST_CONTAINER_CPU="${ACTION_TEST_INCUS_CONTAINER_CPU:-1}"
+            ACTION_TEST_CONTAINER_MEMORY="${ACTION_TEST_INCUS_CONTAINER_MEMORY:-1024}"
+            ACTION_TEST_CONTAINER_DISK="${ACTION_TEST_INCUS_CONTAINER_DISK:-20}"
+            ACTION_TEST_VM_CPU="${ACTION_TEST_INCUS_VM_CPU:-1}"
+            ACTION_TEST_VM_MEMORY="${ACTION_TEST_INCUS_VM_MEMORY:-1024}"
+            ACTION_TEST_VM_DISK="${ACTION_TEST_INCUS_VM_DISK:-20}"
+            ;;
+        proxmoxve)
+            ACTION_TEST_CONTAINER_CPU="${ACTION_TEST_PROXMOXVE_CONTAINER_CPU:-1}"
+            ACTION_TEST_CONTAINER_MEMORY="${ACTION_TEST_PROXMOXVE_CONTAINER_MEMORY:-1024}"
+            ACTION_TEST_CONTAINER_DISK="${ACTION_TEST_PROXMOXVE_CONTAINER_DISK:-8}"
+            ACTION_TEST_VM_CPU="${ACTION_TEST_PROXMOXVE_VM_CPU:-1}"
+            ACTION_TEST_VM_MEMORY="${ACTION_TEST_PROXMOXVE_VM_MEMORY:-1024}"
+            ACTION_TEST_VM_DISK="${ACTION_TEST_PROXMOXVE_VM_DISK:-8}"
+            ;;
+        qemu)
+            ACTION_TEST_CONTAINER_CPU="${ACTION_TEST_QEMU_CONTAINER_CPU:-1}"
+            ACTION_TEST_CONTAINER_MEMORY="${ACTION_TEST_QEMU_CONTAINER_MEMORY:-1024}"
+            ACTION_TEST_CONTAINER_DISK="${ACTION_TEST_QEMU_CONTAINER_DISK:-8}"
+            ACTION_TEST_VM_CPU="${ACTION_TEST_QEMU_VM_CPU:-1}"
+            ACTION_TEST_VM_MEMORY="${ACTION_TEST_QEMU_VM_MEMORY:-1024}"
+            ACTION_TEST_VM_DISK="${ACTION_TEST_QEMU_VM_DISK:-8}"
+            ;;
+    esac
+    export ACTION_TEST_CONTAINER_CPU ACTION_TEST_CONTAINER_MEMORY ACTION_TEST_CONTAINER_DISK
+    export ACTION_TEST_VM_CPU ACTION_TEST_VM_MEMORY ACTION_TEST_VM_DISK
+}
+
 DB_NAME="${DB_NAME:-oneclickvirt}"
 SERVER_TMP_PREFIX="${SERVER_TMP_PREFIX:-/tmp/oneclickvirt-server}"
 SERVER_BINARY="${SERVER_BINARY:-${SERVER_TMP_PREFIX}}"
@@ -236,8 +317,27 @@ ensure_worker_ssh_reachable() {
 
 is_infrastructure_failure_detail() {
     local detail="$1"
+    if is_vm_runtime_infrastructure_failure_detail "$detail"; then
+        return 0
+    fi
     printf '%s' "$detail" | grep -Eiq \
-        'dial tcp [^ ]+:22: i/o timeout|dial tcp [^ ]+:22: connect: connection refused|failed to connect to SSH server|no route to host|network is unreachable|connection reset by peer|temporary failure in name resolution|temporary failure resolving|could not resolve host|curl: \(6\)|process exited with status 6|远程下载.*(status [0-9]+|lookup|temporary failure|resolving|temp script execution failed|all download methods failed)|remote download.*(status [0-9]+|lookup|temporary failure|resolving|temp script execution failed|all download methods failed)|下载.*镜像失败: 远程下载|download failed - all mirrors unreachable|all mirrors unreachable|lookup .* on \[::1\]:53|lookup (images\.lxd\.canonical\.com|images\.linuxcontainers\.org|github\.com|raw\.githubusercontent\.com)|read udp .*:53: read: connection refused|no matches for kind "DataVolume".*ensure CRDs are installed first|datavolumes\.cdi\.kubevirt\.io.*not found'
+        'dial tcp [^ ]+:22: i/o timeout|dial tcp [^ ]+:22: connect: connection refused|failed to connect to SSH server|no route to host|network is unreachable|connection reset by peer|temporary failure in name resolution|temporary failure resolving|could not resolve host|curl: \(6\)|(can.t|cannot) lock file .*((pve-config-[0-9]+\.lock)|(qemu-server/lock-[0-9]+\.conf)).*(timeout|timed out)|远程下载.*(status [0-9]+|lookup|temporary failure|resolving|temp script execution failed|all download methods failed)|remote download.*(status [0-9]+|lookup|temporary failure|resolving|temp script execution failed|all download methods failed)|下载.*镜像失败: 远程下载|download failed - all mirrors unreachable|all mirrors unreachable|lookup .* on \[::1\]:53|lookup (images\.lxd\.canonical\.com|images\.linuxcontainers\.org|github\.com|raw\.githubusercontent\.com)|read udp .*:53: read: connection refused|no matches for kind "DataVolume".*ensure CRDs are installed first|datavolumes\.cdi\.kubevirt\.io.*not found|SSH.*(连接|connect).*(失败|failed|超时|timeout|拒绝|refused)|(远程|Provider|provider|节点|Worker|worker).*连接.*(失败|failed|超时|timeout|拒绝|refused)|agent.*(offline|unreachable|未连接)|provider.*(unreachable|offline)'
+}
+
+is_vm_runtime_infrastructure_failure_detail() {
+    local detail="$1" environment="${2:-${ENV_TYPE:-}}"
+    case "$environment" in
+        lxd|incus) ;;
+        *) return 1 ;;
+    esac
+    [[ "$detail" == *"虚拟机Agent启动超时，无法继续配置:"* &&
+       "$detail" == *"等待实例可执行命令超时 (1800秒)"* ]]
+}
+
+mark_vm_runtime_infrastructure_unavailable() {
+    VM_RUNTIME_INFRA_UNAVAILABLE_REASON="${1:-VM runtime prerequisite unavailable}"
+    export VM_RUNTIME_INFRA_UNAVAILABLE_REASON
+    log_warning "Disabling remaining VM tests for ${ENV_TYPE:-unknown}: ${VM_RUNTIME_INFRA_UNAVAILABLE_REASON}"
 }
 
 redact_sensitive_text() {
@@ -357,16 +457,26 @@ preflight_check_port_available() {
 wait_for_mysql_ready() {
     local timeout="${1:-60}" interval="${2:-5}" elapsed=0
     local db_password="${DB_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
-    local mysql_args=(-h 127.0.0.1 -u root)
-    [[ -n "$db_password" ]] && mysql_args+=("-p${db_password}")
-    log_info "Waiting for MySQL TCP readiness..."
+    local client=""
+    if command -v mysql >/dev/null 2>&1; then
+        client="mysql"
+    elif command -v mariadb >/dev/null 2>&1; then
+        client="mariadb"
+    fi
+    if [[ -z "$client" ]]; then
+        log_error "Neither mysql nor mariadb client is installed"
+        return 1
+    fi
+    log_info "Waiting for authenticated MySQL/MariaDB TCP readiness..."
     while [[ $elapsed -lt $timeout ]]; do
-        if command -v mysqladmin >/dev/null 2>&1 && mysqladmin "${mysql_args[@]}" ping --silent 2>/dev/null; then
-            log_success "MySQL ready after ${elapsed}s"
-            return 0
-        fi
-        if command -v mysql >/dev/null 2>&1 && mysql "${mysql_args[@]}" -e "SELECT 1;" >/dev/null 2>&1; then
-            log_success "MySQL ready after ${elapsed}s"
+        # mysqladmin ping may return success for a live server even when the
+        # supplied password is wrong.  The harness must prove the same
+        # authenticated query path the application uses; MYSQL_PWD keeps
+        # credentials out of the process argument list and supports all
+        # punctuation in test passwords.
+        if MYSQL_PWD="$db_password" "$client" --protocol=tcp -h 127.0.0.1 \
+            --connect-timeout=5 -u root -e "SELECT 1;" >/dev/null 2>&1; then
+            log_success "MySQL/MariaDB ready after ${elapsed}s"
             return 0
         fi
         sleep "$interval"
@@ -382,6 +492,7 @@ declare -A CHAIN_BROKEN
 REPORT_FILE=""
 RESULTS_FILE="${RESULTS_FILE:-}"
 TEST_START_TS=""
+REPORT_FINALIZED=false
 MASTER_NODE_ID=""
 MASTER_NODE_IP=""
 
@@ -426,6 +537,11 @@ CONFIG_TASK_MAX_WAIT="${CONFIG_TASK_MAX_WAIT:-3600}"
 INSTANCE_HEALTH_SETTLE_SECONDS="${INSTANCE_HEALTH_SETTLE_SECONDS:-30}"
 INSTANCE_OPERATION_SETTLE_SECONDS="${INSTANCE_OPERATION_SETTLE_SECONDS:-3}"
 ACTION_TEST_API_TIMEOUT="${ACTION_TEST_API_TIMEOUT:-180}"
+VM_RUNTIME_INFRA_UNAVAILABLE_REASON="${VM_RUNTIME_INFRA_UNAVAILABLE_REASON:-}"
+
+# Controller mappings require the reverse WebSocket, not merely a running
+# standalone HTTP monitoring daemon. Always probe the current connection.
+ACTION_TEST_AGENT_READY_REASON="${ACTION_TEST_AGENT_READY_REASON:-}"
 
 # -- JSON result collector for HTML report --
 declare -a TEST_RESULTS_JSON=()
@@ -456,11 +572,25 @@ test_api() {
     local code; code=$(echo "$resp" | tail -1)
     local body; body=$(echo "$resp" | sed '$d')
     sleep 0.3
-    # Support pipe-separated expected codes (e.g. "200|201|400")
+    # Support pipe-separated expected codes (e.g. "200|201").  The special
+    # `infra` token is deliberately narrower than accepting arbitrary 4xx/5xx:
+    # it only permits a non-2xx response when the response body matches a
+    # known remote/infrastructure failure.  Such a result is recorded as SKIP,
+    # never PASS, so a validation or product error cannot hide in a tolerant
+    # integration matrix.
     local match=false
+    local infra_match=false
     IFS='|' read -ra exp_codes <<< "$expected"
     for ec in "${exp_codes[@]}"; do
-        [[ "$code" == "$ec" ]] && { match=true; break; }
+        if [[ "$code" == "$ec" ]]; then
+            match=true
+            break
+        fi
+        if [[ "$ec" == "infra" && "$code" =~ ^[45][0-9][0-9]$ ]] && is_infrastructure_failure_detail "$body"; then
+            match=true
+            infra_match=true
+            break
+        fi
     done
     if [[ "$match" == "false" ]]; then
         FAILED_TESTS=$((FAILED_TESTS + 1))
@@ -472,6 +602,14 @@ test_api() {
         report_add_fail "$name" "$method" "$url" "$data" "$expected" "$code" "$body"
         _record_result "$name" "$method" "$url" "FAIL" "$expected" "$code" "$body" "$group" "$error_logs" "$data"
         return 1
+    fi
+    if [[ "$infra_match" == "true" ]]; then
+        SKIPPED_TESTS=$((SKIPPED_TESTS + 1))
+        log_skip "${name} (infrastructure: HTTP ${code})"
+        report_add_skip "$name" "$method" "$url" "remote/infrastructure failure: HTTP ${code}"
+        _record_result "$name" "$method" "$url" "SKIP" "$expected" "$code" "remote/infrastructure failure" "$group"
+        emit_test_response "$body"
+        return 0
     fi
     PASSED_TESTS=$((PASSED_TESTS + 1))
     log_success "${name}"
@@ -504,8 +642,12 @@ test_api_retry() {
         if [[ $i -lt $retries ]]; then
             # Undo the FAIL record written to RESULTS_FILE so it is not counted as a permanent failure
             if [[ -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" && $_results_before -ge 0 ]]; then
-                head -c "$_results_before" "$RESULTS_FILE" > "${RESULTS_FILE}.retry_tmp" 2>/dev/null && \
-                    mv "${RESULTS_FILE}.retry_tmp" "$RESULTS_FILE" 2>/dev/null || true
+                if [[ "$_results_before" == "0" ]]; then
+                    : > "$RESULTS_FILE"
+                else
+                    head -c "$_results_before" "$RESULTS_FILE" > "${RESULTS_FILE}.retry_tmp" 2>/dev/null && \
+                        mv "${RESULTS_FILE}.retry_tmp" "$RESULTS_FILE" 2>/dev/null || true
+                fi
             fi
             while [[ ${#TEST_RESULTS_JSON[@]} -gt $_results_len ]]; do
                 local _last_idx=$((${#TEST_RESULTS_JSON[@]} - 1))
@@ -681,6 +823,7 @@ env_supports_container() {
 }
 
 env_supports_vm() {
+    [[ -z "${VM_RUNTIME_INFRA_UNAVAILABLE_REASON:-}" ]] || return 1
     [[ "${PLATFORM_SUPPORTS_VM[${ENV_TYPE}]:-0}" -eq 1 ]]
 }
 
@@ -757,11 +900,12 @@ wait_db_ready() {
     while [[ $elapsed -lt $max ]]; do
         local r; r=$(curl -s --max-time 10 "${url}/api/v1/public/init/check" 2>/dev/null) || true
         local need_init; need_init=$(safe_jq "$r" '-r .data.needInit' 'unknown')
-        if [[ "$need_init" == "false" ]]; then
-            log_success "System initialization complete"
+        local ready; ready=$(safe_jq "$r" '-r .data.ready' 'false')
+        if [[ "$need_init" == "false" && "$ready" == "true" ]]; then
+            log_success "System initialization and runtime services complete"
             return 0
         fi
-        log_debug "Init not complete yet (needInit=${need_init}), waiting..."
+        log_debug "Init not complete yet (needInit=${need_init}, ready=${ready}), waiting..."
         sleep "$interval"; elapsed=$((elapsed + interval))
     done
     log_error "System init wait timeout after ${max}s"
@@ -841,6 +985,73 @@ wait_task_complete() {
         jq -cn --arg id "$task_id" --arg status "timeout" --arg message "task wait timed out with no task detail response" \
             '{code:504,data:{id:$id,status:$status,errorMessage:$message},message:$message,msg:$message}'
     fi
+    return 1
+}
+
+
+# Ensure the reverse Agent is connected before opening a controller tunnel.
+# For SSH providers monitoring/status.is_running only checks systemd. Deploying
+# that standalone HTTP daemon cannot establish the reverse WebSocket needed by
+# controller mappings. Only the Agent-mode response carries a live hub status.
+ensure_action_test_agent_ready() {
+    local provider_id="${1:-${PROVIDER_ID:-}}"
+    local group="${2:-default}"
+    local token="${3:-${ADMIN_TOKEN:-}}"
+    local max_wait="${4:-${ACTION_TEST_AGENT_STATUS_MAX_WAIT:-240}}"
+    local interval="${5:-5}"
+    [[ "$max_wait" =~ ^[0-9]+$ && "$max_wait" -ge 5 ]] || max_wait=240
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 1 ]] || interval=5
+    ACTION_TEST_AGENT_READY_REASON=""
+    if [[ -z "$provider_id" ]]; then
+        ACTION_TEST_AGENT_READY_REASON="provider id is empty"
+        return 1
+    fi
+    local deadline=$((SECONDS + max_wait)) remaining pause request_timeout
+    local status_resp status_code http_code status_shape is_running agent_status
+    local status_url="/api/v1/admin/providers/${provider_id}/monitoring/status"
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        request_timeout=$remaining
+        (( request_timeout > 20 )) && request_timeout=20
+        status_resp=$(curl -s -w '\n%{http_code}' --max-time "$request_timeout" \
+            -H "Authorization: Bearer ${token}" "${SERVER_URL}${status_url}" 2>/dev/null) || true
+        http_code=$(printf '%s\n' "$status_resp" | tail -1)
+        status_resp=$(printf '%s\n' "$status_resp" | sed '$d')
+        status_code=$(safe_jq "$status_resp" '-r .code // empty' '')
+        if [[ "$http_code" != "200" || "$status_code" != "200" ]]; then
+            ACTION_TEST_AGENT_READY_REASON="Agent control status unavailable (HTTP ${http_code:-unknown})"
+            if [[ "$http_code" == "000" ]] || is_infrastructure_failure_detail "$status_resp"; then
+                return 1
+            fi
+            record_fail_result "Agent control status prerequisite" "GET" "$status_url" \
+                "HTTP 200 with valid status" "${http_code:-unknown}" "$status_resp" "$group"
+            return 1
+        fi
+        status_shape=$(safe_jq "$status_resp" '.data | type == "object" and (.is_running | type == "boolean") and ((has("status") | not) or .status == "online" or .status == "offline")' 'false') || true
+        if [[ "$status_shape" != "true" ]]; then
+            ACTION_TEST_AGENT_READY_REASON="Invalid Agent control status response"
+            record_fail_result "Agent control status prerequisite" "GET" "$status_url" \
+                "boolean is_running and optional online/offline status" "invalid response" "$status_resp" "$group"
+            return 1
+        fi
+        is_running=$(safe_jq "$status_resp" '-r .data.is_running' 'false')
+        agent_status=$(safe_jq "$status_resp" '-r .data.status // empty' '')
+        if [[ "$is_running" == "true" && "$agent_status" == "online" ]]; then
+            return 0
+        fi
+        if [[ -z "$agent_status" ]]; then
+            ACTION_TEST_AGENT_READY_REASON="当前为SSH监控Agent，未建立控制端转发所需的反向WebSocket；systemd运行状态不代表控制连接在线"
+            return 1
+        fi
+        # An Agent-mode provider can reconnect in the background. Keep polling
+        # an offline status until the deadline instead of skipping immediately.
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+        pause=$interval
+        (( pause > remaining )) && pause=$remaining
+        sleep "$pause"
+    done
+    ACTION_TEST_AGENT_READY_REASON="Agent反向WebSocket在${max_wait}s内未上线，跳过控制端转发测试"
     return 1
 }
 
@@ -1520,6 +1731,7 @@ init_results_file() {
     RESULTS_FILE="$1"
     : > "$RESULTS_FILE"
     TEST_START_TS=$(_ts)
+    REPORT_FINALIZED=false
 }
 
 # -- Record test result to JSON Lines file --
@@ -1551,6 +1763,15 @@ _record_result() {
 _add_result_json() {
     local name="$1" method="$2" url="$3" status="$4" expected="$5" actual="$6" detail="$7" group="$8"
     _record_result "$name" "$method" "$url" "$status" "$expected" "$actual" "$detail" "$group" ""
+}
+
+record_pass_result() {
+    local name="$1" method="$2" url="$3" expected="${4:-}" actual="${5:-}" detail="${6:-}" group="${7:-default}"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+    log_success "${name}"
+    report_add_pass "$name" "$method" "$url"
+    _record_result "$name" "$method" "$url" "PASS" "$expected" "$actual" "$detail" "$group"
 }
 
 record_skip_result() {
@@ -1604,9 +1825,28 @@ ensure_test_instance_available() {
     return 1
 }
 
+require_test_instance() {
+    local group="$1" label="${2:-instance-dependent test}" token="${3:-$ADMIN_TOKEN}"
+    local instance_id="${TEST_INSTANCE_ID:-}"
+    if [[ -z "$instance_id" ]]; then
+        chain_break "$group" "${label} requires an instance created by module 10"
+        record_skip_result "$label" "HARNESS" "TEST_INSTANCE_ID" \
+            "module 10 did not create a usable instance; dependent checks are skipped" "$group"
+        return 1
+    fi
+    if ensure_test_instance_available "$token" "$instance_id" "$label"; then
+        return 0
+    fi
+    chain_break "$group" "${label} requires a currently available instance"
+    record_skip_result "$label" "HARNESS" "/api/v1/admin/instances/${instance_id}" \
+        "the instance created by module 10 is no longer available; dependent checks are skipped" "$group"
+    return 1
+}
+
 # -- Markdown report --
 report_init() {
     REPORT_FILE="$1"
+    REPORT_FINALIZED=false
     local env="$2" ts; ts=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
     cat > "$REPORT_FILE" << EOF
 # ${env} Integration Test Report
@@ -1663,11 +1903,9 @@ report_add_skip() {
 
 report_finalize() {
     [[ -z "$REPORT_FILE" ]] && return
+    [[ "$REPORT_FINALIZED" == "true" ]] && return
 
-    # When tests ran in a subprocess (e.g. run_env_test.sh → run_module.sh),
-    # the in-memory counters may be zero.  Fall back to counting from the JSONL
-    # results file which is always written to disk.
-    if [[ $TOTAL_TESTS -eq 0 && -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" ]]; then
+    if [[ -n "${RESULTS_FILE:-}" && -f "$RESULTS_FILE" ]]; then
         local _jsonl_total=0 _jsonl_pass=0 _jsonl_fail=0 _jsonl_skip=0
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
@@ -1694,6 +1932,7 @@ report_finalize() {
     rm -f "${REPORT_FILE}.bak"
     echo -e "\n---\n\nCompleted: Total=${TOTAL_TESTS} Passed=${PASSED_TESTS} Failed=${FAILED_TESTS} Skipped=${SKIPPED_TESTS} Rate=${rate}%" >> "$REPORT_FILE"
     log_section "Results: Total=${TOTAL_TESTS} Passed=${PASSED_TESTS} Failed=${FAILED_TESTS} Skipped=${SKIPPED_TESTS} Rate=${rate}%"
+    REPORT_FINALIZED=true
 }
 
 # -- HTML report generation (delegates to report/generate_report.sh) --

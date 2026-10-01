@@ -2,15 +2,18 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	_ "time/tzdata" // 嵌入时区数据，确保 Alpine/无 tzdata 环境（如 Docker）中 Asia/Shanghai 可用
 
 	systemAPI "oneclickvirt/api/v1/system"
+	"oneclickvirt/constant"
 	"oneclickvirt/global"
 	"oneclickvirt/initialize"
 	"oneclickvirt/mcp"
+	updateService "oneclickvirt/service/update"
 
 	_ "oneclickvirt/docs"
 	_ "oneclickvirt/provider/containerd"
@@ -50,6 +53,18 @@ import (
 // @name Authorization
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "version", "--version", "-v":
+			fmt.Printf("oneclickvirt %s commit=%s build_time=%s official=%t\n",
+				constant.DisplayVersion(), constant.BuildCommit, constant.BuildTime, constant.IsOfficialBuild())
+			return
+		case "update-worker":
+			runUpdateWorker(os.Args[2:])
+			return
+		}
+	}
+
 	// Check for MCP subcommand before full initialization
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
 		// MCP mode: lightweight init (no DB, no full server)
@@ -68,6 +83,25 @@ func main() {
 
 	// 启动服务器
 	runServer()
+}
+
+// runUpdateWorker executes a panel-approved update in a detached systemd
+// transient unit. It intentionally avoids HTTP/database initialization so the
+// worker can replace and restart the serving process safely.
+func runUpdateWorker(args []string) {
+	flags := flag.NewFlagSet("update-worker", flag.ContinueOnError)
+	operationID := flags.String("operation-id", "", "operation id")
+	action := flags.String("action", "update", "update, rollback or restart")
+	target := flags.String("target", "", "release tag")
+	backupID := flags.String("backup-id", "", "local backup id")
+	if err := flags.Parse(args); err != nil || *operationID == "" {
+		fmt.Fprintln(os.Stderr, "[UPDATE] invalid update-worker arguments")
+		os.Exit(2)
+	}
+	if err := updateService.GetService().RunWorker(*operationID, *action, *target, *backupID); err != nil {
+		fmt.Fprintf(os.Stderr, "[UPDATE] %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // runMCP 启动 MCP stdio 服务器（轻量模式，不需要数据库）

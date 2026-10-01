@@ -1,10 +1,24 @@
 #!/bin/bash
 # from https://github.com/oneclickvirt/oneclickvirt
-# 2025.11.07
+# 2026.07.29
+
+# Keep the two installer entry points interoperable. The documented canonical
+# variable is lowercase for historical compatibility, while NONINTERACTIVE is
+# accepted as an alias by deployments that use the full installer.
+noninteractive="${noninteractive:-${NONINTERACTIVE:-false}}"
+export noninteractive NONINTERACTIVE="${noninteractive}"
 
 VERSION="" 
 REPO="oneclickvirt/oneclickvirt"
 BASE_URL=""
+MANAGED_INSTALL_ROOT="${ONECLICKVIRT_INSTALL_ROOT:-/opt/oneclickvirt}"
+MANAGED_SERVER_DIR="${ONECLICKVIRT_SERVER_DIR:-${MANAGED_INSTALL_ROOT}/server}"
+MANAGED_SERVER_BIN="${ONECLICKVIRT_SERVER_BIN:-${MANAGED_SERVER_DIR}/oneclickvirt-server}"
+MANAGED_ENV_FILE="${ONECLICKVIRT_ENV_FILE:-${MANAGED_SERVER_DIR}/oneclickvirt.env}"
+MANAGED_SERVICE_FILE="${ONECLICKVIRT_SERVICE_FILE:-/etc/systemd/system/oneclickvirt.service}"
+MANAGED_CLI_LINK="${ONECLICKVIRT_CLI_LINK:-/usr/local/bin/oneclickvirt}"
+MANAGED_SERVICE_NAME="${ONECLICKVIRT_SERVICE_NAME:-oneclickvirt}"
+EXPECTED_API_CONTRACT="2026-08-16.1"
 cdn_urls="https://cdn0.spiritlhl.top/ http://cdn3.spiritlhl.net/ http://cdn1.spiritlhl.net/ http://cdn2.spiritlhl.net/"
 cdn_success_url=""
 github_api_urls=(
@@ -44,14 +58,82 @@ log_error() {
     log_with_level "${RED}[ERROR]${NC}" "$1" "$2"
 }
 
+existing_install_detected() {
+    [ -x "$MANAGED_SERVER_BIN" ] || [ -f "$MANAGED_SERVER_DIR/config.yaml" ] || [ -f "$MANAGED_SERVICE_FILE" ]
+}
+
+managed_web_path() {
+    if [ -n "${custom_web_path:-}" ]; then
+        printf '%s' "$custom_web_path"
+    else
+        printf '%s' "${ONECLICKVIRT_WEB_DIR:-${MANAGED_INSTALL_ROOT}/web}"
+    fi
+}
+
+validate_install_paths() {
+    local web_path
+    web_path=$(managed_web_path)
+    for path in "$MANAGED_INSTALL_ROOT" "$MANAGED_SERVER_DIR" "$web_path"; do
+        case "$path" in
+            ""|/|*[[:cntrl:]]*)
+                log_error "Refusing an unsafe installation path: '$path'." "拒绝使用不安全的安装路径: '$path'。"
+                return 1
+                ;;
+            /*) ;;
+            *)
+                log_error "Installation paths must be absolute: '$path'." "安装路径必须是绝对路径: '$path'。"
+                return 1
+                ;;
+        esac
+    done
+    if [ "$web_path" = "$MANAGED_INSTALL_ROOT" ] || [ "$web_path" = "$MANAGED_SERVER_DIR" ]; then
+        log_error "The web path must not replace the application or server directory." \
+            "Web 路径不能替代应用目录或服务端目录。"
+        return 1
+    fi
+    return 0
+}
+
+confirm_existing_install_action() {
+    log_warning "An existing OneClickVirt installation was detected. Running install again can overwrite config.yaml and web assets." \
+        "检测到已有 OneClickVirt 安装。再次执行 install 可能覆盖 config.yaml 和 Web 文件。"
+
+    if [ "${noninteractive:-false}" = "true" ]; then
+        if [ "${FORCE_REINSTALL:-false}" = "true" ] && [ "${CONFIRM_REINSTALL:-}" = "REINSTALL" ]; then
+            log_warning "Forced reinstall explicitly confirmed in non-interactive mode." "非交互模式已显式确认强制重装。"
+            return 0
+        fi
+        log_warning "Non-interactive install is being converted to a safe upgrade. Set FORCE_REINSTALL=true and CONFIRM_REINSTALL=REINSTALL only for an intentional reinstall." \
+            "非交互 install 已自动转换为安全升级。仅在确需重装时同时设置 FORCE_REINSTALL=true 和 CONFIRM_REINSTALL=REINSTALL。"
+        return 2
+    fi
+
+    local switch_to_upgrade
+    reading "Switch to the safe upgrade flow instead? (Y/n): " "是否改用安全升级流程？(Y/n): " switch_to_upgrade
+    case "$switch_to_upgrade" in
+        [Nn]*) ;;
+        *) return 2 ;;
+    esac
+
+    local reinstall_confirmation
+    reading "Fresh install may overwrite existing configuration. Type REINSTALL to continue: " \
+        "全新安装可能覆盖现有配置。请输入 REINSTALL 继续：" reinstall_confirmation
+    if [ "$reinstall_confirmation" != "REINSTALL" ]; then
+        log_warning "Reinstall confirmation did not match; installation aborted." "重装确认不匹配，已中止安装。"
+        return 1
+    fi
+
+    return 0
+}
+
 reading() {
     if [ $# -eq 3 ]; then
         printf "\033[32m\033[01m%s\033[0m\n" "$1"
         printf "\033[32m\033[01m%s\033[0m" "$2"
-        read "$3"
+        read -r "$3"
     else
         printf "\033[32m\033[01m%s\033[0m" "$1"
-        read "$2"
+        read -r "$2"
     fi
 }
 
@@ -100,7 +182,8 @@ check_root() {
 }
 
 detect_arch() {
-    local arch=$(uname -m)
+    local arch
+    arch=$(uname -m)
     case $arch in
         x86_64|amd64|x64)
             echo "amd64"
@@ -129,7 +212,7 @@ detect_system() {
     elif [ -s /etc/redhat-release ]; then
         SYS="$(cat /etc/redhat-release)"
     elif [ -s /etc/issue ]; then
-        SYS="$(head -n1 /etc/issue | cut -d '\' -f1 | sed '/^[ ]*$/d')"
+        SYS="$(head -n1 /etc/issue | sed 's/\\.*//' | sed '/^[ ]*$/d')"
     else
         SYS="$(uname -s)"
     fi
@@ -222,6 +305,7 @@ check_dependencies() {
         # 如果是非交互模式，询问是否更新系统
         if [ "$noninteractive" != "true" ]; then
             log_warning "A package index update may take some time and could briefly affect network availability." "更新系统包索引可能耗时较长，并可能导致网络短暂波动。"
+            local update_confirm=""
             reading "Update package indexes before installing dependencies? (y/N): " "是否先更新系统包索引再安装依赖？(y/N): " update_confirm
             case "$update_confirm" in
                 [Yy]*)
@@ -310,6 +394,8 @@ download_file() {
     local max_retries=3
     local retry_count=0
     local total_size=0
+    local attempt_output
+    attempt_output=$(mktemp "${output}.part.XXXXXX") || return 1
 
     # Get file size from headers
     total_size=$(curl -sIkL --connect-timeout 10 "$url" 2>/dev/null | grep -i 'Content-Length' | awk '{print $2}' | tr -d '\r\n ' | grep -o '[0-9]*' | tail -1)
@@ -352,26 +438,30 @@ download_file() {
     
     while [ $retry_count -lt $max_retries ]; do
         echo ""
-        curl -L --connect-timeout 20 --max-time 600 -o "$output" "$url" 2>/dev/null &
+        rm -f -- "$attempt_output"
+        curl -fL --connect-timeout 20 --max-time 600 -o "$attempt_output" "$url" 2>/dev/null &
         local dl_pid=$!
-        _dl_progress "$output" "$total_size" "$dl_pid" &
+        _dl_progress "$attempt_output" "$total_size" "$dl_pid" &
         local mon_pid=$!
-        wait "$dl_pid" 2>/dev/null
+        local dl_rc=0
+        wait "$dl_pid" 2>/dev/null || dl_rc=$?
         wait "$mon_pid" 2>/dev/null
-        if [ -s "$output" ]; then
+        if [ "$dl_rc" -eq 0 ] && [ -s "$attempt_output" ] && mv -f -- "$attempt_output" "$output"; then
             return 0
         fi
 
-        rm -f "$output"
-        wget -T 20 -t 3 -O "$output" "$url" 2>/dev/null &
+        rm -f -- "$attempt_output"
+        wget -T 20 -t 3 -O "$attempt_output" "$url" 2>/dev/null &
         dl_pid=$!
-        _dl_progress "$output" "$total_size" "$dl_pid" &
+        _dl_progress "$attempt_output" "$total_size" "$dl_pid" &
         mon_pid=$!
-        wait "$dl_pid" 2>/dev/null
+        dl_rc=0
+        wait "$dl_pid" 2>/dev/null || dl_rc=$?
         wait "$mon_pid" 2>/dev/null
-        if [ -s "$output" ]; then
+        if [ "$dl_rc" -eq 0 ] && [ -s "$attempt_output" ] && mv -f -- "$attempt_output" "$output"; then
             return 0
         fi
+        rm -f -- "$attempt_output"
         
         retry_count=$((retry_count + 1))
         log_warning "Download failed, retrying (${retry_count}/${max_retries}): $url" "下载失败，正在重试 (${retry_count}/${max_retries}): $url"
@@ -379,31 +469,40 @@ download_file() {
     done
     
     log_error "Download failed: $url" "下载失败: $url"
+    rm -f -- "$attempt_output"
     return 1
 }
 
 create_directories() {
-    local dirs=("/opt/oneclickvirt" "/opt/oneclickvirt/server")
-    
-    # 如果自定义了Web路径，使用自定义路径，否则使用默认路径
-    if [ -n "$custom_web_path" ]; then
-        dirs+=("$custom_web_path")
-    else
-        dirs+=("/opt/oneclickvirt/web")
-    fi
+    validate_install_paths || return 1
+    local dirs=("$MANAGED_INSTALL_ROOT" "$MANAGED_SERVER_DIR" "$(managed_web_path)")
     
     for dir in "${dirs[@]}"; do
         if [ ! -d "$dir" ]; then
-            mkdir -p "$dir"
+            if ! mkdir -p "$dir"; then
+                log_error "Unable to create installation directory: $dir" "无法创建安装目录: $dir"
+                return 1
+            fi
             log_info "Creating directory: $dir" "正在创建目录: $dir"
         fi
     done
 }
 
 install_server() {
-    local arch=$(detect_arch)
+    local target_dir="${1:-$MANAGED_SERVER_DIR}"
+    local arch
+    arch=$(detect_arch)
     local filename="server-linux-${arch}.tar.gz"
     local download_url
+    local work_dir
+    validate_install_paths || return 1
+    work_dir=$(mktemp -d "${MANAGED_INSTALL_ROOT}/.server-download.XXXXXX") || return 1
+    local temp_file="${work_dir}/${filename}"
+    local extract_dir="${work_dir}/extract"
+    if ! mkdir -p "$extract_dir" "$target_dir"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
     
     if [ -n "$cdn_success_url" ]; then
         download_url="${cdn_success_url}${BASE_URL}/${filename}"
@@ -411,7 +510,6 @@ install_server() {
         download_url="${BASE_URL}/${filename}"
     fi
     
-    local temp_file="/opt/oneclickvirt/${filename}"
     log_info "Downloading server binary (${arch})..." "正在下载服务器二进制文件 (${arch})..."
     log_info "Download URL: $download_url" "下载链接: $download_url"
     
@@ -419,54 +517,67 @@ install_server() {
         log_success "Download completed: $filename" "下载完成: $filename"
     else
         log_error "Failed to download: $download_url" "下载失败: $download_url"
-        exit 1
+        rm -rf "$work_dir"
+        return 1
     fi
     
     log_info "Extracting server binary package..." "正在解压服务器二进制文件..."
-    if tar -xzf "$temp_file" -C /opt/oneclickvirt/server/; then
+    if tar -xzf "$temp_file" -C "$extract_dir"; then
         # 检查解压后的文件名并重命名
-        if [ -f "/opt/oneclickvirt/server/server-linux-${arch}" ]; then
-            mv "/opt/oneclickvirt/server/server-linux-${arch}" "/opt/oneclickvirt/server/oneclickvirt-server"
-        elif [ -f "/opt/oneclickvirt/server/oneclickvirt-server" ]; then
-            # 文件已经是正确的名称
-            :
+        local executable=""
+        if [ -f "${extract_dir}/server-linux-${arch}" ]; then
+            executable="${extract_dir}/server-linux-${arch}"
+        elif [ -f "${extract_dir}/oneclickvirt-server" ]; then
+            executable="${extract_dir}/oneclickvirt-server"
         else
-            # 寻找可执行文件
-            local executable=$(find /opt/oneclickvirt/server/ -type f -executable | head -n1)
-            if [ -n "$executable" ]; then
-                mv "$executable" "/opt/oneclickvirt/server/oneclickvirt-server"
-            else
-                log_error "No executable file was found after extraction." "解压后未找到可执行文件。"
-                exit 1
-            fi
+            executable=$(find "$extract_dir" -type f -executable | head -n1)
         fi
-        chmod 777 /opt/oneclickvirt/server/oneclickvirt-server
-        rm -f "$temp_file"
+        if [ -z "$executable" ]; then
+            log_error "No executable file was found after extraction." "解压后未找到可执行文件。"
+            rm -rf "$work_dir"
+            return 1
+        fi
+        local target_binary="${target_dir}/oneclickvirt-server"
+        local next_binary
+        next_binary=$(mktemp "${target_dir}/.oneclickvirt-server.XXXXXX") || {
+            rm -rf "$work_dir"
+            return 1
+        }
+        if ! cp "$executable" "$next_binary" || ! chmod 0755 "$next_binary" || ! mv -f "$next_binary" "$target_binary"; then
+            rm -f "$next_binary"
+            rm -rf "$work_dir"
+            return 1
+        fi
+        rm -rf "$work_dir"
         log_success "Server binary installation completed." "服务器二进制文件安装完成。"
     else
         log_error "Extraction failed." "解压失败。"
-        exit 1
+        rm -rf "$work_dir"
+        return 1
     fi
 }
 
 install_web() {
+    local web_path="${1:-$(managed_web_path)}"
     local filename="web-dist.zip"
     local download_url
+    local work_dir
+    validate_install_paths || return 1
+    if [ "$web_path" = "$MANAGED_INSTALL_ROOT" ] || [ "$web_path" = "$MANAGED_SERVER_DIR" ]; then
+        log_error "Refusing to install web assets into a managed parent directory." "拒绝将 Web 文件安装到受管父目录。"
+        return 1
+    fi
+    work_dir=$(mktemp -d "${MANAGED_INSTALL_ROOT}/.web-download.XXXXXX") || return 1
+    local temp_file="${work_dir}/${filename}"
     if [ -n "$cdn_success_url" ]; then
         download_url="${cdn_success_url}${BASE_URL}/${filename}"
     else
         download_url="${BASE_URL}/${filename}"
     fi
-    local temp_file="/opt/oneclickvirt/${filename}"
-    
-    # 确定Web安装路径
-    local web_path
-    if [ -n "$custom_web_path" ]; then
-        web_path="$custom_web_path"
-        log_info "Using custom web path: $web_path" "使用自定义 Web 路径: $web_path"
-    else
-        web_path="/opt/oneclickvirt/web"
-        log_info "Using default web path: $web_path" "使用默认 Web 路径: $web_path"
+    log_info "Using web path: $web_path" "使用 Web 路径: $web_path"
+    if ! mkdir -p "$web_path"; then
+        rm -rf "$work_dir"
+        return 1
     fi
     
     log_info "Downloading web assets..." "正在下载 Web 应用文件..."
@@ -476,40 +587,75 @@ install_web() {
         log_success "Download completed: $filename" "下载完成: $filename"
     else
         log_error "Failed to download: $download_url" "下载失败: $download_url"
-        exit 1
+        rm -rf "$work_dir"
+        return 1
     fi
     
     log_info "Extracting web assets..." "正在解压 Web 应用文件..."
     if command -v unzip &> /dev/null; then
-        if unzip -q "$temp_file" -d "$web_path/"; then
-            rm -f "$temp_file"
-            chmod 777 "$web_path/"
+        if unzip -q -o "$temp_file" -d "$web_path/"; then
+            rm -rf "$work_dir"
+            if ! chmod 0755 "$web_path/"; then
+                return 1
+            fi
             log_success "Web assets installed successfully: $web_path" "Web 应用文件安装完成: $web_path"
         else
             log_error "Extraction failed." "解压失败。"
-            exit 1
+            rm -rf "$work_dir"
+            return 1
         fi
     else
         log_error "The unzip utility is missing." "未找到 unzip 工具。"
         log_info "Installing unzip..." "正在安装 unzip..."
         if ! ${INSTALL_CMD} unzip 2>/dev/null; then
             log_error "Failed to install unzip; skipping web asset installation." "unzip 安装失败，跳过 Web 文件安装。"
+            rm -rf "$work_dir"
             return 1
         fi
-        if unzip -q "$temp_file" -d "$web_path/"; then
-            rm -f "$temp_file"
-            chmod 777 "$web_path/"
+        if unzip -q -o "$temp_file" -d "$web_path/"; then
+            rm -rf "$work_dir"
+            if ! chmod 0755 "$web_path/"; then
+                return 1
+            fi
             log_success "Web assets installed successfully: $web_path" "Web 应用文件安装完成: $web_path"
         else
             log_error "Extraction failed." "解压失败。"
-            exit 1
+            rm -rf "$work_dir"
+            return 1
         fi
     fi
 }
 
+# Keep a stable installation marker for the in-panel update capability check.
+# The files are informational and do not replace the existing upgrade script.
+write_release_metadata() {
+    local arch asset version_tmp asset_tmp
+    [ -n "${VERSION:-}" ] || return 0
+    arch=$(detect_arch)
+    asset="server-linux-${arch}.tar.gz"
+    mkdir -p "$MANAGED_INSTALL_ROOT" || return 1
+    version_tmp=$(mktemp "${MANAGED_INSTALL_ROOT}/.VERSION.XXXXXX") || return 1
+    asset_tmp=$(mktemp "${MANAGED_INSTALL_ROOT}/.SERVER_ASSET.XXXXXX") || {
+        rm -f "$version_tmp"
+        return 1
+    }
+    if ! printf '%s\n' "$VERSION" > "$version_tmp" || ! printf '%s\n' "$asset" > "$asset_tmp"; then
+        rm -f "$version_tmp" "$asset_tmp"
+        return 1
+    fi
+    chmod 0644 "$version_tmp" "$asset_tmp" || {
+        rm -f "$version_tmp" "$asset_tmp"
+        return 1
+    }
+    if ! mv -f "$version_tmp" "${MANAGED_INSTALL_ROOT}/VERSION" || ! mv -f "$asset_tmp" "${MANAGED_INSTALL_ROOT}/SERVER_ASSET"; then
+        rm -f "$version_tmp" "$asset_tmp"
+        return 1
+    fi
+}
+
 download_config() {
-    local config_url="https://raw.githubusercontent.com/oneclickvirt/oneclickvirt/refs/heads/main/server/config.yaml"
-    local config_file="/opt/oneclickvirt/server/config.yaml"
+    local config_url="https://raw.githubusercontent.com/${REPO}/${VERSION}/server/config.yaml"
+    local config_file="${MANAGED_SERVER_DIR}/config.yaml"
     local download_url
     
     if [ -n "$cdn_success_url" ]; then
@@ -521,17 +667,31 @@ download_config() {
     log_info "Downloading configuration file..." "正在下载配置文件..."
     log_info "Download URL: $download_url" "下载链接: $download_url"
     
-    if download_file "$download_url" "$config_file"; then
-        chmod 644 "$config_file"
+    validate_install_paths || return 1
+    if ! mkdir -p "$MANAGED_SERVER_DIR"; then
+        return 1
+    fi
+    local next_config
+    next_config=$(mktemp "${MANAGED_SERVER_DIR}/.config.yaml.XXXXXX") || return 1
+    if download_file "$download_url" "$next_config"; then
+        if ! chmod 0644 "$next_config"; then
+            rm -f "$next_config"
+            return 1
+        fi
+        if ! mv -f "$next_config" "$config_file"; then
+            rm -f "$next_config"
+            return 1
+        fi
         log_success "Configuration file download completed." "配置文件下载完成。"
     else
+        rm -f "$next_config"
         log_error "Failed to download configuration file: $config_url" "配置文件下载失败: $config_url"
-        exit 1
+        return 1
     fi
 }
 
 create_readme() {
-    local readme_file="/opt/oneclickvirt/server/readme.md"
+    local readme_file="${MANAGED_SERVER_DIR}/readme.md"
     
     log_info "Creating the usage guide..." "正在创建使用说明文件..."
     
@@ -544,27 +704,30 @@ create_readme() {
 架构: $(detect_arch)
 
 ## 目录结构
-- 安装目录: /opt/oneclickvirt
-- 服务器文件: /opt/oneclickvirt/server/
-- Web文件: /opt/oneclickvirt/web/
-- 配置文件: /opt/oneclickvirt/server/config.yaml
+- 安装目录: ${MANAGED_INSTALL_ROOT}
+- 服务器文件: ${MANAGED_SERVER_DIR}/
+- Web文件: $(managed_web_path)/
+- 配置文件: ${MANAGED_SERVER_DIR}/config.yaml
 
 ## 服务管理命令
-- 启动服务: systemctl start oneclickvirt
-- 停止服务: systemctl stop oneclickvirt  
-- 重启服务: systemctl restart oneclickvirt
-- 开机自启: systemctl enable oneclickvirt
-- 禁用自启: systemctl disable oneclickvirt
-- 查看状态: systemctl status oneclickvirt
-- 查看日志: journalctl -u oneclickvirt -f
-- 查看最近日志: journalctl -u oneclickvirt --since "1 hour ago"
+- 启动服务: systemctl start ${MANAGED_SERVICE_NAME}
+- 停止服务: systemctl stop ${MANAGED_SERVICE_NAME}
+- 重启服务: systemctl restart ${MANAGED_SERVICE_NAME}
+- 开机自启: systemctl enable ${MANAGED_SERVICE_NAME}
+- 禁用自启: systemctl disable ${MANAGED_SERVICE_NAME}
+- 查看状态: bash install.sh status
+- 查看日志: bash install.sh logs
+- 持续查看日志: bash install.sh logs --follow
+- 查看最近日志: journalctl -u ${MANAGED_SERVICE_NAME} --since "1 hour ago"
+- 卸载应用并保留配置和存储: bash install.sh uninstall
+- 完全删除应用目录: bash install.sh uninstall --purge
 
 ## 直接运行
-- oneclickvirt
-- /opt/oneclickvirt/server/oneclickvirt-server
+- ${MANAGED_CLI_LINK}
+- ${MANAGED_SERVER_BIN}
 
 ## 配置文件
-请根据需要修改 /opt/oneclickvirt/server/config.yaml 配置文件后启动服务
+请根据需要修改 ${MANAGED_SERVER_DIR}/config.yaml 配置文件后启动服务
 
 ## 端口说明
 请确保防火墙允许服务所需端口通过
@@ -575,9 +738,9 @@ create_readme() {
 - 如遇问题，请查看日志文件排查
 
 ## 卸载方法
-- 停止服务: systemctl stop oneclickvirt
-- 删除服务: systemctl disable oneclickvirt && rm -f /etc/systemd/system/oneclickvirt.service
-- 删除文件: rm -rf /opt/oneclickvirt /usr/local/bin/oneclickvirt
+- 停止服务: systemctl stop ${MANAGED_SERVICE_NAME}
+- 删除服务: systemctl disable ${MANAGED_SERVICE_NAME} && rm -f ${MANAGED_SERVICE_FILE}
+- 删除文件: rm -rf ${MANAGED_INSTALL_ROOT} ${MANAGED_CLI_LINK}
 - 重载systemd: systemctl daemon-reload
 EOF
 
@@ -585,10 +748,11 @@ EOF
 }
 
 create_systemd_service() {
-    local service_file="/etc/systemd/system/oneclickvirt.service"
+    local service_file="$MANAGED_SERVICE_FILE"
     
     log_info "Creating the systemd service file..." "正在创建 systemd 服务文件..."
     
+    mkdir -p "$(dirname "$service_file")" "$MANAGED_SERVER_DIR"
     cat > "$service_file" << EOF
 [Unit]
 Description=OneClickVirt Server
@@ -600,8 +764,9 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/opt/oneclickvirt/server
-ExecStart=/opt/oneclickvirt/server/oneclickvirt-server
+EnvironmentFile=-${MANAGED_ENV_FILE}
+WorkingDirectory=${MANAGED_SERVER_DIR}
+ExecStart=${MANAGED_SERVER_BIN}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=5
@@ -615,85 +780,534 @@ SyslogIdentifier=oneclickvirt
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/opt/oneclickvirt
+ReadWritePaths=${MANAGED_INSTALL_ROOT}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
+    if ! systemctl daemon-reload; then
+        log_error "Failed to reload systemd after writing the service file." "写入服务文件后重载 systemd 失败。"
+        return 1
+    fi
     log_success "systemd service file created successfully." "systemd 服务文件创建完成。"
 }
 
 create_symlink() {
-    if [ ! -L "/usr/local/bin/oneclickvirt" ]; then
-        ln -sf /opt/oneclickvirt/server/oneclickvirt-server /usr/local/bin/oneclickvirt
-        log_success "CLI symlink created: /usr/local/bin/oneclickvirt" "命令行链接已创建: /usr/local/bin/oneclickvirt"
+    if [ ! -L "$MANAGED_CLI_LINK" ]; then
+        ln -sf "$MANAGED_SERVER_BIN" "$MANAGED_CLI_LINK"
+        log_success "CLI symlink created: $MANAGED_CLI_LINK" "命令行链接已创建: $MANAGED_CLI_LINK"
     else
         log_info "CLI symlink already exists." "命令行链接已存在。"
     fi
 }
 
+find_running_server_pids() {
+    local proc pid exe cmdline
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        pid=${proc##*/}
+        exe=$(readlink "$proc/exe" 2>/dev/null || true)
+        exe=${exe% (deleted)}
+        cmdline=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
+        if [ "$exe" = "$MANAGED_SERVER_BIN" ] || [[ "$exe" == "$MANAGED_SERVER_DIR/"* ]] || [[ "$cmdline" == "$MANAGED_SERVER_DIR"/* ]]; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
+persist_runtime_environment() {
+    local pids="$1"
+    local temp_file
+    mkdir -p "$MANAGED_SERVER_DIR"
+    temp_file=$(mktemp "${MANAGED_SERVER_DIR}/.oneclickvirt-env.XXXXXX") || return 1
+    local captured=0 name value pid escaped filtered_file
+
+    if [ -f "$MANAGED_ENV_FILE" ]; then
+        cp "$MANAGED_ENV_FILE" "$temp_file" || {
+            rm -f "$temp_file"
+            return 1
+        }
+    fi
+
+    for name in DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD DB_TYPE SERVER_PORT; do
+        value=""
+        for pid in $pids; do
+            [ -r "/proc/$pid/environ" ] || continue
+            value=$(tr '\0' '\n' < "/proc/$pid/environ" | sed -n "s/^${name}=//p" | head -n1)
+            [ -n "$value" ] && break
+        done
+        if [ -z "$value" ]; then
+            value="${!name:-}"
+        fi
+        [ -n "$value" ] || continue
+        value=${value//$'\n'/}
+        escaped=${value//\\/\\\\}
+        escaped=${escaped//\"/\\\"}
+        filtered_file=$(mktemp "${MANAGED_SERVER_DIR}/.oneclickvirt-env-filtered.XXXXXX") || {
+            rm -f "$temp_file"
+            return 1
+        }
+        awk -v key="$name" 'index($0, key "=") != 1 { print }' "$temp_file" > "$filtered_file"
+        mv "$filtered_file" "$temp_file"
+        printf '%s="%s"\n' "$name" "$escaped" >> "$temp_file"
+        captured=$((captured + 1))
+    done
+
+    if [ "$captured" -gt 0 ]; then
+        chmod 0600 "$temp_file"
+        mv "$temp_file" "$MANAGED_ENV_FILE"
+        log_info "Persisted runtime deployment variables to the protected environment file." "已将运行时部署变量保存到受保护的环境文件。"
+    else
+        rm -f "$temp_file"
+    fi
+}
+
+ensure_systemd_environment_dropin() {
+    local dropin_dir="${MANAGED_SERVICE_FILE}.d"
+    mkdir -p "$dropin_dir"
+    cat > "${dropin_dir}/10-oneclickvirt-env.conf" << EOF
+[Service]
+EnvironmentFile=-${MANAGED_ENV_FILE}
+WorkingDirectory=${MANAGED_SERVER_DIR}
+ExecStart=
+ExecStart=${MANAGED_SERVER_BIN}
+EOF
+    systemctl daemon-reload
+}
+
+verify_managed_server_process() {
+    local pid exe
+    pid=$(systemctl show "$MANAGED_SERVICE_NAME" --property MainPID --value 2>/dev/null || true)
+    case "$pid" in
+        ''|0|*[!0-9]*) return 1 ;;
+    esac
+    exe=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+    exe=${exe% (deleted)}
+    [ "$exe" = "$MANAGED_SERVER_BIN" ]
+}
+
+stop_running_server_pids() {
+    local pids="$1" pid wait_round
+    local -a pid_list=()
+    [ -n "$pids" ] || return 0
+    read -r -a pid_list <<< "$pids"
+    kill "${pid_list[@]}" 2>/dev/null || true
+    for ((wait_round = 0; wait_round < 20; wait_round++)); do
+        local alive=""
+        for pid in "${pid_list[@]}"; do
+            kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+        done
+        [ -z "$alive" ] && return 0
+        sleep 1
+    done
+    for pid in "${pid_list[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+}
+
+controller_port() {
+    local port
+    port=$(sed -n '/^system:/,/^[^[:space:]]/ s/^[[:space:]]*addr:[[:space:]]*//p' "$MANAGED_SERVER_DIR/config.yaml" 2>/dev/null | head -n1 | tr -d '"' | tr -d "'")
+    case "$port" in
+        ''|*[!0-9]*) printf '8888' ;;
+        *) printf '%s' "$port" ;;
+    esac
+}
+
+wait_for_controller_endpoint() {
+    local endpoint="$1"
+    local attempts="${2:-60}"
+    local port
+    port=$(controller_port)
+    local attempt
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        if curl -fsS --max-time 3 "http://127.0.0.1:${port}${endpoint}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+verify_controller_api_contract_marker() {
+    local port response
+    port=$(controller_port)
+    response=$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/api/v1/public/build-info" 2>/dev/null || true)
+    printf '%s' "$response" | tr -d '[:space:]' | grep -Fq "\"apiContract\":\"${EXPECTED_API_CONTRACT}\""
+}
+
+verify_admin_route_contract() {
+    local port status method route
+    port=$(controller_port)
+    while IFS='|' read -r method route; do
+        status=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -X "$method" "http://127.0.0.1:${port}${route}" 2>/dev/null || true)
+        case "$status" in
+            000|404|502|'')
+                log_error "Route contract check failed: ${method} ${route} returned ${status:-no-response}." \
+                    "路由契约检查失败：${method} ${route} 返回 ${status:-无响应}。"
+                return 1
+                ;;
+        esac
+    done <<'EOF'
+POST|/api/v1/admin/providers/1/health-check-task
+GET|/api/v1/admin/providers/1/ipv6-pool?page=1&pageSize=1
+GET|/api/v1/admin/providers/1/ipv6-tunnels
+POST|/api/v1/admin/port-mappings/repair
+EOF
+}
+
 upgrade_server() {
-    if [ ! -f "/opt/oneclickvirt/server/oneclickvirt-server" ]; then
+    local legacy_binary=""
+    if [ ! -f "$MANAGED_SERVER_BIN" ]; then
+        legacy_binary=$(find "$MANAGED_SERVER_DIR" -maxdepth 1 -type f \
+            \( -name 'server-allinone-*' -o -name 'server-linux-*' \) 2>/dev/null | head -n1)
+    fi
+
+    if [ ! -f "$MANAGED_SERVER_BIN" ] && [ -z "$legacy_binary" ]; then
         log_error "No existing installation was detected; please use the install command for a fresh setup." "未检测到已安装版本，请使用 install 选项进行全新安装。"
-        exit 1
+        return 1
+    fi
+
+    if [ -n "$legacy_binary" ]; then
+        log_info "Detected a legacy full-installer binary; it will be migrated during upgrade." "检测到旧版一键安装二进制，升级时将自动迁移。"
     fi
     
     log_info "Starting upgrade to version: $VERSION" "开始升级到版本: $VERSION"
-    
-    # 检查服务是否正在运行
-    local service_was_running=false
-    if systemctl is-active --quiet oneclickvirt 2>/dev/null; then
-        log_info "Stopping the oneclickvirt service..." "正在停止 oneclickvirt 服务..."
-        systemctl stop oneclickvirt
-        service_was_running=true
-    fi
-    
-    # 升级服务器二进制文件
-    log_info "Upgrading server binary..." "正在升级服务器二进制文件..."
-    install_server
-    
-    # 升级Web文件 - 先删除旧文件，再解压新文件
-    log_info "Upgrading web assets..." "正在升级 Web 应用文件..."
-    
-    # 确定Web路径
+
     local web_path
-    if [ -n "$custom_web_path" ]; then
-        web_path="$custom_web_path"
-    else
-        web_path="/opt/oneclickvirt/web"
+    web_path=$(managed_web_path)
+    validate_install_paths || return 1
+    if ! mkdir -p "$MANAGED_INSTALL_ROOT" "$MANAGED_SERVER_DIR" "$(dirname "$web_path")"; then
+        log_error "Unable to prepare upgrade directories." "无法准备升级目录。"
+        return 1
     fi
-    
-    # 删除旧的Web文件夹内容（但保留文件夹本身）
-    if [ -d "$web_path" ]; then
-        log_info "Cleaning old web assets at: $web_path" "正在清理旧的 Web 文件: $web_path"
-        rm -rf "${web_path:?}"/*
-        log_success "Old web assets have been cleaned up." "旧 Web 文件已清理。"
+    local upgrade_dir
+    upgrade_dir=$(mktemp -d "${MANAGED_INSTALL_ROOT}/.upgrade.XXXXXX") || return 1
+    local staged_server_dir="${upgrade_dir}/server"
+    local staged_web_dir="${upgrade_dir}/web"
+    if ! mkdir -p "$staged_server_dir" "$staged_web_dir"; then
+        rm -rf "$upgrade_dir"
+        return 1
     fi
-    
-    # 安装新的Web文件
-    install_web
-    
-    # 重新启动服务
-    if [ "$service_was_running" = true ]; then
-        log_info "Restarting the oneclickvirt service..." "正在重新启动 oneclickvirt 服务..."
-        systemctl start oneclickvirt
-        sleep 2
-        if systemctl is-active --quiet oneclickvirt; then
-            log_success "Service restarted successfully." "服务已成功重启。"
+
+    log_info "Staging the new controller binary and web assets before downtime..." "正在停机前暂存新主控和 Web 文件..."
+    if ! install_server "$staged_server_dir" || ! install_web "$staged_web_dir"; then
+        rm -rf "$upgrade_dir"
+        log_error "Upgrade staging failed; the running installation was not changed." "升级暂存失败，现有运行环境未被修改。"
+        return 1
+    fi
+    if ! "$staged_server_dir/oneclickvirt-server" --version >/dev/null 2>&1; then
+        rm -rf "$upgrade_dir"
+        log_error "The staged controller binary failed the version preflight." "暂存的主控二进制未通过版本预检。"
+        return 1
+    fi
+
+    local binary_next
+    binary_next=$(mktemp "${MANAGED_SERVER_BIN}.next.XXXXXX") || {
+        rm -rf "$upgrade_dir"
+        return 1
+    }
+    if ! cp "$staged_server_dir/oneclickvirt-server" "$binary_next" || ! chmod 0755 "$binary_next"; then
+        rm -f "$binary_next"
+        rm -rf "$upgrade_dir"
+        return 1
+    fi
+
+    local web_next
+    web_next=$(mktemp -d "${web_path}.next.XXXXXX") || {
+        rm -f "$binary_next"
+        rm -rf "$upgrade_dir"
+        return 1
+    }
+    if ! cp -a "$staged_web_dir/." "$web_next/"; then
+        rm -f "$binary_next"
+        rm -rf "$web_next" "$upgrade_dir"
+        return 1
+    fi
+
+    local running_pids
+    running_pids=$(find_running_server_pids | sort -u | tr '\n' ' ')
+    persist_runtime_environment "$running_pids" || {
+        rm -f "$binary_next"
+        rm -rf "$web_next" "$upgrade_dir"
+        return 1
+    }
+
+    local pre_upgrade_healthy=false
+    if wait_for_controller_endpoint "/api/v1/health" 1; then
+        pre_upgrade_healthy=true
+    fi
+
+    local existing_binary="$MANAGED_SERVER_BIN"
+    [ -f "$existing_binary" ] || existing_binary="$legacy_binary"
+    local binary_backup="${MANAGED_SERVER_BIN}.pre-upgrade"
+    local web_backup="${web_path}.pre-upgrade"
+    rm -f "$binary_backup"
+    if [ -n "$existing_binary" ] && [ -f "$existing_binary" ]; then
+        cp -a "$existing_binary" "$binary_backup" || {
+            rm -f "$binary_next"
+            rm -rf "$web_next" "$upgrade_dir"
+            return 1
+        }
+    fi
+    rm -rf "$web_backup"
+    local service_backup="${MANAGED_SERVICE_FILE}.pre-upgrade"
+    local service_existed=false
+    local managed_dropin="${MANAGED_SERVICE_FILE}.d/10-oneclickvirt-env.conf"
+    local managed_dropin_backup="${managed_dropin}.pre-upgrade"
+    local managed_dropin_existed=false
+    rm -f "$service_backup"
+    rm -f "$managed_dropin_backup"
+    if [ -f "$MANAGED_SERVICE_FILE" ]; then
+        cp -a "$MANAGED_SERVICE_FILE" "$service_backup" || {
+            rm -f "$binary_next" "$binary_backup"
+            rm -rf "$web_next" "$upgrade_dir"
+            return 1
+        }
+        service_existed=true
+    fi
+    if [ -f "$managed_dropin" ]; then
+        cp -a "$managed_dropin" "$managed_dropin_backup" || {
+            rm -f "$binary_next" "$binary_backup" "$service_backup"
+            rm -rf "$web_next" "$upgrade_dir"
+            return 1
+        }
+        managed_dropin_existed=true
+    fi
+
+    if systemctl is-active --quiet "$MANAGED_SERVICE_NAME" 2>/dev/null; then
+        log_info "Stopping the managed oneclickvirt service..." "正在停止受管的 oneclickvirt 服务..."
+        systemctl stop "$MANAGED_SERVICE_NAME" || true
+    fi
+    stop_running_server_pids "$running_pids"
+
+    local switch_failed=false
+    local web_original_moved=false
+    local web_replaced=false
+    if ! mv -f "$binary_next" "$MANAGED_SERVER_BIN"; then
+        switch_failed=true
+    fi
+    if [ "$switch_failed" = false ]; then
+        if [ -d "$web_path" ]; then
+            if mv "$web_path" "$web_backup"; then
+                web_original_moved=true
+            else
+                switch_failed=true
+            fi
+        fi
+        if [ "$switch_failed" = false ] && mv "$web_next" "$web_path"; then
+            web_replaced=true
         else
-            log_error "Service failed to start; check logs with: journalctl -u oneclickvirt -n 50" "服务启动失败，请检查日志: journalctl -u oneclickvirt -n 50"
+            switch_failed=true
         fi
     fi
-    
+
+    if [ "$switch_failed" = false ]; then
+        if [ "$service_existed" = true ]; then
+            ensure_systemd_environment_dropin || switch_failed=true
+        else
+            create_systemd_service || switch_failed=true
+        fi
+    fi
+
+    if [ "$switch_failed" = false ]; then
+        systemctl enable "$MANAGED_SERVICE_NAME" >/dev/null 2>&1 || switch_failed=true
+    fi
+    if [ "$switch_failed" = false ]; then
+        systemctl start "$MANAGED_SERVICE_NAME" || switch_failed=true
+    fi
+
+    if [ "$switch_failed" = false ] && ! wait_for_controller_endpoint "/api/v1/public/build-info" 60; then
+        switch_failed=true
+    fi
+    if [ "$switch_failed" = false ] && ! verify_controller_api_contract_marker; then
+        log_error "The staged controller does not expose the expected API contract: ${EXPECTED_API_CONTRACT}." "暂存主控未提供预期 API 契约：${EXPECTED_API_CONTRACT}。"
+        switch_failed=true
+    fi
+    if [ "$switch_failed" = false ] && ! verify_managed_server_process; then
+        log_error "The service started, but systemd is not running the staged controller binary." "服务虽已启动，但 systemd 实际运行的不是本次暂存的主控二进制。"
+        switch_failed=true
+    fi
+    if [ "$switch_failed" = false ] && [ "$pre_upgrade_healthy" = true ] && ! wait_for_controller_endpoint "/api/v1/health" 60; then
+        switch_failed=true
+    fi
+    if [ "$switch_failed" = false ] && ! verify_admin_route_contract; then
+        switch_failed=true
+    fi
+
+    if [ "$switch_failed" = true ]; then
+        log_error "Upgrade verification failed; rolling back controller and web assets." "升级验证失败，正在回滚主控和 Web 文件。"
+        systemctl stop "$MANAGED_SERVICE_NAME" >/dev/null 2>&1 || true
+        if [ -f "$binary_backup" ]; then
+            local rollback_binary
+            rollback_binary=$(mktemp "${MANAGED_SERVER_BIN}.rollback.XXXXXX") || true
+            if [ -n "$rollback_binary" ]; then
+                cp -a "$binary_backup" "$rollback_binary" && chmod 0755 "$rollback_binary" && mv -f "$rollback_binary" "$MANAGED_SERVER_BIN"
+                rm -f "$rollback_binary"
+            fi
+        fi
+        if [ "$web_replaced" = true ]; then
+            rm -rf "$web_path"
+        fi
+        if [ "$web_original_moved" = true ] && [ -d "$web_backup" ]; then
+            mv "$web_backup" "$web_path"
+        fi
+        if [ "$service_existed" = true ] && [ -f "$service_backup" ]; then
+            cp -a "$service_backup" "$MANAGED_SERVICE_FILE"
+            if [ "$managed_dropin_existed" = true ] && [ -f "$managed_dropin_backup" ]; then
+                mkdir -p "$(dirname "$managed_dropin")"
+                cp -a "$managed_dropin_backup" "$managed_dropin"
+            else
+                rm -f "$managed_dropin"
+            fi
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        systemctl start "$MANAGED_SERVICE_NAME" >/dev/null 2>&1 || true
+        wait_for_controller_endpoint "/api/v1/public/build-info" 30 || true
+        rm -f "$binary_next" "$binary_backup" "$service_backup" "$managed_dropin_backup"
+        rm -rf "$web_next" "$web_backup" "$upgrade_dir"
+        return 1
+    fi
+
+    if [ -n "$legacy_binary" ] && [ "$legacy_binary" != "$MANAGED_SERVER_BIN" ]; then
+        rm -f "$legacy_binary"
+    fi
+    rm -f "$binary_backup" "$service_backup" "$managed_dropin_backup"
+    rm -rf "$web_backup" "$upgrade_dir"
+    if ! write_release_metadata; then
+        log_warning "Upgrade completed, but the local release metadata could not be recorded." "升级已完成，但无法记录本地发布元数据。"
+    fi
+
     log_success "Upgrade completed successfully." "升级完成！"
     log_info "Version: $VERSION" "版本: $VERSION"
-    log_info "Configuration file kept unchanged: /opt/oneclickvirt/server/config.yaml" "配置文件保持不变: /opt/oneclickvirt/server/config.yaml"
+    log_info "Configuration file kept unchanged: ${MANAGED_SERVER_DIR}/config.yaml" "配置文件保持不变: ${MANAGED_SERVER_DIR}/config.yaml"
     log_info "Web path: $web_path" "Web 路径: $web_path"
-    if [ "$service_was_running" = false ]; then
-        log_warning "The service was not auto-started; start it manually with: systemctl start oneclickvirt" "服务未自动启动，请手动执行: systemctl start oneclickvirt"
+}
+
+show_service_status() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_error "systemctl is required to inspect this installation." "查看此安装的状态需要 systemctl。"
+        return 1
     fi
+
+    systemctl status "$MANAGED_SERVICE_NAME" --no-pager
+}
+
+show_service_logs() {
+    local lines=100
+    local follow=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow)
+                follow=true
+                shift
+                ;;
+            -n|--lines)
+                if [ $# -lt 2 ] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    log_error "--lines requires a non-negative integer." "--lines 需要一个非负整数。"
+                    return 1
+                fi
+                lines="$2"
+                shift 2
+                ;;
+            *)
+                log_error "Unknown logs option: $1" "未知的日志选项: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    if ! command -v journalctl >/dev/null 2>&1; then
+        log_error "journalctl is required to inspect this installation's logs." "查看此安装的日志需要 journalctl。"
+        return 1
+    fi
+
+    if [ "$follow" = true ]; then
+        journalctl -u "$MANAGED_SERVICE_NAME" -n "$lines" -f
+    else
+        journalctl -u "$MANAGED_SERVICE_NAME" -n "$lines" --no-pager
+    fi
+}
+
+uninstall_server() {
+    local assume_yes=false
+    local purge=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes)
+                assume_yes=true
+                shift
+                ;;
+            --purge)
+                purge=true
+                shift
+                ;;
+            *)
+                log_error "Unknown uninstall option: $1" "未知的卸载选项: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    case "$MANAGED_INSTALL_ROOT" in
+        ""|/)
+            log_error "Refusing to uninstall from an unsafe installation root: '$MANAGED_INSTALL_ROOT'." "拒绝从不安全的安装根目录卸载: '$MANAGED_INSTALL_ROOT'。"
+            return 1
+            ;;
+    esac
+    validate_install_paths || return 1
+
+    if [ "$assume_yes" != true ]; then
+        if [ "${noninteractive:-false}" = "true" ]; then
+            log_error "Non-interactive uninstall requires --yes." "无交互卸载必须指定 --yes。"
+            return 1
+        fi
+
+        local prompt="Remove the OneClickVirt application"
+        [ "$purge" = true ] && prompt="$prompt and all files under $MANAGED_INSTALL_ROOT"
+        printf "%s? [y/N]: " "$prompt"
+        local confirmation
+        read -r confirmation
+        case "$confirmation" in
+            [Yy]|[Yy][Ee][Ss]) ;;
+            *)
+                log_info "Uninstall cancelled." "已取消卸载。"
+                return 0
+                ;;
+        esac
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "$MANAGED_SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    rm -f "$MANAGED_SERVICE_FILE" "$MANAGED_CLI_LINK"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed "$MANAGED_SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+
+    if [ "$purge" = true ]; then
+        rm -rf "$MANAGED_INSTALL_ROOT"
+        log_success "OneClickVirt and its application directory were removed." "OneClickVirt 及其应用目录已删除。"
+    else
+        rm -f \
+            "$MANAGED_INSTALL_ROOT/server/oneclickvirt-server" \
+            "$MANAGED_INSTALL_ROOT/server/readme.md"
+        find "$MANAGED_INSTALL_ROOT/server" -maxdepth 1 -type f \
+            \( -name 'server-allinone-*' -o -name 'server-linux-*' \) -delete 2>/dev/null || true
+        rm -rf "$MANAGED_INSTALL_ROOT/web"
+        log_success "OneClickVirt was uninstalled; configuration and storage were preserved under $MANAGED_INSTALL_ROOT/server/." \
+            "OneClickVirt 已卸载；配置和存储仍保留在 $MANAGED_INSTALL_ROOT/server/ 下。"
+    fi
+
+    if [ -n "${WEB_PATH:-}" ] && [ "${WEB_PATH}" != "$MANAGED_INSTALL_ROOT/web" ]; then
+        log_warning "The custom web path was not removed: ${WEB_PATH}" "自定义 Web 路径未删除: ${WEB_PATH}"
+    fi
+    log_warning "Database, reverse-proxy, and TLS resources were not removed because they may be shared." \
+        "数据库、反向代理和 TLS 资源可能被共用，因此未被删除。"
 }
 
 check_system_resources() {
@@ -737,6 +1351,7 @@ check_system_resources() {
             exit 1
         fi
 
+        local confirm=""
         reading "Continue anyway? (y/N): " "是否继续安装？(y/N): " confirm
         case "$confirm" in
             [Yy]*)
@@ -759,17 +1374,17 @@ show_info() {
     log_info "  Version:       $VERSION" "  版本:         $VERSION"
     log_info "  System:        $SYSTEM" "  系统:         $SYSTEM"
     log_info "  Architecture:  $(detect_arch)" "  架构:         $(detect_arch)"
-    log_info "  Install path:  /opt/oneclickvirt" "  安装路径:     /opt/oneclickvirt"
+    log_info "  Install path:  $MANAGED_INSTALL_ROOT" "  安装路径:     $MANAGED_INSTALL_ROOT"
     if [ -n "$custom_web_path" ]; then
         log_info "  Web path:      $custom_web_path (custom)" "  Web 路径:     $custom_web_path (自定义)"
     else
-        log_info "  Web path:      /opt/oneclickvirt/web (default)" "  Web 路径:     /opt/oneclickvirt/web (默认)"
+        log_info "  Web path:      $(managed_web_path) (default)" "  Web 路径:     $(managed_web_path) (默认)"
     fi
     echo ""
     log_info "Quick usage:" "使用方法："
-    log_info "  Start:         systemctl start oneclickvirt" "  启动:         systemctl start oneclickvirt"
-    log_info "  Status:        systemctl status oneclickvirt" "  状态:         systemctl status oneclickvirt"
-    log_info "  Logs:          journalctl -u oneclickvirt -f" "  日志:         journalctl -u oneclickvirt -f"
+    log_info "  Start:         systemctl start $MANAGED_SERVICE_NAME" "  启动:         systemctl start $MANAGED_SERVICE_NAME"
+    log_info "  Status:        systemctl status $MANAGED_SERVICE_NAME" "  状态:         systemctl status $MANAGED_SERVICE_NAME"
+    log_info "  Logs:          journalctl -u $MANAGED_SERVICE_NAME -f" "  日志:         journalctl -u $MANAGED_SERVICE_NAME -f"
     echo ""
     echo -e "${YELLOW}  IMPORTANT — First-Run Setup / 重要 — 首次运行设置:${NC}"
     echo -e "  - Default admin account (if auto-initialized by install_full.sh):"
@@ -778,9 +1393,9 @@ show_info() {
     echo -e "    Password / 密码:    Admin123!@#"
     echo -e "  - CHANGE THE PASSWORD after first login! / 首次登录后请修改密码！"
     echo -e "  - Start the service, then visit the web UI to begin. / 启动服务后访问 Web 界面开始使用。"
-    echo -e "  - Guide / 使用说明: /opt/oneclickvirt/server/readme.md"
+    echo -e "  - Guide / 使用说明: ${MANAGED_SERVER_DIR}/readme.md"
     echo ""
-    log_warning "Review config before starting: /opt/oneclickvirt/server/config.yaml" "启动前请检查配置文件: /opt/oneclickvirt/server/config.yaml"
+    log_warning "Review config before starting: ${MANAGED_SERVER_DIR}/config.yaml" "启动前请检查配置文件: ${MANAGED_SERVER_DIR}/config.yaml"
 }
 
 env_check() {
@@ -814,6 +1429,12 @@ Commands:
     env         仅检查和准备环境
     upgrade     Upgrade an existing installation
     upgrade     升级已安装版本
+    status      Show service status
+    status      查看服务状态
+    logs        Show service logs (supports --lines N and --follow)
+    logs        查看服务日志（支持 --lines N 和 --follow）
+    uninstall   Remove the application (supports --yes and --purge)
+    uninstall   卸载应用（支持 --yes 和 --purge）
     help        Show this help message
     help        显示此帮助信息
 
@@ -824,11 +1445,18 @@ Environment variables:
     FORCE_INSTALL=true          Skip resource checks (disk & memory) / 跳过资源检查
     WEB_PATH=/path              Custom web install path / 自定义 Web 安装路径
     INSTALL_VERSION=v1.0.0      Install a specific version / 指定安装版本
+    FORCE_REINSTALL=true        Allow reinstall over an existing install / 允许覆盖已有安装
+    CONFIRM_REINSTALL=REINSTALL Required with FORCE_REINSTALL in non-interactive mode / 非交互强制重装确认
 
 Examples / 示例:
     bash install.sh                                      # Install latest / 安装最新版
     bash install.sh env                                  # Environment check / 环境检查
     bash install.sh upgrade                              # Upgrade / 升级
+    bash install.sh status                               # Service status / 服务状态
+    bash install.sh logs --lines 200                     # Recent logs / 最近日志
+    bash install.sh logs --follow                        # Follow logs / 持续查看日志
+    bash install.sh uninstall                            # Keep config and storage / 保留配置和存储
+    bash install.sh uninstall --purge                    # Remove application data / 删除应用数据
     CN=true bash install.sh                              # Use CN mirrors / 使用中国镜像
     noninteractive=true bash install.sh                  # Non-interactive / 非交互
     FORCE_INSTALL=true bash install.sh                   # Skip resource check / 跳过资源检查
@@ -841,6 +1469,7 @@ EOF
 main() {
     # 从环境变量读取自定义Web路径
     custom_web_path="${WEB_PATH:-}"
+    validate_install_paths || return 1
     
     case "${1:-install}" in
         "env")
@@ -849,9 +1478,31 @@ main() {
             ;;
         "install")
             check_root
+            reinstalling=false
+            if existing_install_detected; then
+                if confirm_existing_install_action; then
+                    install_action=0
+                else
+                    install_action=$?
+                fi
+                case "$install_action" in
+                    2)
+                        env_check
+                        upgrade_server
+                        return $?
+                        ;;
+                    1)
+                        return 1
+                        ;;
+                    0)
+                        reinstalling=true
+                        ;;
+                esac
+            fi
             env_check
             # 处理自定义Web路径（仅在 install 模式下询问）
             if [ "$noninteractive" != "true" ] && [ -z "$custom_web_path" ]; then
+                use_custom=""
                 reading "Use a custom web path? (y/N): " "是否使用自定义 Web 路径？(y/N): " use_custom
                 case "$use_custom" in
                     [Yy]*)
@@ -869,13 +1520,23 @@ main() {
             elif [ -n "$custom_web_path" ]; then
                 log_info "Detected WEB_PATH from environment: $custom_web_path" "检测到环境变量 WEB_PATH: $custom_web_path"
             fi
-            create_directories
-            install_server
-            install_web
-            download_config
-            create_readme
-            create_systemd_service
-            create_symlink
+            validate_install_paths || return 1
+            create_directories || return 1
+            running_pids=$(find_running_server_pids | sort -u | tr '\n' ' ')
+            persist_runtime_environment "$running_pids" || return 1
+            if [ "$reinstalling" = true ]; then
+                systemctl stop "$MANAGED_SERVICE_NAME" >/dev/null 2>&1 || true
+                stop_running_server_pids "$running_pids"
+            fi
+            install_server || return 1
+            install_web || return 1
+            download_config || return 1
+            create_readme || return 1
+            create_systemd_service || return 1
+            create_symlink || return 1
+            if ! write_release_metadata; then
+                log_warning "Installation completed, but the local release metadata could not be recorded." "安装已完成，但无法记录本地发布元数据。"
+            fi
             show_info
             ;;
         "upgrade")
@@ -884,6 +1545,7 @@ main() {
             # Handle custom web path (interactive prompt, skipped if non-interactive or WEB_PATH env is set)
             # 处理自定义Web路径（交互式询问，非交互模式或已设置 WEB_PATH 环境变量时跳过）
             if [ "$noninteractive" != "true" ] && [ -z "$custom_web_path" ]; then
+                use_custom=""
                 reading "Use a custom web path? (y/N): " "是否使用自定义 Web 路径？(y/N): " use_custom
                 case "$use_custom" in
                     [Yy]*)
@@ -902,6 +1564,18 @@ main() {
                 log_info "Detected WEB_PATH from environment: $custom_web_path" "检测到环境变量 WEB_PATH: $custom_web_path"
             fi
             upgrade_server
+            ;;
+        "status")
+            show_service_status
+            ;;
+        "logs")
+            shift
+            show_service_logs "$@"
+            ;;
+        "uninstall"|"remove")
+            check_root
+            shift
+            uninstall_server "$@"
             ;;
         "help"|"-h"|"--help")
             show_help

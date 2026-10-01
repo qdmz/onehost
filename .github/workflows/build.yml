@@ -2,6 +2,12 @@ name: Build and Release oneclickvirt
 
 on:
   workflow_dispatch:
+  # A deliberately named tag is the non-interactive release trigger used by
+  # maintainers without a browser session. Ordinary tags do not start a
+  # release, so an accidental version tag cannot publish a second artifact.
+  push:
+    tags:
+      - 'release-trigger-*'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -42,7 +48,7 @@ jobs:
     - name: Build monitoring agent (AMD64)
       working-directory: ./server/agent
       run: |
-        cargo build --release --target x86_64-unknown-linux-musl
+        cargo build --locked --release --target x86_64-unknown-linux-musl
         cp target/x86_64-unknown-linux-musl/release/oneclickvirt-agent oneclickvirt-agent-linux-amd64
 
     - name: Upload AMD64 agent artifact
@@ -82,7 +88,7 @@ jobs:
     - name: Build monitoring agent (ARM64)
       working-directory: ./server/agent
       run: |
-        cargo build --release --target aarch64-unknown-linux-musl
+        cargo build --locked --release --target aarch64-unknown-linux-musl
         cp target/aarch64-unknown-linux-musl/release/oneclickvirt-agent oneclickvirt-agent-linux-arm64
 
     - name: Upload ARM64 agent artifact
@@ -174,8 +180,11 @@ jobs:
       run: |
         TAG_NAME="v${{ steps.date.outputs.date }}"
         sed -i "s/const ServerVersion = \".*\"/const ServerVersion = \"${TAG_NAME}\"/" server/constant/version.go
-        sed -i "s/const CompatibleAgentVersion = \".*\"/const CompatibleAgentVersion = \"${TAG_NAME}\"/" server/constant/version.go
-        echo "Updated version constants to: ${TAG_NAME}"
+        AGENT_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' server/agent/Cargo.toml | head -1)
+        MIN_AGENT_VERSION=$(sed -n 's/^const CompatibleAgentVersion = "\([^"]*\)"/\1/p' server/constant/version.go)
+        test -n "${AGENT_VERSION}"
+        test "${AGENT_VERSION}" = "${MIN_AGENT_VERSION}"
+        echo "Updated controller release tag to: ${TAG_NAME}; minimum Agent API version: ${MIN_AGENT_VERSION}"
         cat server/constant/version.go
 
     - name: Cache npm dependencies
@@ -207,7 +216,7 @@ jobs:
         BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         BUILD_SIGNATURE="official-github-actions"
         export LDFLAGS="-s -w -extldflags '-static' -X oneclickvirt/constant.BuildCommit=${BUILD_COMMIT} -X oneclickvirt/constant.BuildTime=${BUILD_TIME} -X oneclickvirt/constant.BuildSignature=${BUILD_SIGNATURE}"
-        
+
         # Linux AMD64
         GOOS=linux GOARCH=amd64 go build -ldflags="$LDFLAGS" -o ../build/server-linux-amd64 .
         
@@ -271,6 +280,21 @@ jobs:
         rm server-linux-amd64 server-linux-arm64 server-windows-amd64.exe server-windows-arm64.exe
         rm server-allinone-linux-amd64 server-allinone-linux-arm64 server-allinone-windows-amd64.exe server-allinone-windows-arm64.exe
         rm oneclickvirt-agent-linux-amd64 oneclickvirt-agent-linux-arm64
+
+        # The panel updater verifies its selected release assets against this
+        # manifest before extracting or replacing any local files.
+        sha256sum \
+          server-linux-amd64.tar.gz \
+          server-linux-arm64.tar.gz \
+          server-windows-amd64.zip \
+          server-windows-arm64.zip \
+          server-allinone-linux-amd64.tar.gz \
+          server-allinone-linux-arm64.tar.gz \
+          server-allinone-windows-amd64.zip \
+          server-allinone-windows-arm64.zip \
+          oneclickvirt-agent-linux-amd64.tar.gz \
+          oneclickvirt-agent-linux-arm64.tar.gz \
+          web-dist.zip > SHA256SUMS
         
         ls -lh
 
@@ -306,7 +330,10 @@ jobs:
         
         ### 监控代理（部署到 Provider 节点）
         - \`oneclickvirt-agent-linux-amd64.tar.gz\` - 监控代理 Linux AMD64 版本
-        - \`oneclickvirt-agent-linux-arm64.tar.gz\` - 监控代理 Linux ARM64 版本"
+        - \`oneclickvirt-agent-linux-arm64.tar.gz\` - 监控代理 Linux ARM64 版本
+
+        ### 校验文件
+        - \`SHA256SUMS\` - Release 资产 SHA-256 校验清单"
         
         # Create release with auto-generated notes
         if [ -n "$PREVIOUS_TAG" ]; then
@@ -325,7 +352,8 @@ jobs:
             ./build/server-allinone-windows-arm64.zip \
             ./build/oneclickvirt-agent-linux-amd64.tar.gz \
             ./build/oneclickvirt-agent-linux-arm64.tar.gz \
-            ./build/web-dist.zip
+            ./build/web-dist.zip \
+            ./build/SHA256SUMS
         else
           gh release create "$TAG_NAME" \
             --title "Release $TAG_NAME" \
@@ -341,5 +369,6 @@ jobs:
             ./build/server-allinone-windows-arm64.zip \
             ./build/oneclickvirt-agent-linux-amd64.tar.gz \
             ./build/oneclickvirt-agent-linux-arm64.tar.gz \
-            ./build/web-dist.zip
+            ./build/web-dist.zip \
+            ./build/SHA256SUMS
         fi

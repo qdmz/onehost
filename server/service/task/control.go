@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+
+	"oneclickvirt/constant"
 	"oneclickvirt/global"
 	adminModel "oneclickvirt/model/admin"
 	providerModel "oneclickvirt/model/provider"
 	"oneclickvirt/service/resources"
 	"oneclickvirt/utils"
-	"time"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -27,6 +29,13 @@ func (s *TaskService) CompleteTask(taskID uint, success bool, errorMessage strin
 	updates := map[string]interface{}{
 		"status":       status,
 		"completed_at": &now,
+	}
+	// A terminal successful task is complete even when the last optional
+	// post-processing step reported 90/98%.  Leaving that value behind makes
+	// the UI show a finished task as permanently in progress and causes polling
+	// clients to wait forever.  Failed tasks keep their last diagnostic progress.
+	if success {
+		updates["progress"] = 100
 	}
 	if !success && errorMessage != "" {
 		updates["error_message"] = errorMessage
@@ -340,6 +349,31 @@ func (s *TaskService) handleCancelledTaskCleanup(taskID uint) {
 		zap.String("taskType", task.TaskType),
 		zap.Bool("wasRunning", task.StartedAt != nil))
 
+	// A create task can already have an instance row when it is cancelled.
+	// Leaving that row in `creating` permanently blocks deletion and quota
+	// recovery. Keep the resource accounting until the normal delete task runs,
+	// but move only the still-owned provisioning row to `error`; a late provider
+	// completion must not overwrite a terminal state or make the instance appear
+	// successfully created.
+	if isCreateTaskType(task.TaskType) && task.InstanceID != nil {
+		result := global.APP_DB.Model(&providerModel.Instance{}).
+			Where("id = ? AND status = ?", *task.InstanceID, constant.InstanceStatusCreating).
+			Updates(map[string]interface{}{
+				"status":        constant.InstanceStatusError,
+				"desired_state": providerModel.InstanceDesiredStateStopped,
+			})
+		if result.Error != nil {
+			global.APP_LOG.Warn("恢复被取消创建实例状态失败",
+				zap.Uint("taskId", taskID),
+				zap.Uint("instanceId", *task.InstanceID),
+				zap.Error(result.Error))
+		} else if result.RowsAffected > 0 {
+			global.APP_LOG.Info("已将被取消创建实例标记为error，等待正常删除回收远端资源",
+				zap.Uint("taskId", taskID),
+				zap.Uint("instanceId", *task.InstanceID))
+		}
+	}
+
 	// 处理删除任务的清理
 	if task.TaskType == "delete" && task.InstanceID != nil {
 		global.APP_LOG.Debug("开始清理被取消的删除任务的资源",
@@ -434,34 +468,22 @@ func (s *TaskService) handleCancelledTaskCleanup(taskID uint) {
 		}
 
 		// 根据任务类型和当前状态恢复实例状态
-		shouldRevert := false
-		var originalStatus string
-
-		switch task.TaskType {
-		case "start":
-			if instance.Status == "starting" {
-				originalStatus = "stopped"
-				shouldRevert = true
-			}
-		case "stop":
-			if instance.Status == "stopping" {
-				originalStatus = "running"
-				shouldRevert = true
-			}
-		case "restart":
-			if instance.Status == "restarting" {
-				originalStatus = "running"
-				shouldRevert = true
-			}
-		}
+		originalStatus, restoredDesiredState, ok := cancelledOperationRestore(task)
+		shouldRevert := ok && instance.Status == cancelledOperationTransitionStatus(task.TaskType)
 
 		if shouldRevert {
-			if err := global.APP_DB.Model(&instance).Update("status", originalStatus).Error; err != nil {
+			result := global.APP_DB.Model(&providerModel.Instance{}).
+				Where("id = ? AND status = ?", instance.ID, cancelledOperationTransitionStatus(task.TaskType)).
+				Updates(map[string]interface{}{
+					"status":        originalStatus,
+					"desired_state": restoredDesiredState,
+				})
+			if result.Error != nil {
 				global.APP_LOG.Error("恢复实例状态失败",
 					zap.Uint("instanceId", instance.ID),
 					zap.String("taskType", task.TaskType),
 					zap.String("newStatus", originalStatus),
-					zap.Error(err))
+					zap.Error(result.Error))
 			} else {
 				global.APP_LOG.Debug("已恢复被取消任务的实例状态",
 					zap.Uint("instanceId", instance.ID),
@@ -469,6 +491,69 @@ func (s *TaskService) handleCancelledTaskCleanup(taskID uint) {
 					zap.String("status", originalStatus))
 			}
 		}
+	}
+}
+
+func isCreateTaskType(taskType string) bool {
+	switch taskType {
+	case "create", "create_instance", "create_redemption_instance":
+		return true
+	default:
+		return false
+	}
+}
+
+// cancelledOperationRestore returns the controller state that corresponds to
+// an explicitly cancelled lifecycle operation. Internal start tasks are
+// different from user starts: they are queued to restore a previously running
+// instance, so cancellation must keep desired_state=running for a later retry.
+func cancelledOperationRestore(task adminModel.Task) (status, desiredState string, ok bool) {
+	switch task.TaskType {
+	case "start":
+		if cancelledStartPreservesRunningIntent(task) {
+			return "stopped", providerModel.InstanceDesiredStateRunning, true
+		}
+		return "stopped", providerModel.InstanceDesiredStateStopped, true
+	case "stop", "restart":
+		return "running", providerModel.InstanceDesiredStateRunning, true
+	default:
+		return "", "", false
+	}
+}
+
+// cancelledStartPreservesRunningIntent identifies system-generated start
+// tasks without adding another database read to cancellation cleanup. The
+// explicit task-data marker is used for newly queued tasks; the exact legacy
+// status messages keep already persisted traffic/check-in tasks compatible.
+func cancelledStartPreservesRunningIntent(task adminModel.Task) bool {
+	var taskData struct {
+		Recovery     bool   `json:"recovery"`
+		DesiredState string `json:"desiredState"`
+	}
+	if err := json.Unmarshal([]byte(task.TaskData), &taskData); err == nil {
+		if taskData.Recovery || taskData.DesiredState == providerModel.InstanceDesiredStateRunning {
+			return true
+		}
+	}
+
+	switch task.StatusMessage {
+	case "流量限制已解除，自动恢复因流量策略停机的实例", "签到续期后自动启动实例":
+		return true
+	default:
+		return false
+	}
+}
+
+func cancelledOperationTransitionStatus(taskType string) string {
+	switch taskType {
+	case "start":
+		return "starting"
+	case "stop":
+		return "stopping"
+	case "restart":
+		return "restarting"
+	default:
+		return ""
 	}
 }
 

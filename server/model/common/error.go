@@ -12,17 +12,18 @@ import (
 
 // 统一错误码 — 直接使用 HTTP 状态码，不再使用自定义错误码
 const (
-	CodeSuccess         = http.StatusOK                    // 200
-	CodeBadRequest      = http.StatusBadRequest            // 400
-	CodeUnauthorized    = http.StatusUnauthorized          // 401
-	CodeForbidden       = http.StatusForbidden             // 403
-	CodeNotFound        = http.StatusNotFound              // 404
-	CodeConflict        = http.StatusConflict              // 409
-	CodeTooLarge        = http.StatusRequestEntityTooLarge // 413
-	CodeTooManyRequests = http.StatusTooManyRequests       // 429
-	CodeInternalError   = http.StatusInternalServerError   // 500
-	CodeBadGateway      = http.StatusBadGateway            // 502
-	CodeUnavailable     = http.StatusServiceUnavailable    // 503
+	CodeSuccess          = http.StatusOK                    // 200
+	CodeBadRequest       = http.StatusBadRequest            // 400
+	CodeUnauthorized     = http.StatusUnauthorized          // 401
+	CodeForbidden        = http.StatusForbidden             // 403
+	CodeNotFound         = http.StatusNotFound              // 404
+	CodeConflict         = http.StatusConflict              // 409
+	CodeTooLarge         = http.StatusRequestEntityTooLarge // 413
+	CodeFailedDependency = http.StatusFailedDependency      // 424
+	CodeTooManyRequests  = http.StatusTooManyRequests       // 429
+	CodeInternalError    = http.StatusInternalServerError   // 500
+	CodeBadGateway       = http.StatusBadGateway            // 502
+	CodeUnavailable      = http.StatusServiceUnavailable    // 503
 
 	// 向后兼容别名 — 所有旧常量映射到对应的 HTTP 状态码
 	CodeError                   = CodeBadRequest    // was 1000
@@ -58,17 +59,18 @@ const (
 
 // 错误信息映射
 var ErrorMessages = map[int]string{
-	CodeSuccess:         "操作成功",
-	CodeBadRequest:      "数据验证失败",
-	CodeUnauthorized:    "未授权访问",
-	CodeForbidden:       "禁止访问",
-	CodeNotFound:        "资源不存在",
-	CodeConflict:        "资源冲突",
-	CodeTooLarge:        "请求数据过大",
-	CodeTooManyRequests: "请求过于频繁，请稍后重试",
-	CodeInternalError:   "系统内部错误",
-	CodeBadGateway:      "外部API调用失败",
-	CodeUnavailable:     "服务暂时不可用",
+	CodeSuccess:          "操作成功",
+	CodeBadRequest:       "数据验证失败",
+	CodeUnauthorized:     "未授权访问",
+	CodeForbidden:        "禁止访问",
+	CodeNotFound:         "资源不存在",
+	CodeConflict:         "资源冲突",
+	CodeTooLarge:         "请求数据过大",
+	CodeFailedDependency: "下游依赖操作失败",
+	CodeTooManyRequests:  "请求过于频繁，请稍后重试",
+	CodeInternalError:    "系统内部错误",
+	CodeBadGateway:       "外部API调用失败",
+	CodeUnavailable:      "服务暂时不可用",
 }
 
 // AppError 统一错误结构
@@ -145,7 +147,8 @@ func ClassifyError(err error) *AppError {
 		strings.Contains(msg, "已被绑定") || strings.Contains(msg, "已通过") ||
 		strings.Contains(msg, "正在进行") || strings.Contains(msg, "正在创建") ||
 		strings.Contains(msg, "正在删除") || strings.Contains(msg, "正在操作") ||
-		strings.Contains(msg, "操作进行中") ||
+		strings.Contains(msg, "操作进行中") || strings.Contains(msg, "资源不足") ||
+		strings.Contains(msg, "配额不足") || strings.Contains(msg, "数量已达上限") ||
 		strings.Contains(lower, "already exists") || strings.Contains(lower, "duplicate") ||
 		strings.Contains(lower, "conflict") {
 		return NewError(CodeConflict, msg)
@@ -175,6 +178,7 @@ func ClassifyError(err error) *AppError {
 		strings.Contains(msg, "不满足") || strings.Contains(msg, "密码") ||
 		strings.Contains(msg, "不允许") || strings.Contains(msg, "不能") ||
 		strings.Contains(msg, "已被使用") ||
+		strings.Contains(msg, "所选镜像不可用") || strings.Contains(msg, "镜像不可用") ||
 		strings.Contains(lower, "invalid") || strings.Contains(lower, "required") ||
 		strings.Contains(lower, "validation") || strings.Contains(lower, "too long") ||
 		strings.Contains(lower, "exceeded") || strings.Contains(lower, "frozen") ||

@@ -22,7 +22,7 @@
       @perform-action="performAction"
       @reset-password="showResetPasswordDialog"
       @open-ssh="openSSHTerminal"
-      @open-vnc="showVNCDialog = true"
+      @open-vnc="openConsole('')"
       @view-task="viewTaskDetail"
       @create-share="createShareLink"
     />
@@ -109,10 +109,12 @@
     />
 
     <VNCDialog
-      v-if="!isShareMode"
       v-model="showVNCDialog"
       :instance-id="currentInstanceId"
       :instance-name="instance.name"
+      :initial-protocol="selectedConsoleProtocol"
+      :scope="isShareMode ? 'share' : 'user'"
+      :share-token="shareToken"
     />
 
     <!-- 重置系统镜像选择对话框 -->
@@ -185,6 +187,7 @@ const { t } = useI18n()
 const activeTab = ref('overview')
 const resourceChartRef = ref(null)
 const showVNCDialog = ref(false)
+const selectedConsoleProtocol = ref('')
 const shareToken = computed(() => route.params.token ? String(route.params.token) : '')
 const isShareMode = computed(() => Boolean(shareToken.value))
 
@@ -219,6 +222,11 @@ const {
   togglePassword,
   copyToClipboard
 } = useInstanceActions(instance, monitoring, loadInstanceDetail, shareToken)
+
+const openConsole = (protocol = '') => {
+  selectedConsoleProtocol.value = protocol || ''
+  showVNCDialog.value = true
+}
 
 // 标志位，防止 watch 循环触发
 let isUpdatingFromRoute = false

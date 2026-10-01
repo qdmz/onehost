@@ -14,6 +14,7 @@ import (
 	userModel "oneclickvirt/model/user"
 	"oneclickvirt/service/auth"
 	"oneclickvirt/service/cache"
+	consoleService "oneclickvirt/service/console"
 	"oneclickvirt/service/database"
 	trafficService "oneclickvirt/service/traffic"
 
@@ -138,6 +139,7 @@ func (s *Service) InstanceAction(userID uint, req userModel.InstanceActionReques
 		}
 
 		instance.Status = constant.InstanceStatusStarting
+		instance.DesiredState = providerModel.InstanceDesiredStateRunning
 	case "stop":
 		if instance.Status != constant.InstanceStatusRunning {
 			return errors.New("实例状态不允许停止")
@@ -158,6 +160,7 @@ func (s *Service) InstanceAction(userID uint, req userModel.InstanceActionReques
 		}
 
 		instance.Status = constant.InstanceStatusStopping
+		instance.DesiredState = providerModel.InstanceDesiredStateStopped
 	case "restart":
 		if instance.Status != constant.InstanceStatusRunning {
 			return errors.New("实例状态不允许重启")
@@ -178,6 +181,7 @@ func (s *Service) InstanceAction(userID uint, req userModel.InstanceActionReques
 		}
 
 		instance.Status = constant.InstanceStatusRestarting
+		instance.DesiredState = providerModel.InstanceDesiredStateRunning
 	case "reset":
 		if instance.Status != constant.InstanceStatusRunning && instance.Status != constant.InstanceStatusStopped {
 			return errors.New("实例状态不允许重置")
@@ -241,9 +245,13 @@ func (s *Service) InstanceAction(userID uint, req userModel.InstanceActionReques
 
 	// 使用数据库抽象层保存
 	dbService := database.GetDatabaseService()
-	return dbService.ExecuteTransaction(context.Background(), func(tx *gorm.DB) error {
+	err := dbService.ExecuteTransaction(context.Background(), func(tx *gorm.DB) error {
 		return tx.Save(&instance).Error
 	})
+	if err == nil {
+		consoleService.InvalidateInstanceConsoleCaches(instance.ID)
+	}
+	return err
 }
 
 func (s *Service) BatchInstanceAction(userID uint, req userModel.BatchInstanceActionRequest) userModel.BatchInstanceActionResponse {

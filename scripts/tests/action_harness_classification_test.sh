@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # shellcheck source=../../action_tests/common/node_manager.sh
 source "${ROOT_DIR}/action_tests/common/node_manager.sh"
+# shellcheck source=../../action_tests/common/test_framework.sh
+source "${ROOT_DIR}/action_tests/common/test_framework.sh"
 
 fail() {
     echo "action harness classification test failed: $*" >&2
@@ -55,6 +57,143 @@ assert_offline_empty_fixtures() {
 assert_offline_empty_fixtures lxd lxc
 assert_offline_empty_fixtures incus incus
 
+MOCK_EXEC_MODE="success"
+CAPTURED_COMMANDS=()
+prepare_dirty_node worker-id 192.0.2.10 lxd container || fail "LXD container-only fixture preparation failed"
+[[ "$DIRTY_NODE_CONTAINER_EXPECTED" == "true" && "$DIRTY_NODE_VM_EXPECTED" == "false" ]] ||
+    fail "LXD container-only run prepared the wrong fixture types"
+! printf '%s\n' "${CAPTURED_COMMANDS[@]}" | grep -Fq 'pre-existing-vm' ||
+    fail "LXD container-only run still prepared a VM fixture"
+
+CAPTURED_COMMANDS=()
+prepare_dirty_node worker-id 192.0.2.10 lxd vm || fail "LXD VM-only fixture preparation failed"
+[[ "$DIRTY_NODE_CONTAINER_EXPECTED" == "false" && "$DIRTY_NODE_VM_EXPECTED" == "true" ]] ||
+    fail "LXD VM-only run prepared the wrong fixture types"
+! printf '%s\n' "${CAPTURED_COMMANDS[@]}" | grep -Fq 'pre-existing-1' ||
+    fail "LXD VM-only run still prepared a container fixture"
+
+CAPTURED_COMMANDS=()
+prepare_dirty_node worker-id 192.0.2.10 proxmoxve both || fail "PVE both-fixture preparation failed"
+[[ "$DIRTY_NODE_CONTAINER_EXPECTED" == "true" && "$DIRTY_NODE_VM_EXPECTED" == "true" ]] ||
+    fail "PVE both run did not mark both fixture types as expected"
+[[ "$DIRTY_NODE_CONTAINER_READY" == "true" && "$DIRTY_NODE_VM_READY" == "true" ]] ||
+    fail "PVE both run did not mark both fixtures ready"
+grep -Fq 'pct create "$ctid"' <(printf '%s\n' "${CAPTURED_COMMANDS[@]}") ||
+    fail "PVE both run did not prepare an LXC fixture"
+! printf '%s\n' "${CAPTURED_COMMANDS[@]}" | grep -Fq -- '--startup 0' ||
+    fail "PVE LXC fixture still passes the invalid --startup 0 option"
+
+CAPTURED_COMMANDS=()
+prepare_dirty_node worker-id 192.0.2.10 proxmoxve container || fail "PVE container-only fixture preparation failed"
+[[ "$DIRTY_NODE_CONTAINER_EXPECTED" == "true" && "$DIRTY_NODE_VM_EXPECTED" == "false" ]] ||
+    fail "PVE container-only run prepared the wrong fixture types"
+[[ "$DIRTY_NODE_CONTAINER_READY" == "true" && "$DIRTY_NODE_VM_READY" == "false" ]] ||
+    fail "PVE container-only run did not mark the LXC fixture ready"
+grep -Fq 'pct create "$ctid"' <(printf '%s\n' "${CAPTURED_COMMANDS[@]}") ||
+    fail "PVE container-only run did not prepare an LXC fixture"
+
+CAPTURED_COMMANDS=()
+prepare_dirty_node worker-id 192.0.2.10 proxmoxve vm || fail "PVE VM-only fixture preparation failed"
+[[ "$DIRTY_NODE_CONTAINER_EXPECTED" == "false" && "$DIRTY_NODE_VM_EXPECTED" == "true" ]] ||
+    fail "PVE VM-only run prepared the wrong fixture types"
+[[ "$DIRTY_NODE_CONTAINER_READY" == "false" && "$DIRTY_NODE_VM_READY" == "true" ]] ||
+    fail "PVE VM-only run did not mark the QEMU fixture ready"
+! printf '%s\n' "${CAPTURED_COMMANDS[@]}" | grep -Fq 'pct create "$ctid"' ||
+    fail "PVE VM-only run still prepared an LXC fixture"
+
+# A reserved fixture ID must never claim or overwrite an unrelated guest.
+MOCK_EXEC_MODE="selective"
+MOCK_FAIL_MATCH="qm status 990"
+occupied_rc=0
+prepare_dirty_node worker-id 192.0.2.10 proxmoxve vm || occupied_rc=$?
+[[ "$occupied_rc" == "75" ]] || fail "occupied PVE VMID was not classified as unavailable"
+MOCK_FAIL_MATCH="pct status \"\$ctid\""
+occupied_rc=0
+prepare_dirty_node worker-id 192.0.2.10 proxmoxve container || occupied_rc=$?
+[[ "$occupied_rc" == "75" ]] || fail "occupied PVE CTID was not classified as unavailable"
+MOCK_EXEC_MODE="success"
+MOCK_FAIL_MATCH=""
+
+assert_worker_budget() {
+    local env="$1" types="$2" expected_cpu="$3" expected_memory="$4" expected_disk="$5" expected_kvm="$6"
+    local actual_cpu actual_memory actual_disk actual_kvm
+    configure_action_test_resources_for_env "$env"
+    INSTANCE_TYPES="$types"
+    read -r actual_cpu actual_memory actual_disk actual_kvm < <(worker_resource_requirements "$env" "$types")
+    [[ "$actual_cpu" == "$expected_cpu" ]] || fail "${env}/${types} CPU budget ${actual_cpu}, expected ${expected_cpu}"
+    [[ "$actual_memory" == "$expected_memory" ]] || fail "${env}/${types} memory budget ${actual_memory}, expected ${expected_memory}"
+    [[ "$actual_disk" == "$expected_disk" ]] || fail "${env}/${types} disk budget ${actual_disk}, expected ${expected_disk}"
+    [[ "$actual_kvm" == "$expected_kvm" ]] || fail "${env}/${types} KVM requirement ${actual_kvm}, expected ${expected_kvm}"
+}
+
+assert_worker_budget qemu both 4 8192 20 true
+assert_worker_budget kubevirt both 4 8192 20 true
+assert_worker_budget lxd both 4 8192 41 true
+assert_worker_budget incus both 4 8192 41 true
+assert_worker_budget lxd container 2 4096 21 false
+assert_worker_budget lxd vm 2 4096 21 true
+assert_worker_budget incus container 2 4096 21 false
+assert_worker_budget incus vm 2 4096 21 true
+assert_worker_budget proxmoxve both 4 8192 20 true
+assert_worker_budget qemu container 2 4096 20 false
+assert_worker_budget qemu vm 2 4096 20 true
+
+for nested_env in lxd incus proxmoxve qemu kubevirt; do
+    env_needs_worker_resource_check "$nested_env" || fail "${nested_env} bypasses worker resource validation"
+done
+if env_needs_worker_resource_check docker; then
+    fail "Docker should not require nested-virtualization worker validation"
+fi
+
+lightnode_get_packages() {
+    printf '%s\n200\n' '{"packages":[{"packageCode":"small","cpu":2,"memory":4},{"packageCode":"peak","cpu":4,"memory":8},{"packageCode":"large","cpu":8,"memory":16}]}'
+}
+LIGHTNODE_REGION="test-region"
+LIGHTNODE_ZONE="test-zone"
+ENV_TYPE="qemu"
+INSTANCE_TYPES="both"
+configure_action_test_resources_for_env "$ENV_TYPE"
+LIGHTNODE_PACKAGE_CODE=""
+LIGHTNODE_TARGET_CPU=2
+LIGHTNODE_TARGET_MEMORY_MB=4096
+LIGHTNODE_STRICT_RECOMMENDED_SPEC=true
+[[ "$(_lightnode_get_default_package)" == "peak" ]] || fail "LightNode did not raise qemu/both to the 4C/8GB package"
+LIGHTNODE_TARGET_CPU=8
+LIGHTNODE_TARGET_MEMORY_MB=16384
+[[ "$(_lightnode_get_default_package)" == "large" ]] || fail "LightNode downgraded an explicit larger worker target"
+LIGHTNODE_TARGET_CPU=6
+LIGHTNODE_TARGET_MEMORY_MB=12288
+LIGHTNODE_STRICT_RECOMMENDED_SPEC=false
+[[ "$(_lightnode_get_default_package)" == "large" ]] || fail "LightNode non-strict selection fell below a larger worker target"
+LIGHTNODE_STRICT_RECOMMENDED_SPEC=true
+LIGHTNODE_PACKAGE_CODE="small"
+LIGHTNODE_TARGET_CPU=2
+LIGHTNODE_TARGET_MEMORY_MB=4096
+if _lightnode_get_default_package >/dev/null 2>&1; then
+    fail "LightNode accepted an explicit package below the qemu/both peak budget"
+fi
+LIGHTNODE_PACKAGE_CODE="large"
+[[ "$(_lightnode_get_default_package)" == "large" ]] || fail "LightNode rejected an explicit package above the peak budget"
+LIGHTNODE_PACKAGE_CODE=""
+
+RESOURCE_COMMAND_FILE=$(mktemp)
+MOCK_RESOURCE_CHECK_RESULT=0
+platform_ssh_exec() {
+    local _ip="$1" command="$2" _timeout="${3:-}"
+    printf '%s\n' "$command" > "$RESOURCE_COMMAND_FILE"
+    printf '%s\n' 'WORKER_RESOURCE_CHECK mocked'
+    return "$MOCK_RESOURCE_CHECK_RESULT"
+}
+platform_validate_worker_resources qemu 192.0.2.10 lightnode >/dev/null 2>&1 || fail "valid qemu/both worker check was rejected"
+grep -Fq 'required>=4' "$RESOURCE_COMMAND_FILE" || fail "worker validation command does not enforce the 4 CPU peak budget"
+grep -Fq 'required>=7680' "$RESOURCE_COMMAND_FILE" || fail "worker validation command does not allow only nominal-memory virtualization overhead"
+grep -Fq '/dev/kvm missing' "$RESOURCE_COMMAND_FILE" || fail "worker validation command does not enforce nested virtualization"
+MOCK_RESOURCE_CHECK_RESULT=1
+resource_check_rc=0
+platform_validate_worker_resources qemu 192.0.2.10 lightnode >/dev/null 2>&1 || resource_check_rc=$?
+[[ "$resource_check_rc" == "75" ]] || fail "insufficient worker resources should return infrastructure status 75"
+rm -f "$RESOURCE_COMMAND_FILE"
+
 MOCK_EXEC_MODE="selective"
 MOCK_FAIL_MATCH="pre-existing-vm"
 CAPTURED_COMMANDS=()
@@ -87,7 +226,60 @@ runtime_rc=0
 verify_worker_runtime worker-id 192.0.2.10 docker || runtime_rc=$?
 [[ "$runtime_rc" == "0" ]] || fail "healthy worker runtime check should pass, got ${runtime_rc}"
 
+vm_agent_timeout='Provider创建实例失败: 虚拟机Agent启动超时，无法继续配置: 等待实例可执行命令超时 (1800秒)'
+ENV_TYPE=incus
+is_infrastructure_failure_detail "$vm_agent_timeout" ||
+    fail "Incus VM agent startup timeout should be classified as infrastructure"
+ENV_TYPE=lxd
+is_infrastructure_failure_detail "$vm_agent_timeout" ||
+    fail "LXD VM agent startup timeout should be classified as infrastructure"
+ENV_TYPE=docker
+if is_infrastructure_failure_detail "$vm_agent_timeout"; then
+    fail "Docker must not inherit the LXD/Incus VM timeout classification"
+fi
+ENV_TYPE=incus
+if is_infrastructure_failure_detail '等待实例可执行命令超时 (30秒)'; then
+    fail "generic or short instance timeout must remain a product failure"
+fi
+pve_lock_timeout="Provider创建实例失败: 配置容器网络失败: status 500, response: can't lock file '/run/lock/lxc/pve-config-100.lock' - got timeout"
+is_infrastructure_failure_detail "$pve_lock_timeout" ||
+    fail "transient PVE config lock timeout should be classified as infrastructure"
+pve_qemu_lock_timeout="Provider创建实例失败: 配置虚拟机网络失败: can't lock file '/var/lock/qemu-server/lock-100.conf' - got timeout"
+is_infrastructure_failure_detail "$pve_qemu_lock_timeout" ||
+    fail "transient PVE QEMU lock timeout should be classified as infrastructure"
+if is_infrastructure_failure_detail "can't lock file '/var/lock/qemu-server/lock-100.conf': permission denied"; then
+    fail "permanent PVE lock permission errors must remain product failures"
+fi
+if is_infrastructure_failure_detail "another-component lock file '/var/lib/other/resource.lock' - got timeout"; then
+    fail "unrelated lock timeouts must remain product failures"
+fi
+if is_infrastructure_failure_detail "PVE API returned a permanent validation error"; then
+    fail "permanent PVE validation errors must remain product failures"
+fi
+mark_vm_runtime_infrastructure_unavailable "$vm_agent_timeout"
+if env_supports_vm; then
+    fail "VM runtime circuit breaker did not disable subsequent VM tests"
+fi
+VM_RUNTIME_INFRA_UNAVAILABLE_REASON=""
+ENV_TYPE=lxd
+env_supports_vm || fail "clearing the VM runtime circuit breaker did not restore the provider capability"
+
 DISCOVERY_MODULE="${ROOT_DIR}/action_tests/modules/23_discovery.sh"
+NODE_MANAGER="${ROOT_DIR}/action_tests/common/node_manager.sh"
+grep -Fq '/usr/local/libexec/cni' "$NODE_MANAGER" ||
+    fail "containerd runtime verification does not search the nerdctl-full CNI location"
+grep -Fq "containerd_check 'containerd daemon (ctr version)' ctr version" "$NODE_MANAGER" ||
+    fail "containerd runtime verification does not use ctr version for the daemon"
+grep -Fq "containerd_check 'nerdctl CLI version' nerdctl version" "$NODE_MANAGER" ||
+    fail "containerd runtime verification does not validate the nerdctl CLI"
+grep -Fq 'CONTAINERD_VERIFY_ROOT' "$NODE_MANAGER" ||
+    fail "containerd runtime verifier cannot be exercised with an isolated fixture"
+grep -Fq 'systemctl show containerd.service --property=LoadState' "$NODE_MANAGER" ||
+    fail "containerd runtime verification does not distinguish loaded systemd units from unavailable systemd"
+! grep -Fq 'nerdctl --cni-path "${cni_path}" network inspect containerd-net' "$NODE_MANAGER" ||
+    fail "containerd runtime verification still relies on an unregistered nerdctl network"
+! grep -Fq 'for plugin in bridge host-local loopback portmap firewall tuning; do test -x /opt/cni/bin/\$plugin' "$NODE_MANAGER" ||
+    fail "containerd runtime verification still hardcodes /opt/cni/bin per plugin"
 ! grep -Fq 'any(.data.discoveredInstances' "$DISCOVERY_MODULE" ||
     fail "discovery module still accepts an arbitrary container or VM"
 grep -Fq 'Discover exact pre-existing container' "$DISCOVERY_MODULE" ||
@@ -96,17 +288,276 @@ grep -Fq 'Discover exact pre-existing VM' "$DISCOVERY_MODULE" ||
     fail "exact VM fixture assertion missing"
 grep -Fq -- '--arg container_name' "$DISCOVERY_MODULE" ||
     fail "fixture-specific import selection missing"
+grep -Fq 'Discover exact pre-existing PVE container' "$DISCOVERY_MODULE" ||
+    fail "PVE container discovery assertion missing"
+grep -Fq 'Auto-imported PVE container keeps CTID' "$DISCOVERY_MODULE" ||
+    fail "PVE container import assertion missing"
+grep -Fq -- '--arg container_id' "$DISCOVERY_MODULE" ||
+    fail "PVE container orphan/import selection missing"
+grep -Fq 'DIRTY_NODE_CONTAINER_PROVIDER_ID="991"' "$NODE_MANAGER" ||
+    fail "PVE LXC fixture does not expose a deterministic CTID"
+grep -Fq 'pct create "$ctid"' "$NODE_MANAGER" ||
+    fail "PVE dirty-node fixture does not create an LXC"
 
 RUN_ENV_TEST="${ROOT_DIR}/action_tests/run_env_test.sh"
 grep -Fq 'install_rc == 75' "$RUN_ENV_TEST" ||
     fail "the environment orchestrator does not preserve transient installer status 75"
+grep -Fq 'environment installation" "HARNESS" "install_env"' "$RUN_ENV_TEST" ||
+    fail "the environment orchestrator does not record non-transient installer failures"
+! grep -Fq 'Environment installation may have issues, continuing' "$RUN_ENV_TEST" ||
+    fail "the environment orchestrator continues module tests after a failed installation"
 grep -Fq 'runtime_rc == 75' "$RUN_ENV_TEST" ||
     fail "the environment orchestrator does not preserve transient runtime status 75"
 grep -Fq 'dirty_node_rc == 75' "$RUN_ENV_TEST" ||
     fail "the environment orchestrator does not classify missing fixtures as infrastructure"
+grep -Fq 'Partial dirty-node fixture preparation' "$RUN_ENV_TEST" ||
+    fail "the environment orchestrator does not record partial fixture failures"
+grep -Fq 'all requested instance types have deterministic fixtures' "$RUN_ENV_TEST" ||
+    fail "partial dirty-node fixtures are still treated as a feature skip"
+grep -Fq 'Worker cleanup' "$RUN_ENV_TEST" ||
+    fail "environment cleanup failures are not recorded as harness failures"
+grep -Fq 'retaining IDs for retry' "$RUN_ENV_TEST" ||
+    fail "environment cleanup does not retain failed worker IDs for retry"
+grep -Fq 'configure_action_test_resources_for_env "$ENV_TYPE"' "$RUN_ENV_TEST" ||
+    fail "the environment orchestrator does not apply provider-specific instance sizing"
+grep -Fq 'platform_validate_worker_resources "$env" "$ip" "${ACTIVE_PLATFORM:-}"' "$NODE_MANAGER" ||
+    fail "runtime verification does not recheck the worker peak resource budget"
+NETWORK_MODE_TEST="${ROOT_DIR}/action_tests/run_network_mode_test.sh"
+grep -Fq 'configure_action_test_resources_for_env "$ENV_TYPE"' "$NETWORK_MODE_TEST" ||
+    fail "the network-mode worker path does not apply provider-specific instance sizing"
+grep -Fq 'log_error "Some network mode tests FAILED' "$NETWORK_MODE_TEST" ||
+    fail "network-mode failures are not surfaced as errors"
+grep -Fq '    exit 1' "$NETWORK_MODE_TEST" ||
+    fail "network-mode matrix still exits successfully after failures"
+grep -Fq 'Instance ${inst_id} did not reach running state' "$NETWORK_MODE_TEST" ||
+    fail "network-mode instance readiness failure is still treated as success"
+! grep -Fq 'wait_instance_status "$inst_id" "running" "$INSTANCE_STATUS_MAX_WAIT" 10 "$ADMIN_TOKEN" "network-mode instance ${inst_id}" > /dev/null || true' "$NETWORK_MODE_TEST" ||
+    fail "network-mode instance readiness failure is swallowed"
+grep -Fq '_auto_configure_provider "$PROVIDER_ID"' "$NETWORK_MODE_TEST" ||
+    fail "network-mode provider auto-configure gate is missing"
+grep -Fq 'Auto-configure failed for provider ${PROVIDER_ID}' "$NETWORK_MODE_TEST" ||
+    fail "network-mode auto-configure failure is not classified as a method failure"
+! grep -Fq 'Auto-configure had issues' "$NETWORK_MODE_TEST" ||
+    fail "network-mode auto-configure still downgrades a required failure to a warning"
+grep -Fq 'Failed to delete test instance ${TEST_INSTANCE_ID}' "$NETWORK_MODE_TEST" ||
+    fail "network-mode cleanup failures are not surfaced"
+! grep -Fq 'auto-configure-stream' "$NETWORK_MODE_TEST" ||
+    fail "network-mode still starts a short-lived stream and a second mutating config task"
+grep -Fq 'cleanup_failed=true' "$NETWORK_MODE_TEST" ||
+    fail "provider cleanup does not retain deletion failures"
+grep -Fq '[[ "$cleanup_failed" == "true" ]] && return 1' "$NETWORK_MODE_TEST" ||
+    fail "provider cleanup failure is not returned to callers"
+grep -Fq 'wait_task_complete "$SERVER_URL" "$del_task"' "$NETWORK_MODE_TEST" ||
+    fail "provider deletion task is not awaited before the next network-mode iteration"
+grep -Fq 'Previous provider cleanup failed; refusing to start method=${mapping_method}' "$NETWORK_MODE_TEST" ||
+    fail "network-mode matrix advances after failed previous-provider cleanup"
+grep -Fq 'Final provider cleanup failed' "$NETWORK_MODE_TEST" ||
+    fail "network-mode final provider cleanup failure is not part of overall result"
+grep -Fq 'Environment installation failed for method' "$NETWORK_MODE_TEST" ||
+    fail "network-mode continues after a failed first environment installation"
+grep -Fq 'Environment re-installation failed for method' "$NETWORK_MODE_TEST" ||
+    fail "network-mode continues after a failed environment re-installation"
+grep -Fq 'Worker reinstall failed for method' "$NETWORK_MODE_TEST" ||
+    fail "network-mode does not record a failed worker reinstall"
+grep -Fq 'Provider cleanup failed after instance creation failure' "$NETWORK_MODE_TEST" ||
+    fail "network-mode swallows provider cleanup after instance failure"
+grep -Fq 'Worker cleanup failed; retaining IDs for diagnosis' "$NETWORK_MODE_TEST" ||
+    fail "network-mode cleanup failure is not surfaced by the EXIT trap"
 
 INTEGRATION_WORKFLOW="${ROOT_DIR}/.github/workflows/integration-tests.yml"
 grep -Fq 'bash scripts/tests/action_harness_classification_test.sh' "$INTEGRATION_WORKFLOW" ||
     fail "the harness regression test is not enforced by the integration workflow"
+PORT_MAPPING_MODULE="${ROOT_DIR}/action_tests/modules/13_port_mappings.sh"
+DOMAIN_MODULE="${ROOT_DIR}/action_tests/modules/15_domains.sh"
+CHECKIN_MODULE="${ROOT_DIR}/action_tests/modules/22_checkin.sh"
+INSTANCE_MODULE="${ROOT_DIR}/action_tests/modules/10_instances.sh"
+! grep -Fq 'TEST_INSTANCE_ID:-1' "$PORT_MAPPING_MODULE" || fail "port mapping module still fabricates instance ID 1"
+! grep -Fq 'TEST_INSTANCE_ID:-1' "$DOMAIN_MODULE" || fail "domain module still fabricates instance ID 1"
+! grep -Eq 'instanceId[^0-9]*1([^0-9]|$)' "$CHECKIN_MODULE" || fail "checkin module still uses a fabricated instance ID 1"
+grep -Fq 'require_test_instance "$instance_group"' "$PORT_MAPPING_MODULE" || fail "port mapping instance prerequisite guard missing"
+grep -Fq 'require_test_instance "$instance_group"' "$DOMAIN_MODULE" || fail "domain instance prerequisite guard missing"
+! grep -Fq 'test_api_retry "Create container instance"' "$INSTANCE_MODULE" || fail "container creation still retries a non-idempotent POST"
+! grep -Fq 'test_api_retry "Create VM instance"' "$INSTANCE_MODULE" || fail "VM creation still retries a non-idempotent POST"
+grep -Fq 'pve-config-' "${ROOT_DIR}/action_tests/common/test_framework.sh" || fail "PVE lock classification is missing"
+
+# Static audit regression: single-shot instance creation is safe, while a
+# retry wrapper around the non-idempotent POST must be rejected.
+python3 - "${ROOT_DIR}/action_tests/static_audit.py" <<'PY' || fail "static audit retry hygiene regression"
+import importlib.util
+import pathlib
+import sys
+import tempfile
+
+audit_path = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("static_audit", audit_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = pathlib.Path(tmp)
+    modules = root / "action_tests" / "modules"
+    modules.mkdir(parents=True)
+    (modules / "safe.sh").write_text(
+        'test_api "Create container instance" "POST" "/api/v1/admin/instances" "200" "{}"\n',
+        encoding="utf-8",
+    )
+    (modules / "unsafe.sh").write_text(
+        'test_api_retry "Create VM instance" "POST" "/api/v1/admin/instances" "200" "{}"\n',
+        encoding="utf-8",
+    )
+    (modules / "jq-validation.sh").write_text(
+        'value=$(jq -r ".value" <<< "$response") || return 1\n'
+        'if ! jq -e ".ready" <<< "$response"; then return 1; fi\n'
+        'unhandled=$(jq -r ".value" <<< "$response")\n',
+        encoding="utf-8",
+    )
+    jq_findings, _ = module.audit_shell(root)
+    if len(jq_findings) != 1 or "unhandled=" not in jq_findings[0].detail:
+        raise AssertionError(f"jq failure handling was misclassified: {jq_findings!r}")
+    findings = module.audit_retry_hygiene(root)
+    if len(findings) != 1 or findings[0].kind != "non-idempotent-create-retry":
+        raise SystemExit(f"unexpected retry findings: {findings!r}")
+PY
+
+RESULTS_FILE=$(mktemp)
+init_results_file "$RESULTS_FILE"
+captured_result=$(record_fail_result "captured failure" "GET" "/captured" "200" "500" "body" "subshell" 2>/dev/null)
+[[ -z "$captured_result" ]] || fail "record_fail_result unexpectedly wrote response data"
+[[ "$(jq -r 'select(.name == "captured failure" and .status == "FAIL") | 1' "$RESULTS_FILE")" == "1" ]] ||
+    fail "a failure recorded inside command substitution was lost from JSONL"
+rm -f "$RESULTS_FILE"
+
+RESULTS_FILE=$(mktemp)
+init_results_file "$RESULTS_FILE"
+record_pass_result "captured pass" "PREFLIGHT" "commands" "available" "available" "pass is persisted" "HARNESS"
+[[ "$(jq -r 'select(.name == "captured pass" and .status == "PASS" and .group == "HARNESS") | 1' "$RESULTS_FILE")" == "1" ]] ||
+    fail "record_pass_result did not persist a HARNESS PASS to JSONL"
+rm -f "$RESULTS_FILE"
+
+RUN_MODULE="${ROOT_DIR}/action_tests/run_module.sh"
+if grep -Fq 'for _result_json in "${TEST_RESULTS_JSON[@]}"' "$RUN_MODULE"; then
+    fail "run_module still overwrites authoritative JSONL from its parent-shell array"
+fi
+grep -Fq 'RESULTS_FILE_SHARED' "$RUN_MODULE" || fail "run_module does not preserve shared harness JSONL"
+grep -Fq 'export RESULTS_FILE_SHARED=true' "$RUN_ENV_TEST" || fail "run_env_test does not mark its JSONL as shared"
+
+# PVE network reload resilience regression.  The mock deliberately drops one
+# status query, then lets SSH recover; the mutating launcher must remain
+# single-shot and the detached status must drive completion.
+MOCK_PVE_QUERY_COUNT=0
+MOCK_PVE_LAUNCH_COUNT=0
+MOCK_PVE_STATUS_MODE="recover"
+MOCK_PVE_POSTCONDITION=""
+MOCK_LAST_POSTCONDITION_COMMAND=""
+CAPTURED_COMMANDS=()
+MOCK_PVE_QUERY_FILE=$(mktemp)
+MOCK_PVE_LAUNCH_FILE=$(mktemp)
+MOCK_PVE_POSTCONDITION_FILE=$(mktemp)
+printf '0\n' > "$MOCK_PVE_QUERY_FILE"
+printf '0\n' > "$MOCK_PVE_LAUNCH_FILE"
+platform_exec_once() {
+    local _ip="$1" command="$2" _timeout="${3:-}"
+    CAPTURED_COMMANDS+=("$command")
+    if [[ "$command" == *"mkdir -p /tmp/oneclickvirt-pve-jobs"* ]]; then
+        local launch_count; launch_count=$(cat "$MOCK_PVE_LAUNCH_FILE")
+        launch_count=$((launch_count + 1)); printf '%s\n' "$launch_count" > "$MOCK_PVE_LAUNCH_FILE"
+        printf '%s\n' STARTED
+        return 0
+    fi
+    if [[ "$command" == *"if [ -s "* && "$command" == *".status"* ]]; then
+        local query_count; query_count=$(cat "$MOCK_PVE_QUERY_FILE")
+        query_count=$((query_count + 1)); printf '%s\n' "$query_count" > "$MOCK_PVE_QUERY_FILE"
+        case "$MOCK_PVE_STATUS_MODE:$query_count" in
+            recover:1) return 1 ;;
+            recover:2) printf '%s\n' RUNNING; return 0 ;;
+            recover:*) printf '%s\n' 0; return 0 ;;
+            running:*) printf '%s\n' RUNNING; return 0 ;;
+            failed:*) printf '%s\n' 1; return 0 ;;
+        esac
+    fi
+    if [[ "$command" == *"test -s /usr/local/bin/build_backend_pve.txt"* || "$command" == *"test -r /etc/network/interfaces"* ]]; then
+        printf '%s' "$command" > "$MOCK_PVE_POSTCONDITION_FILE"
+        [[ "$MOCK_PVE_POSTCONDITION" == "backend" && "$command" == *"build_backend_pve.txt"* ]] || [[ "$MOCK_PVE_POSTCONDITION" == "nat" && "$command" == *"pve_nat_subnet"* ]]
+        return
+    fi
+    return 0
+}
+
+export PVE_REMOTE_POLL_INTERVAL=1
+export PVE_REMOTE_SSH_RECOVERY_WAIT=2
+MOCK_SSH_REACHABLE=true
+wait_for_ssh() { [[ "$MOCK_SSH_REACHABLE" == "true" ]]; }
+pve_run_remote_job 192.0.2.10 'echo mutating-pve-command' 'network-reload-regression' 5 || fail "detached PVE job did not complete after temporary SSH loss"
+MOCK_PVE_LAUNCH_COUNT=$(cat "$MOCK_PVE_LAUNCH_FILE")
+MOCK_PVE_QUERY_COUNT=$(cat "$MOCK_PVE_QUERY_FILE")
+[[ "$MOCK_PVE_LAUNCH_COUNT" == "1" ]] || fail "detached PVE job launcher was invoked ${MOCK_PVE_LAUNCH_COUNT} times"
+[[ "$MOCK_PVE_QUERY_COUNT" -ge 3 ]] || fail "detached PVE job status was not polled through recovery"
+
+# build_backend.sh exits 1 when its marker already exists; its durable marker
+# and PVE runtime postcondition should make this an accepted completion.
+MOCK_PVE_STATUS_MODE="failed"
+printf '0\n' > "$MOCK_PVE_QUERY_FILE"
+printf '0\n' > "$MOCK_PVE_LAUNCH_FILE"
+MOCK_PVE_POSTCONDITION="backend"
+pve_run_job_or_accept_postcondition 192.0.2.10 'echo backend' 'backend-marker-regression' backend 5 || fail "backend marker postcondition was not accepted"
+
+# A job that is still RUNNING after the primary and grace windows must remain
+# untouched; a durable postcondition cannot authorize the next mutating phase
+# while the previous one may still be changing network state.
+MOCK_PVE_STATUS_MODE="running"
+printf '0\n' > "$MOCK_PVE_QUERY_FILE"
+printf '0\n' > "$MOCK_PVE_LAUNCH_FILE"
+export PVE_REMOTE_RUNNING_GRACE_WAIT=1
+MOCK_PVE_POSTCONDITION="backend"
+running_rc=0
+pve_run_job_or_accept_postcondition 192.0.2.10 'echo still-running' 'running-job-regression' backend 1 || running_rc=$?
+[[ "$running_rc" == "75" ]] || fail "still-running PVE job was not classified as infrastructure"
+[[ "$PVE_LAST_JOB_STATE" == "running" ]] || fail "still-running PVE job state was not preserved"
+unset PVE_REMOTE_RUNNING_GRACE_WAIT
+
+MOCK_PVE_POSTCONDITION="nat"
+pve_check_postcondition 192.0.2.10 nat || fail "NAT postcondition was rejected by the mock"
+MOCK_LAST_POSTCONDITION_COMMAND=$(cat "$MOCK_PVE_POSTCONDITION_FILE")
+grep -Fq 'pve_nat_subnet' <<<"$MOCK_LAST_POSTCONDITION_COMMAND" || fail "NAT postcondition did not inspect persisted subnet state"
+grep -Fq 'masquerade' <<<"$MOCK_LAST_POSTCONDITION_COMMAND" || fail "NAT postcondition did not inspect masquerade rules"
+
+rm -f "$MOCK_PVE_QUERY_FILE" "$MOCK_PVE_LAUNCH_FILE" "$MOCK_PVE_POSTCONDITION_FILE"
+
+grep -Fq 'record_pass_result "Platform resolution"' "$RUN_ENV_TEST" || fail "preflight PASS results are not recorded"
+grep -Fq '"$group" == "HARNESS"' "$INTEGRATION_WORKFLOW" || fail "workflow does not separate HARNESS results from module assertions"
+grep -Fq 'Module tests executed' "$INTEGRATION_WORKFLOW" || fail "workflow does not state whether module assertions ran"
+module_gate=$(awk '/if \[\[ "\$module_executed" -eq 0 \]\]; then/{inside=1} inside{print} inside && /fi/{exit}' "$INTEGRATION_WORKFLOW")
+grep -Fq '::error::No module assertions were executed' <<<"$module_gate" || fail "zero module assertions are not reported as an error"
+grep -Fq 'exit 1' <<<"$module_gate" || fail "zero module assertions do not fail validation"
+
+# PVE images that do not ship ifupdown can schedule an ifupdown2 bootstrap
+# service.  It may reboot once more after SSH first recovers; the orchestrator
+# must observe that bootstrap before launching the second installer pass.
+MOCK_BOOTSTRAP_FILE=$(mktemp)
+printf '0\n' > "$MOCK_BOOTSTRAP_FILE"
+platform_exec_once() {
+    local _ip="$1" command="$2" _timeout="${3:-}"
+    if [[ "$command" == *"if [ -e /etc/systemd/system/ifupdown2-install.service"* ]]; then
+        local bootstrap_step; bootstrap_step=$(cat "$MOCK_BOOTSTRAP_FILE")
+        bootstrap_step=$((bootstrap_step + 1)); printf '%s\n' "$bootstrap_step" > "$MOCK_BOOTSTRAP_FILE"
+        case "$bootstrap_step" in
+            1) printf '%s\n' PENDING; return 0 ;;
+            2) return 1 ;;
+            *) printf '%s\n' COMPLETE; return 0 ;;
+        esac
+    fi
+    return 0
+}
+sleep() { :; }
+export PVE_IFUPDOWN2_BOOTSTRAP_MAX_WAIT=3
+export PVE_IFUPDOWN2_BOOTSTRAP_POLL_INTERVAL=1
+export PVE_REMOTE_SSH_RECOVERY_WAIT=1
+export PVE_REMOTE_STABLE_PROBES=1
+pve_wait_for_ifupdown2_bootstrap 192.0.2.10 3 || fail "ifupdown2 bootstrap recovery was not observed"
+[[ "$(cat "$MOCK_BOOTSTRAP_FILE")" -ge 3 ]] || fail "ifupdown2 bootstrap was not polled through the transient reboot"
+rm -f "$MOCK_BOOTSTRAP_FILE"
+unset PVE_IFUPDOWN2_BOOTSTRAP_MAX_WAIT PVE_IFUPDOWN2_BOOTSTRAP_POLL_INTERVAL PVE_REMOTE_STABLE_PROBES
 
 echo "action harness classification tests passed"

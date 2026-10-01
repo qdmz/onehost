@@ -178,7 +178,7 @@
             @click="$emit('open-vnc')"
           >
             <el-icon><Monitor /></el-icon>
-            {{ $t('user.instanceDetail.webVNC') }}
+            {{ $t('user.instanceDetail.webConsole') }}
           </el-button>
           <el-button
             v-if="!shareMode && instance.orderId"

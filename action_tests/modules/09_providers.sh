@@ -2,6 +2,60 @@
 # Module 09: Provider Management
 # Dependencies: 01_init (ADMIN_TOKEN), worker node (WORKER_IP + WORKER_PASSWORD or ALICE_PRIVATE_KEY)
 
+action_test_requires_routed_ipv6() {
+    case "${1:-}" in
+        qemu|kubevirt|vmware|virtualbox|multipass|vagrant) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+action_test_live_ipv6_tunnel_enabled() {
+    [[ "${ACTION_TEST_LIVE_IPV6_TUNNEL:-false}" == "true" ]]
+}
+
+action_test_runner_has_ipv6() {
+    # Probe the runner, not a proxy that might supply IPv6 on its behalf. A
+    # failed capability probe is a SKIP, never proof that guest IPv6 works.
+    curl -6 --noproxy '*' --connect-timeout 5 --max-time 10 --fail --silent \
+        --output /dev/null https://api64.ipify.org
+}
+
+# The regular Action matrix has no disposable tunnel endpoint. Keep every
+# host-facing tunnel call behind an explicit opt-in, while Go contract tests
+# exercise the state machine using a fake remote executor.
+run_ipv6_tunnel_host_lifecycle_tests() {
+    local group="$1"
+    if ! action_test_live_ipv6_tunnel_enabled; then
+        record_skip_result "IPv6 tunnel host lifecycle" "SKIP" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels" \
+            "默认CI不调用隧道接口或变更宿主机网络；由带假远端执行器的Go契约测试覆盖" "$group"
+        return 0
+    fi
+    if ! action_test_runner_has_ipv6; then
+        record_skip_result "IPv6 tunnel host lifecycle" "SKIP" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels" \
+            "runner无可用IPv6，跳过实际IPv6分配、隧道操作和连通性测试；保留离线契约测试" "$group"
+        return 0
+    fi
+
+    local ipv6_tunnel_resp
+    ipv6_tunnel_resp=$(test_api "Create disabled IPv6 tunnel" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels" "200" \
+        '{"name":"CI disabled tunnel","mode":"sit","interfaceName":"ocv6ci0","localIpv4":"192.0.2.10","remoteIpv4":"198.51.100.1","localIpv6":"2001:db8:100::2/64","remoteIpv6":"2001:db8:100::1","routedCidr":"2001:db8:101::/64","mtu":1480,"ttl":255,"routeMetric":100,"defaultRoute":false,"enabled":false}' "$group")
+    local ipv6_tunnel_id
+    ipv6_tunnel_id=$(echo "$ipv6_tunnel_resp" | jq -r '.data.id // empty' 2>/dev/null)
+    test_api "List IPv6 tunnels" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels" "200" "" "$group"
+    if [[ -n "$ipv6_tunnel_id" ]]; then
+        test_api "Update disabled IPv6 tunnel" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels/${ipv6_tunnel_id}" "200" \
+            '{"name":"CI disabled tunnel updated","mode":"sit","interfaceName":"ocv6ci0","localIpv4":"192.0.2.10","remoteIpv4":"198.51.100.1","localIpv6":"2001:db8:100::2/64","remoteIpv6":"2001:db8:100::1","routedCidr":"2001:db8:102::/64","mtu":1480,"ttl":255,"routeMetric":101,"defaultRoute":false}' "$group"
+        test_api "Check disabled IPv6 tunnel" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels/check" "200" '{}' "$group"
+        test_api "Disable inactive IPv6 tunnel" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels/${ipv6_tunnel_id}/disable" "200" '{}' "$group"
+        test_api "Delete disabled IPv6 tunnel" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels/${ipv6_tunnel_id}" "200" "" "$group"
+    else
+        record_fail_result "IPv6 tunnel lifecycle" "POST" \
+            "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels" "tunnel id" "missing" \
+            "$ipv6_tunnel_resp" "$group"
+    fi
+    test_api "Enable nonexistent IPv6 tunnel" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-tunnels/999999999/enable" "400|404" '{}' "$group"
+}
+
 run_module_09() {
     report_add_section "09 - Provider Management"
     local group="providers"
@@ -25,14 +79,14 @@ run_module_09() {
     local password_ssh_code="" key_ssh_code=""
     if [[ -n "$worker_pass" ]]; then
         local password_ssh_resp=""
-        password_ssh_resp=$(test_api "Test SSH connection (password)" "POST" "/api/v1/admin/providers/test-ssh-connection" "200|400|500" \
+        password_ssh_resp=$(test_api "Test SSH connection (password)" "POST" "/api/v1/admin/providers/test-ssh-connection" "200|infra" \
             "{\"host\":\"${WORKER_IP}\",\"port\":22,\"username\":\"root\",\"password\":\"${worker_pass}\"}" "$group") || password_ssh_resp=""
         password_ssh_code=$(echo "$password_ssh_resp" | jq -r '.code // empty' 2>/dev/null || true)
     fi
     if [[ -n "$worker_key" ]]; then
         local escaped_key; escaped_key=$(echo "$worker_key" | jq -Rsa .)
         local key_ssh_resp=""
-        key_ssh_resp=$(test_api "Test SSH connection (key)" "POST" "/api/v1/admin/providers/test-ssh-connection" "200|400" \
+        key_ssh_resp=$(test_api "Test SSH connection (key)" "POST" "/api/v1/admin/providers/test-ssh-connection" "200|infra" \
             "{\"host\":\"${WORKER_IP}\",\"port\":22,\"username\":\"root\",\"sshKey\":${escaped_key}}" "$group") || key_ssh_resp=""
         key_ssh_code=$(echo "$key_ssh_resp" | jq -r '.code // empty' 2>/dev/null || true)
     fi
@@ -274,13 +328,14 @@ run_module_09() {
         sleep 5
 
         # -- Auto configure (task) --
-        local ac; ac=$(test_api "Auto configure (task)" "POST" "/api/v1/admin/providers/auto-configure" "200|400|500" \
+        local auto_config_task_required=false
+        local auto_config_expected="400"
+        case "$ENV_TYPE" in
+            lxd|incus|proxmox|proxmoxve) auto_config_task_required=true; auto_config_expected="200|infra" ;;
+        esac
+        local ac; ac=$(test_api "Auto configure (task)" "POST" "/api/v1/admin/providers/auto-configure" "$auto_config_expected" \
             "{\"providerId\":${PROVIDER_ID}}" "$group")
         local ac_task; ac_task=$(echo "$ac" | jq -r '.data.taskId // .data.task_id // empty' 2>/dev/null)
-        local auto_config_task_required=false
-        case "$ENV_TYPE" in
-            lxd|incus|proxmox|proxmoxve) auto_config_task_required=true ;;
-        esac
         if [[ -n "$ac_task" ]]; then
             local ac_result=""
             if ac_result=$(wait_configuration_task_complete_nonfatal "$ac_task" "$ADMIN_TOKEN" "$CONFIG_TASK_MAX_WAIT" 10); then
@@ -320,7 +375,7 @@ run_module_09() {
             record_skip_result "Generate certificate (sync)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/generate-cert" "covered by auto-configure task for ${ENV_TYPE}" "$group"
             ;;
         *)
-            test_api "Generate certificate" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/generate-cert" "200|400|404|500" \
+            test_api "Generate certificate (unsupported provider)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/generate-cert" "400" \
                 '{}' "$group"
             ;;
     esac
@@ -345,11 +400,50 @@ run_module_09() {
 
     test_api "Clear IPv4 pool" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/ipv4-pool" "200" "" "$group"
 
+    # -- Offline pool CRUD/capacity contract: no host/guest IPv6 assignment --
+    test_api "Reset IPv6 pool before coverage" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" "200" "" "$group"
+    if action_test_requires_routed_ipv6 "$ENV_TYPE"; then
+        test_api "Reject manual IPv6 pool on routed-only provider" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" "400" \
+            '{"addresses":"2001:db8:ffff::100\n2001:db8:ffff:1::/127"}' "$group"
+        record_skip_result "IPv6 manual-pool capacity" "SKIP" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" \
+            "${ENV_TYPE}仅接受IPv6隧道路由前缀，手工地址池容量断言不适用" "$group"
+        record_skip_result "Delete IPv6 manual range entry" "SKIP" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool/:entry_id" \
+            "${ENV_TYPE}不创建手工IPv6地址范围" "$group"
+    else
+        test_api_json_value "Set IPv6 discrete address and /127" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" "200" \
+            '.data.addedCount' "2" \
+            '{"addresses":"2001:db8:ffff::100\n2001:db8:ffff:1::/127"}' "$group" >/dev/null
+        test_api_json_value "IPv6 tiny-prefix capacity" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" "200" \
+            '.data.stats.availableExact' "2" "" "$group" >/dev/null
+
+        local ipv6_pool_resp; ipv6_pool_resp=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+            "${SERVER_URL}/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" 2>/dev/null)
+        local ipv6_range_entry_id; ipv6_range_entry_id=$(echo "$ipv6_pool_resp" | \
+            jq -r '.data.list[]? | select(.is_range == true) | .id' 2>/dev/null | head -1)
+        if [[ -n "$ipv6_range_entry_id" ]]; then
+            test_api "Delete IPv6 range entry" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool/${ipv6_range_entry_id}" "200" "" "$group"
+        else
+            record_fail_result "Delete IPv6 range entry" "DELETE" \
+                "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool/:entry_id" "range entry id" "missing" \
+                "$ipv6_pool_resp" "$group"
+        fi
+    fi
+
+    test_api "Reject polluted IPv6 pool input" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" "400" \
+        '{"addresses":"inet6-prefix: not-an-ip\nvalid_lft forever preferred_lft forever"}' "$group"
+    test_api "Clear IPv6 address-file path" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
+        '{"ipv6AddressFilePath":""}' "$group"
+    test_api "IPv6 file sync requires configured path" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool/sync" "400" \
+        '{}' "$group"
+    test_api "Clear IPv6 pool" "DELETE" "/api/v1/admin/providers/${PROVIDER_ID}/ipv6-pool" "200" "" "$group"
+
+    run_ipv6_tunnel_host_lifecycle_tests "$group"
+
     # -- Configuration tasks --
     test_api "Configuration tasks" "GET" "/api/v1/admin/configuration-tasks?page=1&pageSize=10" "200" "" "$group"
 
     # -- Hardware report --
-    test_api "Save hardware report" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "200|400|500" \
+    test_api "Save hardware report" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "200|infra" \
         '{"pasteUrl":"https://paste.spiritlhl.net/#/show/ENn4E.txt"}' "$group"
     test_api "Save hardware report (invalid URL)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "400" \
         '{"pasteUrl":"https://example.com/some-report.txt"}' "$group"
@@ -527,7 +621,7 @@ EOF
     test_api "Provider API list" "GET" "/api/v1/providers" "200" "" "$group"
     test_api "Provider API status" "GET" "/api/v1/providers/${PROVIDER_ID}/status" "200" "" "$group"
     test_api "Provider API capabilities" "GET" "/api/v1/providers/${PROVIDER_ID}/capabilities" "200" "" "$group"
-    test_api "Provider API images" "GET" "/api/v1/providers/${PROVIDER_ID}/images" "200|400|500" "" "$group"
+    test_api "Provider API images" "GET" "/api/v1/providers/${PROVIDER_ID}/images" "200|infra" "" "$group"
 
     # -- Traffic history --
     test_api "Provider traffic history" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/traffic/history" "200" "" "$group"
@@ -553,15 +647,34 @@ EOF
         '{"gpuEnabled":true,"gpuDeviceIds":"0"}' "$group"
     test_api "Update provider gpuEnabled off" "PUT" "/api/v1/admin/providers/${PROVIDER_ID}" "200" \
         '{"gpuEnabled":false,"gpuDeviceIds":""}' "$group"
+    # Updates enqueue a runtime reload which disconnects the previous provider.
+    # Do not race GPU detection against that disconnect/reconnect task.
+    if ! wait_provider_active_tasks_idle "$PROVIDER_ID" "provider ${PROVIDER_ID} GPU updates" "$ADMIN_TOKEN" 300 5; then
+        record_fail_result "Provider reload after GPU updates" "GET" "/api/v1/admin/tasks" \
+            "no active tasks" "timeout" "Provider reload task did not settle" "$group"
+    fi
 
-    # -- detect-gpus: SSH-based GPU detection (may fail on non-LXD, accept 400/500) --
-    test_api "Detect provider GPUs" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/detect-gpus" "200|400|500" "" "$group"
+    # -- detect-gpus is intentionally a negative capability check outside LXD/Incus.
+    if [[ "$ENV_TYPE" == "lxd" || "$ENV_TYPE" == "incus" ]]; then
+        test_api "Detect provider GPUs" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/detect-gpus" "200|infra" "" "$group"
+    else
+        test_api "Detect provider GPUs (unsupported runtime)" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/detect-gpus" "400" "" "$group"
+    fi
 
     # -- stopped-containers: fetch copyable source containers for supported container runtimes --
-    test_api "Get copyable source containers" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/stopped-containers" "200|400|500" "" "$group"
+    case "$ENV_TYPE" in
+        lxd|incus|docker|podman|containerd|orbstack)
+            test_api "Get copyable source containers" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/stopped-containers" "200|infra" "" "$group"
+            ;;
+        *)
+            test_api "Get copyable source containers (unsupported runtime)" "GET" "/api/v1/admin/providers/${PROVIDER_ID}/stopped-containers" "400" "" "$group"
+            ;;
+    esac
 
     # -- exec: run a command on provider via SSH --
-    test_api "Exec command on provider" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/exec" "200|400|500" \
+    # Provider/agent connection failures are explicit infrastructure skips;
+    # validation/product errors remain failures.
+    test_api "Exec command on provider" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/exec" "200|infra" \
         '{"command":"echo hello","timeout":10}' "$group"
 
     # -- exec: empty command must fail --

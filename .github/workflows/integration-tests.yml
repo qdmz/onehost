@@ -79,6 +79,11 @@ on:
           - '3'
           - '4'
         default: '2'
+      live_ipv6_tunnel:
+        description: 'Run host-facing IPv6 tunnel lifecycle checks on a dedicated disposable worker (default: disabled)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -90,8 +95,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-test-agent:
+    uses: ./.github/workflows/build-test-agent.yml
+    permissions:
+      contents: read
+
+  debian-runtime-readiness:
+    name: Debian 12 jq 1.6 runtime readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject empty and malformed runtime responses with jq 1.6
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work debian:12 bash -c '
+            set -euo pipefail
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends jq
+            jq --version
+            bash scripts/tests/non_pve_initialization_test.sh
+          '
+
+  firewall-regressions:
+    name: Real Linux firewall regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache-dependency-path: server/go.sum
+      - name: Test firewall runner prerequisites
+        run: bash scripts/tests/firewall_runner_prerequisite_test.sh
+      - name: Load host firewall kernel modules
+        run: sudo bash scripts/tests/prepare_firewall_kernel.sh
+      - name: Test dual-stack cleanup and Incus/LXD port reuse
+        run: bash scripts/tests/firewall_integration_test.sh
+
   integration-test:
     name: "Test: ${{ matrix.environment }}"
+    needs: [build-test-agent]
+    env:
+      REPORT_DIR: ${{ github.workspace }}/action_tests/reports/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.environment }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     permissions:
@@ -106,6 +154,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Download real Agent artifacts from this run
+        uses: actions/download-artifact@v8
+        with:
+          pattern: integration-agent-*
+          merge-multiple: true
+          path: server/assets/agent
+
+      - name: Verify real Agent assets
+        run: python3 scripts/validate_agent_assets.py server/assets/agent
+
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
@@ -117,7 +175,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl sshpass python3 python3-pip mysql-client
-          pip3 install --quiet paramiko
+          pip3 install --quiet paramiko websocket-client
 
       - name: Validate bash syntax of test scripts
         run: |
@@ -142,7 +200,67 @@ jobs:
         run: bash scripts/tests/provider_image_selection_test.sh
 
       - name: Test action harness failure classification
-        run: bash scripts/tests/action_harness_classification_test.sh
+        run: |
+          bash scripts/tests/action_harness_classification_test.sh
+          bash scripts/tests/containerd_runtime_verifier_test.sh
+          bash scripts/tests/http_status_contract_test.sh
+          bash scripts/tests/instance_creation_result_gate_test.sh
+          bash scripts/tests/port_mapping_result_gate_test.sh
+          bash scripts/tests/port_mapping_agent_readiness_test.sh
+          bash scripts/tests/result_integrity_test.sh
+          bash scripts/tests/module_runner_integrity_test.sh
+          bash scripts/tests/workflow_result_gate_test.sh
+          bash scripts/tests/action_prerequisite_test.sh
+          bash scripts/tests/cnb_snapshot_test.sh
+          python3 scripts/tests/ci_agent_assets_test.py
+
+      - name: Test real SSH output flow control and command deadlines
+        run: |
+          python3 scripts/tests/remote_ssh_io_test.py
+          python3 scripts/tests/webssh_external_probe_test.py
+          python3 scripts/tests/live_node_shell_test.py
+          python3 scripts/tests/live_uninstall_prompts_test.py
+          python3 scripts/tests/live_nested_docker_test.py
+          python3 scripts/tests/live_install_storage_test.py
+
+      - name: Test disposable panel volume cleanup with real Docker
+        run: python3 scripts/tests/live_panel_cleanup_test.py --docker
+
+      - name: Non-PVE installer failure and readiness regressions
+        run: |
+          bash scripts/tests/non_pve_initialization_test.sh
+          bash scripts/tests/local_install_modes_test.sh
+
+      - name: Test provider exec status contract
+        run: bash scripts/tests/provider_exec_status_contract_test.sh
+
+      - name: Test LXD and Incus create resource contracts
+        working-directory: ./server
+        run: go test ./provider/lxd ./provider/incus -run 'APICreateResourceContract|VMSecurityDoesNotSetContainerLimits' -count=1
+
+      - name: Test password rotation and token isolation
+        run: |
+          bash scripts/tests/user_password_rotation_test.sh
+          cd server
+          go test ./utils ./middleware ./service/auth ./service/user/notification
+
+      - name: Test IPv6 tunnel CI isolation
+        run: bash scripts/tests/ipv6_tunnel_ci_isolation_test.sh
+
+      - name: Test IPv6 acceptance cleanup safety
+        run: bash scripts/tests/ipv6_acceptance_cleanup_test.sh
+
+      - name: Test IPv6 tunnel and pool contracts
+        working-directory: ./server
+        run: go test ./service/ipv6tunnel ./service/ipv6pool
+
+      - name: Test installer lifecycle commands
+        run: |
+          bash scripts/tests/install_lifecycle_commands_test.sh
+          bash scripts/tests/download_atomic_test.sh
+
+      - name: Verify default config source consistency
+        run: bash scripts/tests/config_source_consistency_test.sh
 
       - name: Verify generated Swagger docs
         working-directory: ./server
@@ -155,20 +273,22 @@ jobs:
           echo "Swagger docs are up to date."
 
       - name: Run action test static audit
-        continue-on-error: true
         run: |
           set -euo pipefail
-          mkdir -p action_tests/reports
+          mkdir -p ${{ env.REPORT_DIR }}
           audit_exit=0
-          python3 action_tests/static_audit.py --root . --output-dir action_tests/reports --strict --min-route-coverage 82 || audit_exit=$?
+          python3 action_tests/static_audit.py --root . --output-dir ${{ env.REPORT_DIR }} --strict --min-route-coverage 82 || audit_exit=$?
           if [[ "${audit_exit}" != "0" ]]; then
-            echo "::warning::Action test static audit reported advisory findings (exit ${audit_exit}); integration result status is decided by JSONL FAIL counts."
+            echo "::error::Action test static audit found blocking findings (exit ${audit_exit}); integration tests cannot proceed."
           fi
           {
             echo "## Action Test Static Audit"
             echo ""
-            sed -n '1,40p' action_tests/reports/static-audit.md
+            sed -n '1,40p' ${{ env.REPORT_DIR }}/static-audit.md
           } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${audit_exit}" != "0" ]]; then
+            exit "${audit_exit}"
+          fi
 
       - name: Resolve usable cloud platforms
         id: resolve-platforms
@@ -312,24 +432,46 @@ jobs:
           LIGHTNODE_TARGET_MEMORY_MB: "4096"
           LIGHTNODE_STRICT_RECOMMENDED_SPEC: "true"
           PLATFORM_ALLOW_CONCURRENT_INSTANCES: ${{ inputs.environment == 'all' && 'true' || 'false' }}
+          ACTION_TEST_LIVE_IPV6_TUNNEL: ${{ inputs.live_ipv6_tunnel && 'true' || 'false' }}
           ACTION_TEST_CONTAINER_CPU: "2"
           ACTION_TEST_CONTAINER_MEMORY: "2048"
-          ACTION_TEST_CONTAINER_DISK: "20"
+          # Native container providers create several guests on the shared
+          # runner. Keep each test disk small enough for the runner's actual
+          # quota; the preflight still verifies the host has a 20 GiB budget.
+          ACTION_TEST_CONTAINER_DISK: "5"
+          # Controller mappings require a reverse WebSocket; standalone SSH
+          # monitoring is not an online control connection.
+          ACTION_TEST_AGENT_STATUS_MAX_WAIT: "240"
           ACTION_TEST_VM_CPU: "2"
           ACTION_TEST_VM_MEMORY: "4096"
           ACTION_TEST_VM_DISK: "20"
+          ACTION_TEST_KUBEVIRT_CONTAINER_CPU: "1"
+          ACTION_TEST_KUBEVIRT_CONTAINER_MEMORY: "1024"
+          ACTION_TEST_KUBEVIRT_CONTAINER_DISK: "4"
           ACTION_TEST_KUBEVIRT_VM_CPU: "1"
           ACTION_TEST_KUBEVIRT_VM_MEMORY: "512"
-          ACTION_TEST_KUBEVIRT_VM_DISK: "8"
+          ACTION_TEST_KUBEVIRT_VM_DISK: "4"
+          ACTION_TEST_LXD_CONTAINER_CPU: "1"
+          ACTION_TEST_LXD_CONTAINER_MEMORY: "1024"
+          ACTION_TEST_LXD_CONTAINER_DISK: "20"
           ACTION_TEST_LXD_VM_CPU: "1"
           ACTION_TEST_LXD_VM_MEMORY: "1024"
           ACTION_TEST_LXD_VM_DISK: "20"
+          ACTION_TEST_INCUS_CONTAINER_CPU: "1"
+          ACTION_TEST_INCUS_CONTAINER_MEMORY: "1024"
+          ACTION_TEST_INCUS_CONTAINER_DISK: "20"
           ACTION_TEST_INCUS_VM_CPU: "1"
           ACTION_TEST_INCUS_VM_MEMORY: "1024"
           ACTION_TEST_INCUS_VM_DISK: "20"
+          ACTION_TEST_PROXMOXVE_CONTAINER_CPU: "1"
+          ACTION_TEST_PROXMOXVE_CONTAINER_MEMORY: "1024"
+          ACTION_TEST_PROXMOXVE_CONTAINER_DISK: "8"
           ACTION_TEST_PROXMOXVE_VM_CPU: "1"
           ACTION_TEST_PROXMOXVE_VM_MEMORY: "1024"
           ACTION_TEST_PROXMOXVE_VM_DISK: "8"
+          ACTION_TEST_QEMU_CONTAINER_CPU: "1"
+          ACTION_TEST_QEMU_CONTAINER_MEMORY: "1024"
+          ACTION_TEST_QEMU_CONTAINER_DISK: "8"
           ACTION_TEST_QEMU_VM_CPU: "1"
           ACTION_TEST_QEMU_VM_MEMORY: "1024"
           ACTION_TEST_QEMU_VM_DISK: "8"
@@ -390,7 +532,7 @@ jobs:
           chmod -R +x action_tests/modules/ 2>/dev/null || true
           chmod -R +x action_tests/common/ 2>/dev/null || true
           chmod -R +x action_tests/report/ 2>/dev/null || true
-          mkdir -p action_tests/reports
+          mkdir -p ${{ env.REPORT_DIR }}
 
           RESOLVED_PLATFORMS="${{ steps.resolve-platforms.outputs.usable_platforms }}"
           if [[ -z "$RESOLVED_PLATFORMS" ]]; then
@@ -439,7 +581,7 @@ jobs:
           bash action_tests/run_env_test.sh \
             "${{ matrix.environment }}" \
             "${{ inputs.modules }}" \
-            "${{ steps.validate.outputs.instance_types }}" 2>&1 | tee action_tests/reports/full-output.log
+            "${{ steps.validate.outputs.instance_types }}" 2>&1 | tee ${{ env.REPORT_DIR }}/full-output.log
           PIPE_STATUSES=("${PIPESTATUS[@]}")
           TEST_EXIT=${PIPE_STATUSES[0]:-0}
           TEE_EXIT=${PIPE_STATUSES[1]:-0}
@@ -450,20 +592,23 @@ jobs:
           fi
 
           # Ensure tee didn't break the pipe
-          if [[ ! -s action_tests/reports/full-output.log ]]; then
-            echo "WARNING: Test produced no output. Check that required platform secrets are configured." > action_tests/reports/full-output.log
+          if [[ ! -s ${{ env.REPORT_DIR }}/full-output.log ]]; then
+            echo "WARNING: Test produced no output. Check that required platform secrets are configured." > ${{ env.REPORT_DIR }}/full-output.log
           fi
 
           # Ensure report directory has at least a fallback file
-          if ! ls action_tests/reports/*.html 1>/dev/null 2>&1; then
+          if ! ls ${{ env.REPORT_DIR }}/*.html 1>/dev/null 2>&1; then
             if [[ "${TEST_EXIT}" == "75" ]]; then
-              echo "<html><body><h1>Test Skipped</h1><p>Temporary infrastructure/runtime prerequisite failure (exit code 75).</p><pre>$(cat action_tests/reports/full-output.log)</pre></body></html>" > "action_tests/reports/${{ matrix.environment }}-report.html"
+              echo "<html><body><h1>Test Skipped</h1><p>Temporary infrastructure/runtime prerequisite failure (exit code 75).</p><pre>$(cat ${{ env.REPORT_DIR }}/full-output.log)</pre></body></html>" > "${{ env.REPORT_DIR }}/${{ matrix.environment }}-report.html"
             else
-              echo "<html><body><h1>Test Failed</h1><p>Exit code: ${TEST_EXIT}</p><pre>$(cat action_tests/reports/full-output.log)</pre></body></html>" > "action_tests/reports/${{ matrix.environment }}-report.html"
+              echo "<html><body><h1>Test Failed</h1><p>Exit code: ${TEST_EXIT}</p><pre>$(cat ${{ env.REPORT_DIR }}/full-output.log)</pre></body></html>" > "${{ env.REPORT_DIR }}/${{ matrix.environment }}-report.html"
             fi
           fi
 
-          # Always exit 0 - test failures are captured in reports/artifacts, not as step failure
+          # Keep the reports/artifacts even when the harness fails, but expose
+          # the real status to the validation step.  Returning success here
+          # used to let an aborted or empty run look like a green workflow when
+          # the follow-up step itself was skipped or never received its output.
           exit 0
 
       - name: Validate integration test results
@@ -474,10 +619,13 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          # If the run-tests step was skipped/aborted before setting its output, treat as skip.
+          # If the run-tests step was skipped/aborted before setting its output,
+          # this is an incomplete run, not a feature skip.  A green workflow
+          # must never be produced without an authoritative harness status.
           if [[ -z "${TEST_EXIT:-}" ]]; then
-            echo "::warning::Test step did not produce an exit code — it may have been skipped or aborted early. Check workflow logs."
-            exit 0
+            echo "::error::Test step did not produce an exit code — it was skipped or aborted before results were finalized."
+            [[ -f ${{ env.REPORT_DIR }}/full-output.log ]] && tail -200 ${{ env.REPORT_DIR }}/full-output.log || true
+            exit 1
           fi
 
           HARNESS_NONZERO=false
@@ -487,15 +635,17 @@ jobs:
             if [[ "${TEST_EXIT}" == "75" ]]; then
               _skip_reason="temporary infrastructure/runtime prerequisite failure (EX_TEMPFAIL=75)"
             else
-              _skip_reason="infrastructure failure (harness exited with code ${TEST_EXIT})"
+              _skip_reason="harness exited with code ${TEST_EXIT}"
             fi
             echo "::warning::Integration harness exited non-zero: ${_skip_reason}. Aggregating any JSONL results that were produced."
           fi
 
-          result_files=(action_tests/reports/*.jsonl)
+          result_files=()
+          current_results="${REPORT_DIR}/${{ matrix.environment }}-results.jsonl"
+          [[ ! -f "$current_results" ]] || result_files=("$current_results")
           if [[ ${#result_files[@]} -eq 0 ]]; then
             if [[ "${HARNESS_NONZERO}" == "true" ]]; then
-              echo "::warning::Integration tests did not produce JSONL results after ${_skip_reason}."
+              echo "::error::Integration tests did not produce JSONL results after ${_skip_reason}."
               {
                 echo "## Integration Validation"
                 echo ""
@@ -503,21 +653,27 @@ jobs:
                 echo "|--------|-------|"
                 echo "| Resolved Platforms | ${{ steps.resolve-platforms.outputs.platform_priority }} |"
                 echo "| Harness Exit Code | ${TEST_EXIT} |"
-                echo "| Status | SKIPPED (${_skip_reason}; no JSONL results) |"
+                echo "| Status | INCOMPLETE (${_skip_reason}; no JSONL results) |"
               } >> "$GITHUB_STEP_SUMMARY"
-              [[ -f action_tests/reports/full-output.log ]] && tail -200 action_tests/reports/full-output.log || true
-              exit 0
+              [[ -f ${{ env.REPORT_DIR }}/full-output.log ]] && tail -200 ${{ env.REPORT_DIR }}/full-output.log || true
+              exit 1
             fi
             echo "::error::Integration tests did not produce any JSONL result files."
-            [[ -f action_tests/reports/full-output.log ]] && tail -200 action_tests/reports/full-output.log || true
+            [[ -f ${{ env.REPORT_DIR }}/full-output.log ]] && tail -200 ${{ env.REPORT_DIR }}/full-output.log || true
             exit 1
           fi
 
-          # Safely aggregate results - handle empty/corrupt JSONL lines
+          # Safely aggregate results - handle empty/corrupt JSONL lines.  The
+          # harness performs infrastructure/preflight checks, while module
+          # assertions are the product/API checks.  Keep those populations
+          # separate so a worker transport skip is not reported as a module
+          # failure (or as a successful module run).
           total=0 passed=0 failed=0 skipped=0 corrupt=0
+          harness_total=0 harness_passed=0 harness_failed=0 harness_skipped=0
+          module_total=0 module_passed=0 module_failed=0 module_skipped=0
           for f in "${result_files[@]}"; do
             line_no=0
-            while IFS= read -r line; do
+            while IFS= read -r line || [[ -n "$line" ]]; do
               line_no=$((line_no + 1))
               [[ -z "$line" ]] && continue
               if ! status=$(echo "$line" | jq -er '.status // "UNKNOWN"' 2>/dev/null); then
@@ -526,16 +682,35 @@ jobs:
                 corrupt=$((corrupt + 1))
                 continue
               fi
+              group=$(echo "$line" | jq -r '.group // "default"' 2>/dev/null)
+              [[ -z "$group" || "$group" == "null" ]] && group="default"
               total=$((total + 1))
-              case "$status" in
-                PASS) passed=$((passed + 1)) ;;
-                FAIL) failed=$((failed + 1)) ;;
-                SKIP) skipped=$((skipped + 1)) ;;
-                *) skipped=$((skipped + 1)) ;;
-              esac
+              if [[ "$group" == "HARNESS" ]]; then
+                harness_total=$((harness_total + 1))
+                case "$status" in
+                  PASS) harness_passed=$((harness_passed + 1)); passed=$((passed + 1)) ;;
+                  FAIL) harness_failed=$((harness_failed + 1)); failed=$((failed + 1)) ;;
+                  SKIP) harness_skipped=$((harness_skipped + 1)); skipped=$((skipped + 1)) ;;
+                  *)
+                    echo "::error file=${f},line=${line_no}::Unknown JSONL result status '${status}'"
+                    corrupt=$((corrupt + 1))
+                    ;;
+                esac
+              else
+                module_total=$((module_total + 1))
+                case "$status" in
+                  PASS) module_passed=$((module_passed + 1)); passed=$((passed + 1)) ;;
+                  FAIL) module_failed=$((module_failed + 1)); failed=$((failed + 1)) ;;
+                  SKIP) module_skipped=$((module_skipped + 1)); skipped=$((skipped + 1)) ;;
+                  *)
+                    echo "::error file=${f},line=${line_no}::Unknown JSONL result status '${status}'"
+                    corrupt=$((corrupt + 1))
+                    ;;
+                esac
+              fi
             done < "$f"
           done
-          executed=$((passed + failed))
+          module_executed=$((module_passed + module_failed))
 
           {
             echo "## Integration Validation"
@@ -544,10 +719,10 @@ jobs:
             echo "|--------|-------|"
             echo "| Resolved Platforms | ${{ steps.resolve-platforms.outputs.platform_priority }} |"
             echo "| Harness Exit Code | ${TEST_EXIT} |"
-            echo "| Total | ${total} |"
-            echo "| Passed | ${passed} |"
-            echo "| Failed | ${failed} |"
-            echo "| Skipped | ${skipped} |"
+            echo "| Harness Checks | total=${harness_total}, pass=${harness_passed}, fail=${harness_failed}, skip=${harness_skipped} |"
+            echo "| Module Assertions | total=${module_total}, pass=${module_passed}, fail=${module_failed}, skip=${module_skipped} |"
+            echo "| Module tests executed | $([[ ${module_executed} -gt 0 ]] && echo yes || echo no) |"
+            echo "| All Results | total=${total}, pass=${passed}, fail=${failed}, skip=${skipped} |"
             echo "| Corrupt JSONL Lines | ${corrupt} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -558,17 +733,21 @@ jobs:
 
           if [[ "$total" -eq 0 ]]; then
             if [[ "${HARNESS_NONZERO}" == "true" ]]; then
-              echo "::warning::Integration tests produced an empty result set after ${_skip_reason}."
-              [[ -f action_tests/reports/full-output.log ]] && tail -200 action_tests/reports/full-output.log || true
-              exit 0
+              echo "::error::Integration tests produced an empty result set after ${_skip_reason}."
+              [[ -f ${{ env.REPORT_DIR }}/full-output.log ]] && tail -200 ${{ env.REPORT_DIR }}/full-output.log || true
+              exit 1
             fi
             echo "::error::Integration tests produced an empty result set."
             exit 1
           fi
 
-          if [[ "$executed" -eq 0 ]]; then
-            echo "::warning::All ${skipped} test assertions were skipped; no executable checks ran."
-            # All-skip is a valid result for a limited module run — don't block the Action.
+          if [[ "$module_executed" -eq 0 ]]; then
+            echo "::error::No module assertions were executed (module total=${module_total}, skipped=${module_skipped}). The run only completed harness/preflight checks and cannot be reported as a successful integration test."
+            {
+              echo ""
+              echo "> **Integration validation blocked:** no module assertions were executed. The result set contains harness/preflight checks only; resolve the infrastructure/setup condition and rerun."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           if [[ "$failed" -ne 0 ]]; then
@@ -577,9 +756,10 @@ jobs:
               echo "### Failed Assertions"
               echo ""
             } >> "$GITHUB_STEP_SUMMARY"
+            # shellcheck disable=SC2094 # jq --arg passes the JSONL path as annotation data; the input file is never written.
             for f in "${result_files[@]}"; do
               line_no=0
-              while IFS= read -r line; do
+              while IFS= read -r line || [[ -n "$line" ]]; do
                 line_no=$((line_no + 1))
                 [[ -z "$line" ]] && continue
                 [[ "$(echo "$line" | jq -r '.status // empty' 2>/dev/null)" == "FAIL" ]] || continue
@@ -637,14 +817,16 @@ jobs:
           fi
 
           if [[ "${HARNESS_NONZERO}" == "true" ]]; then
-            echo "::warning::Integration harness exited with ${TEST_EXIT} after writing ${total} result(s): ${_skip_reason}. JSONL results were still aggregated above."
+            echo "::error::Integration harness exited with ${TEST_EXIT} after writing ${total} result(s): ${_skip_reason}. Partial assertions cannot make an incomplete run pass."
+            echo "| Status | INCOMPLETE (${_skip_reason}) |" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
       - name: Show integration log on failure
         if: failure()
         run: |
           echo "=== Integration Test Output (last 200 lines) ==="
-          tail -200 action_tests/reports/full-output.log || true
+          tail -200 ${{ env.REPORT_DIR }}/full-output.log || true
 
       - name: Upload test reports
         if: always()
@@ -652,12 +834,12 @@ jobs:
         with:
           name: test-reports-${{ matrix.environment }}-${{ github.run_number }}
           path: |
-            action_tests/reports/*.html
-            action_tests/reports/*.md
-            action_tests/reports/*.log
-            action_tests/reports/*.txt
-            action_tests/reports/*.json
-            action_tests/reports/*.jsonl
+            ${{ env.REPORT_DIR }}/*.html
+            ${{ env.REPORT_DIR }}/*.md
+            ${{ env.REPORT_DIR }}/*.log
+            ${{ env.REPORT_DIR }}/*.txt
+            ${{ env.REPORT_DIR }}/*.json
+            ${{ env.REPORT_DIR }}/*.jsonl
           retention-days: 30
 
       - name: Publish to GitHub Pages
@@ -670,8 +852,8 @@ jobs:
           ENV="${{ matrix.environment }}"
           REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           PUBLISH_SRC=$(mktemp -d)
-          cp action_tests/reports/*.html "$PUBLISH_SRC/" 2>/dev/null || true
-          cp action_tests/reports/*.jsonl "$PUBLISH_SRC/" 2>/dev/null || true
+          cp ${{ env.REPORT_DIR }}/*.html "$PUBLISH_SRC/" 2>/dev/null || true
+          cp ${{ env.REPORT_DIR }}/*.jsonl "$PUBLISH_SRC/" 2>/dev/null || true
 
           # Matrix jobs may finish together. Re-clone and rebuild the index on each retry so
           # a concurrent gh-pages update cannot discard another environment's report.
@@ -690,7 +872,7 @@ jobs:
 
             KEEP=7
             if [[ -d "report-repo/reports/${ENV}" ]]; then
-              SORTED=$(ls -d "report-repo/reports/${ENV}/"*/ 2>/dev/null | sort -r)
+              SORTED=$(find "report-repo/reports/${ENV}" -mindepth 1 -maxdepth 1 -type d | sort -r)
               COUNT=0
               while IFS= read -r dir; do
                 COUNT=$((COUNT + 1))
@@ -721,26 +903,27 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Environment | ${{ matrix.environment }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Platform | ${{ inputs.platform }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Resolved Cloud Platforms | ${{ steps.resolve-platforms.outputs.platform_priority }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Instance Types | ${{ steps.validate.outputs.instance_types }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Modules | ${{ inputs.modules }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ -f "action_tests/reports/${{ matrix.environment }}-report.md" ]]; then
-            cat "action_tests/reports/${{ matrix.environment }}-report.md" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "No markdown report file found." >> $GITHUB_STEP_SUMMARY
-          fi
-          # Also show last 30 lines of output for quick debugging
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "<details><summary>Last 30 lines of test output</summary>" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -30 action_tests/reports/full-output.log >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No output log found"
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "</details>" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Integration Test Results"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Environment | ${{ matrix.environment }} |"
+            echo "| Platform | ${{ inputs.platform }} |"
+            echo "| Resolved Cloud Platforms | ${{ steps.resolve-platforms.outputs.platform_priority }} |"
+            echo "| Instance Types | ${{ steps.validate.outputs.instance_types }} |"
+            echo "| Modules | ${{ inputs.modules }} |"
+            echo ""
+            if [[ -f "${REPORT_DIR}/${{ matrix.environment }}-report.md" ]]; then
+              cat "${REPORT_DIR}/${{ matrix.environment }}-report.md"
+            else
+              echo "No markdown report file found."
+            fi
+            echo ""
+            echo "<details><summary>Last 30 lines of test output</summary>"
+            echo ""
+            echo '```'
+            tail -30 "${REPORT_DIR}/full-output.log" 2>/dev/null || echo "No output log found"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

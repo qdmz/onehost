@@ -8,6 +8,10 @@
 
 报告支持中英双语切换、亮色/暗色主题切换，标题下方显示当前测试对应的主控版本、Agent 版本、Git ref/SHA、GitHub Actions run id 和 workflow 信息。
 
+正式 Actions 会从当前提交构建 AMD64/ARM64 Rust Agent，并校验嵌入包为对应架构的 ELF，不能用模拟 Agent 代替真实监控验证。本地运行需先准备同样的真实包到 `server/assets/agent/`；仅调试测试编排器时可显式设置 `ACTION_TEST_GENERATE_STUB_AGENT=true`，该模式不代表真实 Agent 验收，且禁止用于 GitHub Actions。
+
+专用节点的当前源码面板、真实 Rust Agent 和独立 WebSSH 验收入口见 [真实环境验收说明](../scripts/tests/LIVE_ACCEPTANCE.md)。缺少真实环境不计为通过。Actions 报告写入按 run/attempt/environment 隔离的临时目录，结果门禁只读取当次环境的 JSONL，不再混入仓库中的历史报告。
+
 ## 架构设计
 
 测试采用双节点架构。单个虚拟化环境内的模块按顺序执行；选择 `all` 时默认最多并发运行 2 个相互隔离的环境，每个环境独占并清理自己的 Worker：
@@ -118,6 +122,8 @@ action_tests/
 
 LXD/Incus 等环境在 CI 中依赖远程镜像站、DNS 和 Worker 出网能力。测试框架会把 `Temporary failure resolving`、`curl: (6)`、`lookup images.lxd.canonical.com ... [::1]:53`、远程镜像下载失败、Worker SSH 不可达等明确的基础设施问题记录为 `SKIP`，并继续清理已创建的半成品实例；接口返回格式错误、权限错误、业务状态错误仍会记录为 `FAIL`。
 
+正向 API 断言可以把期望状态写成 `200|infra`（或 `200|201|infra`）。其中 `infra` 不是任意 4xx/5xx 的别名：只有响应正文明确匹配远端连接、DNS、镜像下载或节点不可达等基础设施诊断时才记录 `SKIP`；普通参数、权限和业务错误仍然记录 `FAIL`，不会被当作测试通过。
+
 `26_instance_types.sh` 在创建 container/VM 类型实例前会等待同一 Provider 的活跃任务队列清空；创建任务默认最多等待 `INSTANCE_TYPE_TASK_MAX_WAIT=1800` 秒（不会低于 `INSTANCE_TASK_MAX_WAIT`）。如果任务在超时后仍处于 `pending`、`running`、`processing`、`queued` 或 `cancelling`，测试会先调用管理员取消接口并记录为可恢复的 `SKIP`，避免在创建任务仍运行时删除实例导致后续 `record not found`。
 
 `29_provider_images.sh` 将 `TEST_IMAGES` 视为操作系统家族过滤器。默认会为每个匹配的“操作系统家族 + 实例类型”只选择版本最高的稳定镜像，避免同一次环境测试把 Alpine/Debian 的全部历史版本逐一创建并耗尽 Action 时限。可通过 `PROVIDER_IMAGE_MAX_PER_FAMILY_TYPE` 调整每组样本数；设置为 `0` 时恢复完整镜像矩阵。该模块使用独立的 `PROVIDER_IMAGE_TASK_MAX_WAIT` 和 `PROVIDER_IMAGE_STATUS_MAX_WAIT`，不会继承面向安装/配置任务的超长通用等待预算。
@@ -174,7 +180,7 @@ export PLATFORM_ALICE_ENABLED=true
 export PLATFORM_LIGHTNODE_ENABLED=true
 export ALICE_CLIENT_ID="..."
 export LIGHTNODE_TOKEN="your_token"
-# LightNode 默认严格使用第 3 档 2C/4G；目标套餐不存在时直接失败，不会降级到低配。
+# LightNode 基线为 2C/4G；混合容器/VM 环境会按峰值自动提高到至少 4C/8G。
 export LIGHTNODE_PACKAGE_TIER=3
 export LIGHTNODE_TARGET_CPU=2
 export LIGHTNODE_TARGET_MEMORY_MB=4096
@@ -224,6 +230,12 @@ ACTION_TEST_VERBOSE_RESPONSES=1 bash action_tests/run_module.sh 01-05
 # 运行静态审计（不访问真实服务，CI 使用 82% 路由覆盖门槛）
 python3 action_tests/static_audit.py --root . --output-dir action_tests/reports --strict --min-route-coverage 82
 ```
+
+### IPv6 隧道测试隔离
+
+常规 Action 默认不会调用 IPv6 隧道 API，也不会检查、创建、删除或修改工作节点的隧道配置。隧道状态机、地址池冻结和清理由 Go 契约测试通过假远端执行器覆盖，不依赖 Tunnelbroker 或其他外部隧道服务。只有在专用、可销毁工作节点上显式设置 `ACTION_TEST_LIVE_IPV6_TUNNEL=true`（GitHub Action 的 `live_ipv6_tunnel` 输入），且 runner 的直连 IPv6 探测成功时，才会运行宿主机侧的禁用隧道生命周期检查。无可用 IPv6 的 runner 明确记录 `SKIP`，不执行实际 IPv6 分配或连通性测试；地址池 CRUD、容量计算等不分配宿主/实例地址的离线契约检查仍执行。隔离容器中的防火墙规则测试仅使用文档地址验证规则，不要求公网 IPv6。
+
+防火墙回归的 Linux Docker 主机需要 nftables 和 legacy IPv4/IPv6 NAT 内核模块。CI 先执行 `sudo bash scripts/tests/prepare_firewall_kernel.sh` 预加载模块，再在仅授予 `NET_ADMIN`、无挂载且独立网络命名空间的临时容器内运行测试。脚本不清空主机规则，不分配 IPv6 地址。缺少 `ip6table_nat` 等模块会在前置检查中明确失败；不能仅通过容器内安装 `iptables`、开启特权模式或跳过整个 IPv6 规则组掩盖。
 
 ## 测试报告
 
@@ -324,6 +336,8 @@ GitHub Actions 会自动安装所需依赖。
 | 密钥名称 | 值格式 | 必需 |
 |---------|--------|------|
 | `TEST_ADMIN_PASS` | 任意字符串密码，默认 `Admin123!@#` | 否 |
+| `REMOTE_STRICT_HOST_KEY` | 设为 `yes`/`true` 后，`action_tests/common/remote.py` 拒绝未知 SSH 主机密钥；适用于已预登记的节点 | 否 |
+| `REMOTE_KNOWN_HOSTS` | Paramiko SSH 信任文件路径；设置后自动启用严格校验，未知或变更指纹直接失败 | 否 |
 
 **Alice/Ephemera**（默认平台）
 
@@ -342,15 +356,26 @@ GitHub Actions 会自动安装所需依赖。
 | `LIGHTNODE_PRIVATE_KEY` | SSH 私钥完整内容，含 `-----BEGIN ... PRIVATE KEY-----` 头尾 |
 | `LIGHTNODE_SSH_KEY_UUID` | LightNode 账户中已上传 SSH 公钥的 UUID（在 LightNode 控制台 SSH Keys 页面查看） |
 | `LIGHTNODE_PACKAGE_TIER` | 默认 `3`，自动选套餐时优先使用第 3 档 |
-| `LIGHTNODE_TARGET_CPU` | 默认 `2`，优先匹配 2 核套餐 |
-| `LIGHTNODE_TARGET_MEMORY_MB` | 默认 `4096`，优先匹配 4G 内存套餐 |
-| `LIGHTNODE_PACKAGE_CODE` | 可选，指定后直接使用该 LightNode 套餐 code |
+| `LIGHTNODE_TARGET_CPU` | 默认 `2`；混合容器/VM 环境会按测试峰值自动提高到至少 `4`，显式更大值不会被降低 |
+| `LIGHTNODE_TARGET_MEMORY_MB` | 默认 `4096`；混合容器/VM 环境会按测试峰值自动提高到至少 `8192`，显式更大值不会被降低 |
+| `LIGHTNODE_PACKAGE_CODE` | 可选，指定后仍会校验套餐不小于当前环境的峰值预算，不足则在创建前失败 |
 | `PVE_USE_PRIVATE_IP` | PVE 安装脚本参数；LightNode + ProxmoxVE 测试默认 `false`，避免双网卡宿主重启后写入私网地址和公网网关的组合 |
 | `PVE_MAIN_INTERFACE` | PVE 安装脚本参数；LightNode + ProxmoxVE 测试默认 `eth1`，对应 LightNode 公网默认路由网口 |
 | `PVE_NAT_SUBNET` | 可选的 ProxmoxVE NAT `/24` 网段（必须以 `.0/24` 结尾）；未设置时安装脚本会避开宿主机现有路由自动选择，并将结果持久化供 Provider 与 PVE 创建脚本复用 |
 | `PVE_INSTALL_SCRIPT_LOCAL_PATH` | 可选，本地 ProxmoxVE installer 调试路径；未设置时自动探测同级 `pve` 仓库 |
+| `PVE_REMOTE_SSH_RECOVERY_WAIT` | 默认 `600` 秒；PVE 网络重载导致 SSH 暂时断开时，等待连接恢复的上限，不会在此期间重复启动安装脚本 |
+| `PVE_REMOTE_SSH_STABLE_WAIT` | 默认 `180` 秒；作业完成后等待 SSH 连续稳定探测的上限，避免网络刚恢复又抖动时进入下一阶段 |
+| `PVE_REMOTE_STABLE_PROBES` / `PVE_REMOTE_STABLE_INTERVAL` | 默认 `3` 次 / `5` 秒；连续成功的 SSH/远端 `true` 探测窗口 |
+| `PVE_REMOTE_RUNNING_GRACE_WAIT` | 默认 `900` 秒；主轮询超时后若远端作业仍报告 `RUNNING`，继续观察的上限；仍在运行时保持节点不重启并记录为基础设施跳过 |
+| `PVE_POSTCONDITION_MAX_WAIT` | 默认 `180` 秒；PVE 作业返回非零后等待持久完成标记、8006、网桥和 NAT 规则出现的上限 |
 | `INCUS_INSTALL_SCRIPT_LOCAL_PATH` | 可选，本地 Incus installer 调试路径；未设置时自动探测同级 `incus` 仓库 |
 | `KUBEVIRT_INSTALL_SCRIPT_LOCAL_PATH` | 可选，本地 KubeVirt installer 调试路径；未设置时自动探测同级 `kubevirt` 仓库 |
+| `ACTION_TEST_LIVE_IPV6_TUNNEL` | 默认 `false`；仅限专用可销毁工作节点的显式宿主机隧道生命周期检查 |
+| `ACTION_TEST_AGENT_STATUS_MAX_WAIT` | 默认 `240` 秒；模块 13 等待 Agent 反向 WebSocket 在线的上限。SSH 监控进程运行不代表控制连接在线；无反向连接时明确 SKIP，不通过重装监控进程冒充控制端映射验收 |
+| `OCV_LIVE_NETWORK_TYPE` | live 面板验收网络模式：`nat_ipv4`、`ipv6_only` 或 `nat_ipv4_ipv6` |
+| `OCV_LIVE_IPV6_MAPPING_METHOD` | Incus/LXD 的 `device_proxy`/`iptables` 为宿主 IPv6 映射，`native` 为地址池分配的独立公网 IPv6 |
+| `OCV_LIVE_IPV6` | 设为 `yes` 后对 IPv6 模式执行容器出网、独立公网 HTTP 与严格 SSH 验收；缺条件直接失败 |
+| `OCV_WEBSSH_SOURCE_IPV6` | WebSSH 通过 IPv6 登录时的实际 SSH 来源地址，不能填写网页服务 IPv4 |
 
 **Action 实例规格**
 
@@ -358,25 +383,41 @@ GitHub Actions 会自动安装所需依赖。
 |------|--------|
 | `ACTION_TEST_CONTAINER_CPU` | `2` |
 | `ACTION_TEST_CONTAINER_MEMORY` | `2048` |
-| `ACTION_TEST_CONTAINER_DISK` | `20` |
+| `ACTION_TEST_CONTAINER_DISK` | `5` |
 | `ACTION_TEST_VM_CPU` | `2` |
 | `ACTION_TEST_VM_MEMORY` | `4096` |
 | `ACTION_TEST_VM_DISK` | `20` |
+| `ACTION_TEST_KUBEVIRT_CONTAINER_CPU` | `1`（仅 KubeVirt，覆盖 `ACTION_TEST_CONTAINER_CPU`） |
+| `ACTION_TEST_KUBEVIRT_CONTAINER_MEMORY` | `1024`（仅 KubeVirt） |
+| `ACTION_TEST_KUBEVIRT_CONTAINER_DISK` | `4`（仅 KubeVirt） |
 | `ACTION_TEST_KUBEVIRT_VM_CPU` | `1`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_CPU`） |
-| `ACTION_TEST_KUBEVIRT_VM_MEMORY` | `512`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_MEMORY`；2C/4G LightNode Worker 上更容易调度） |
-| `ACTION_TEST_KUBEVIRT_VM_DISK` | `8`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_KUBEVIRT_VM_MEMORY` | `512`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_MEMORY`） |
+| `ACTION_TEST_KUBEVIRT_VM_DISK` | `4`（仅 KubeVirt，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_LXD_CONTAINER_CPU` / `ACTION_TEST_INCUS_CONTAINER_CPU` | `1` |
+| `ACTION_TEST_LXD_CONTAINER_MEMORY` / `ACTION_TEST_INCUS_CONTAINER_MEMORY` | `1024` |
+| `ACTION_TEST_LXD_CONTAINER_DISK` / `ACTION_TEST_INCUS_CONTAINER_DISK` | `20` |
 | `ACTION_TEST_LXD_VM_CPU` | `1`（仅 LXD，覆盖 `ACTION_TEST_VM_CPU`） |
 | `ACTION_TEST_LXD_VM_MEMORY` | `1024`（仅 LXD，覆盖 `ACTION_TEST_VM_MEMORY`） |
 | `ACTION_TEST_LXD_VM_DISK` | `20`（仅 LXD，覆盖 `ACTION_TEST_VM_DISK`） |
 | `ACTION_TEST_INCUS_VM_CPU` | `1`（仅 Incus，覆盖 `ACTION_TEST_VM_CPU`） |
 | `ACTION_TEST_INCUS_VM_MEMORY` | `1024`（仅 Incus，覆盖 `ACTION_TEST_VM_MEMORY`） |
 | `ACTION_TEST_INCUS_VM_DISK` | `20`（仅 Incus，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_PROXMOXVE_CONTAINER_CPU` | `1`（仅 ProxmoxVE，覆盖 `ACTION_TEST_CONTAINER_CPU`） |
+| `ACTION_TEST_PROXMOXVE_CONTAINER_MEMORY` | `1024`（仅 ProxmoxVE） |
+| `ACTION_TEST_PROXMOXVE_CONTAINER_DISK` | `8`（仅 ProxmoxVE） |
 | `ACTION_TEST_PROXMOXVE_VM_CPU` | `1`（仅 ProxmoxVE，覆盖 `ACTION_TEST_VM_CPU`） |
 | `ACTION_TEST_PROXMOXVE_VM_MEMORY` | `1024`（仅 ProxmoxVE，覆盖 `ACTION_TEST_VM_MEMORY`） |
 | `ACTION_TEST_PROXMOXVE_VM_DISK` | `8`（仅 ProxmoxVE，覆盖 `ACTION_TEST_VM_DISK`） |
+| `ACTION_TEST_QEMU_CONTAINER_CPU` | `1`（仅 QEMU，覆盖 `ACTION_TEST_CONTAINER_CPU`） |
+| `ACTION_TEST_QEMU_CONTAINER_MEMORY` | `1024`（仅 QEMU） |
+| `ACTION_TEST_QEMU_CONTAINER_DISK` | `8`（仅 QEMU） |
 | `ACTION_TEST_QEMU_VM_CPU` | `1`（仅 QEMU，覆盖 `ACTION_TEST_VM_CPU`） |
 | `ACTION_TEST_QEMU_VM_MEMORY` | `1024`（仅 QEMU，覆盖 `ACTION_TEST_VM_MEMORY`） |
 | `ACTION_TEST_QEMU_VM_DISK` | `8`（仅 QEMU，覆盖 `ACTION_TEST_VM_DISK`） |
+
+`lxd`、`incus`、`proxmoxve`、`qemu`、`kubevirt` 会在创建后及安装后按实际峰值占用复核 CPU、内存、磁盘和 KVM。`both` 默认预算包含最多两个 discovery fixture、保留的基准容器以及待创建 VM，因此最低为 4C/8GB；单一 `container` 或 `vm` 测试只准备对应夹具并使用较低预算。LXD/Incus 安装器会使用根分区可用空间减 1GB 创建存储池，因此它们的宿主机磁盘门槛按测试磁盘总和加 1GB 计算；其他嵌套运行时保留 4GB 存储余量。
+
+PVE 安装是可观测的分阶段任务：首次执行写入重启标记并安装内核，Action 触发重启后会等待 SSH 连续稳定；对于未预装 `ifupdown` 的 Debian 镜像，PVE 安装器可能在首次启动时由 `ifupdown2-install.service` 安装网络组件并再次重启，测试编排器会等待该服务结束和 SSH 再次稳定后才启动第二阶段，不会并发重复执行安装脚本。可用 `PVE_IFUPDOWN2_BOOTSTRAP_MAX_WAIT`（默认复用重启等待上限）调整观察窗口。
 
 **Vultr**
 

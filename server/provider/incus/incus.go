@@ -3,6 +3,7 @@ package incus
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"oneclickvirt/global"
+	providerModel "oneclickvirt/model/provider"
 	"oneclickvirt/provider"
 	"oneclickvirt/provider/health"
 	"oneclickvirt/utils"
@@ -27,6 +29,7 @@ type IncusProvider struct {
 	transport        *http.Transport // 保存transport以便清理
 	providerID       uint            // 存储providerID用于清理
 	connected        bool
+	apiHealthy       bool // API-only mode has no SSH executor to represent liveness.
 	healthChecker    health.HealthChecker
 	version          string             // Incus 版本
 	mu               sync.RWMutex       // 保护并发访问
@@ -67,6 +70,14 @@ func (i *IncusProvider) GetSupportedInstanceTypes() []string {
 func (i *IncusProvider) Connect(ctx context.Context, config provider.NodeConfig) error {
 	i.config = config
 	i.providerID = config.ID // 存储providerID
+	i.connected = false
+	i.apiHealthy = false
+	i.sshClient.ClearExecutor()
+	if i.transport != nil {
+		// A failed reconnect must not retain a certificate from a previous
+		// configuration and accidentally keep API mode enabled.
+		i.transport.TLSClientConfig = nil
+	}
 
 	// Transport 已在 NewIncusProvider 中创建，现在关联providerID
 	if i.transport != nil && i.providerID > 0 {
@@ -95,6 +106,20 @@ func (i *IncusProvider) Connect(ctx context.Context, config provider.NodeConfig)
 	} else {
 		global.APP_LOG.Debug("未找到Incus证书配置，仅使用SSH",
 			zap.String("host", utils.TruncateString(config.Host, 32)))
+	}
+
+	if strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+		if !i.hasAPIAccess() {
+			return fmt.Errorf("Incus执行规则为api_only，但未配置有效mTLS证书")
+		}
+		if err := i.probeAPIConnection(ctx); err != nil {
+			return fmt.Errorf("Incus API连接失败: %w", err)
+		}
+		i.connected = true
+		i.apiHealthy = true
+		i.healthChecker = i.newAPIOnlyHealthChecker()
+		global.APP_LOG.Info("Incus provider API-only连接成功", zap.String("host", utils.TruncateString(config.Host, 32)))
+		return nil
 	}
 
 	// 设置SSH超时配置
@@ -130,7 +155,7 @@ func (i *IncusProvider) Connect(ctx context.Context, config provider.NodeConfig)
 		Username:      config.Username,
 		Password:      config.Password,
 		PrivateKey:    config.PrivateKey,
-		APIEnabled:    config.CertPath != "" && config.KeyPath != "",
+		APIEnabled:    i.hasAPIAccess(),
 		APIPort:       8443,
 		APIScheme:     "https",
 		SSHEnabled:    true,
@@ -160,8 +185,27 @@ func (i *IncusProvider) Connect(ctx context.Context, config provider.NodeConfig)
 func (i *IncusProvider) ConnectAgent(executor utils.ShellExecutor, config provider.NodeConfig) error {
 	i.config = config
 	i.providerID = config.ID
+	i.connected = false
+	i.apiHealthy = false
+	if i.transport != nil {
+		if !strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+			i.transport.TLSClientConfig = nil
+		}
+	}
 	if i.transport != nil && i.providerID > 0 {
 		provider.GetTransportCleanupManager().RegisterTransportWithProvider(i.transport, i.providerID)
+	}
+	if strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+		if !i.hasAPIAccess() {
+			return fmt.Errorf("Incus Agent+api_only未配置有效mTLS证书")
+		}
+		if err := i.probeAPIConnection(context.Background()); err != nil {
+			return fmt.Errorf("Incus Agent+api_only API连接失败: %w", err)
+		}
+		i.connected = true
+		i.apiHealthy = true
+		i.healthChecker = i.newAPIOnlyHealthChecker()
+		return nil
 	}
 	i.sshClient.SetExecutor(executor)
 	i.connected = true
@@ -248,15 +292,31 @@ func (i *IncusProvider) Disconnect(ctx context.Context) error {
 	i.transport = nil
 
 	i.connected = false
+	i.apiHealthy = false
 	return nil
 }
 
 func (i *IncusProvider) IsConnected() bool {
+	if strings.EqualFold(strings.TrimSpace(i.config.ExecutionRule), "api_only") {
+		return i.connected && i.apiHealthy
+	}
 	return i.connected && i.sshClient.HasExecutor() && i.sshClient.IsHealthy()
 }
 
 // EnsureConnection 确保SSH连接可用，如果连接不健康则尝试重连
 func (i *IncusProvider) EnsureConnection() error {
+	if strings.EqualFold(strings.TrimSpace(i.config.ExecutionRule), "api_only") {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := i.probeAPIConnection(ctx); err != nil {
+			i.connected = false
+			i.apiHealthy = false
+			return fmt.Errorf("Incus API重连失败: %w", err)
+		}
+		i.connected = true
+		i.apiHealthy = true
+		return nil
+	}
 	if !i.sshClient.HasExecutor() {
 		return fmt.Errorf("SSH client not initialized")
 	}
@@ -284,6 +344,19 @@ func (i *IncusProvider) EnsureConnection() error {
 }
 
 func (i *IncusProvider) HealthCheck(ctx context.Context) (*health.HealthResult, error) {
+	if strings.EqualFold(strings.TrimSpace(i.config.ExecutionRule), "api_only") {
+		if i.healthChecker == nil {
+			return nil, fmt.Errorf("Incus API-only健康检查器未初始化")
+		}
+		result, err := i.healthChecker.CheckHealth(ctx)
+		if err == nil {
+			i.apiHealthy = result.APIStatus == "online"
+			i.connected = i.apiHealthy
+		} else {
+			i.apiHealthy = false
+		}
+		return result, err
+	}
 	if i.healthChecker == nil {
 		if !i.sshClient.HasExecutor() {
 			return nil, fmt.Errorf("health checker not initialized")
@@ -343,14 +416,22 @@ func (i *IncusProvider) CreateInstance(ctx context.Context, config provider.Inst
 		return fmt.Errorf("not connected")
 	}
 
+	forceSSHIPv6 := requiresSSHIPv6Network(config, i.config.ID)
+	if forceSSHIPv6 && !i.shouldUseSSH() {
+		return fmt.Errorf("Incus控制面IPv6网络配置当前需要SSH路径，api_only无法安全配置IPv6地址和端口映射")
+	}
 	// 根据执行规则判断使用哪种方式
 	forceSSHInstaller := i.shouldUseWindowsInstallerSSH(ctx, &config)
-	if i.shouldUseAPI() && !forceSSHInstaller {
+	if i.shouldUseAPI() && !forceSSHInstaller && !forceSSHIPv6 {
 		if err := i.apiCreateInstance(ctx, config); err == nil {
 			global.APP_LOG.Debug("Incus API调用成功 - 创建实例", zap.String("name", utils.TruncateString(config.Name, 50)))
 			return nil
 		} else {
 			global.APP_LOG.Warn("Incus API失败", zap.Error(err))
+			var committedErr *apiCreateCommittedError
+			if errors.As(err, &committedErr) {
+				return err
+			}
 
 			if fallbackErr := i.ensureSSHBeforeFallback(err, "创建实例"); fallbackErr != nil {
 				return fallbackErr
@@ -372,14 +453,22 @@ func (i *IncusProvider) CreateInstanceWithProgress(ctx context.Context, config p
 		return fmt.Errorf("not connected")
 	}
 
+	forceSSHIPv6 := requiresSSHIPv6Network(config, i.config.ID)
+	if forceSSHIPv6 && !i.shouldUseSSH() {
+		return fmt.Errorf("Incus控制面IPv6网络配置当前需要SSH路径，api_only无法安全配置IPv6地址和端口映射")
+	}
 	// 根据执行规则判断使用哪种方式
 	forceSSHInstaller := i.shouldUseWindowsInstallerSSH(ctx, &config)
-	if i.shouldUseAPI() && !forceSSHInstaller {
+	if i.shouldUseAPI() && !forceSSHInstaller && !forceSSHIPv6 {
 		if err := i.apiCreateInstanceWithProgress(ctx, config, progressCallback); err == nil {
 			global.APP_LOG.Debug("Incus API调用成功 - 创建实例", zap.String("name", utils.TruncateString(config.Name, 50)))
 			return nil
 		} else {
 			global.APP_LOG.Warn("Incus API失败", zap.Error(err))
+			var committedErr *apiCreateCommittedError
+			if errors.As(err, &committedErr) {
+				return err
+			}
 
 			if fallbackErr := i.ensureSSHBeforeFallback(err, "创建实例"); fallbackErr != nil {
 				return fallbackErr
@@ -393,6 +482,29 @@ func (i *IncusProvider) CreateInstanceWithProgress(ctx context.Context, config p
 	}
 
 	return i.sshCreateInstanceWithProgress(ctx, config, progressCallback)
+}
+
+func hasRequestedStaticIPv6(config provider.InstanceConfig) bool {
+	return config.Metadata != nil && strings.TrimSpace(config.Metadata["static_ipv6"]) != ""
+}
+
+func requiresSSHIPv6Network(config provider.InstanceConfig, providerID uint) bool {
+	networkType := ""
+	if config.Metadata != nil {
+		networkType = strings.TrimSpace(config.Metadata["network_type"])
+	}
+	if networkType == "" && global.APP_DB != nil && providerID > 0 {
+		var providerConfig providerModel.Provider
+		if err := global.APP_DB.Select("network_type").First(&providerConfig, providerID).Error; err == nil {
+			networkType = strings.TrimSpace(providerConfig.NetworkType)
+		}
+	}
+	switch networkType {
+	case "nat_ipv4_ipv6", "dedicated_ipv4_ipv6", "ipv6_only":
+		return true
+	default:
+		return hasRequestedStaticIPv6(config)
+	}
 }
 
 func (i *IncusProvider) StartInstance(ctx context.Context, id string) error {
@@ -479,6 +591,13 @@ func (i *IncusProvider) RestartInstance(ctx context.Context, id string) error {
 func (i *IncusProvider) DeleteInstance(ctx context.Context, id string) error {
 	if !i.connected {
 		return fmt.Errorf("not connected")
+	}
+
+	// Host firewall rules outlive the Incus instance. Remove the rules while
+	// the database still contains the instance IP/guest-port mapping, before
+	// the API or SSH delete makes that information impossible to resolve.
+	if err := i.cleanupInstancePortMappings(ctx, id); err != nil {
+		return fmt.Errorf("删除Incus实例前清理端口映射失败: %w", err)
 	}
 
 	// 根据执行规则判断使用哪种方式
@@ -587,7 +706,7 @@ func (i *IncusProvider) ExecuteSSHCommand(ctx context.Context, command string) (
 
 // 检查是否有 API 访问权限
 func (i *IncusProvider) hasAPIAccess() bool {
-	return i.config.CertPath != "" && i.config.KeyPath != ""
+	return i.transport != nil && i.transport.TLSClientConfig != nil
 }
 
 // shouldUseAPI 根据执行规则判断是否应该使用API
@@ -656,12 +775,30 @@ func (i *IncusProvider) ensureSSHBeforeFallback(apiErr error, operation string) 
 
 // SetupPortMappingWithIP 公开的方法：在远程服务器上创建端口映射（用于手动添加端口）
 func (i *IncusProvider) SetupPortMappingWithIP(ctx context.Context, instanceName string, hostPort, guestPort int, protocol, method, instanceIP string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(i.config.ExecutionRule), "api_only") {
+		port := providerModel.Port{HostPort: hostPort, GuestPort: guestPort, Protocol: protocol, MappingMethod: method}
+		if strings.Contains(instanceIP, ":") {
+			port.IPv6Enabled, port.IPv6Address = true, instanceIP
+		}
+		return i.ConfigurePortMappingsAPI(ctx, instanceName, []providerModel.Port{port})
+	}
 	return i.setupPortMappingWithIP(instanceName, hostPort, guestPort, protocol, method, instanceIP)
 }
 
 // RemovePortMapping 公开的方法：从远程服务器上删除端口映射（用于手动删除端口）
 func (i *IncusProvider) RemovePortMapping(instanceName string, hostPort int, protocol string, method string) error {
 	return i.removePortMapping(instanceName, hostPort, protocol, method)
+}
+
+// RemovePortMappingWithDetails removes a mapping when the controller already
+// has the guest and range information. This is used by cleanup tasks after a
+// port row or its instance has been soft-deleted and therefore cannot be
+// recovered by a normal database lookup.
+func (i *IncusProvider) RemovePortMappingWithDetails(instanceName string, hostPort, guestPort, hostPortEnd, guestPortEnd, portCount int, protocol, method, instanceIP string) error {
+	return i.removePortMappingWithRange(instanceName, hostPort, guestPort, hostPortEnd, guestPortEnd, portCount, protocol, method, instanceIP)
 }
 
 func init() {

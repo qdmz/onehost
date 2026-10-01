@@ -3,6 +3,8 @@ package proxmox
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +56,9 @@ func (p *ProxmoxProvider) configureContainerNetwork(ctx context.Context, vmid in
 	if hasIPv6 {
 		// 配置IPv6网络（会根据NetworkType自动处理IPv4+IPv6或纯IPv6）
 		if err := p.configureInstanceIPv6(ctx, vmid, config, "container"); err != nil {
+			if requestedProxmoxIPv6(config) != "" {
+				return fmt.Errorf("配置控制面静态IPv6失败: %w", err)
+			}
 			global.APP_LOG.Warn("配置容器IPv6失败，回退到IPv4-only", zap.Int("vmid", vmid), zap.Error(err))
 			// IPv6配置失败，回退到IPv4-only配置
 			hasIPv6 = false
@@ -64,7 +69,7 @@ func (p *ProxmoxProvider) configureContainerNetwork(ctx context.Context, vmid in
 	// 使用VMID到IP的映射函数
 	if !hasIPv6 {
 		userIP := p.vmidToInternalIP(vmid)
-		netCmd := fmt.Sprintf("pct set %d --net0 name=eth0,ip=%s/24,bridge=%s,gw=%s", vmid, userIP, p.getBridgeName("nat"), p.getInternalGateway())
+		netCmd := fmt.Sprintf("pct set %d --net0 %s", vmid, shellSingleQuote(fmt.Sprintf("name=eth0,ip=%s/24,bridge=%s,gw=%s", userIP, p.getBridgeName("nat"), p.getInternalGateway())))
 		_, err := p.sshClient.Execute(netCmd)
 		if err != nil {
 			return fmt.Errorf("配置容器IPv4网络失败: %w", err)
@@ -108,6 +113,9 @@ func (p *ProxmoxProvider) configureVMNetwork(ctx context.Context, vmid int, conf
 	if hasIPv6 {
 		// 配置IPv6网络（会根据NetworkType自动处理IPv4+IPv6或纯IPv6）
 		if err := p.configureInstanceIPv6(ctx, vmid, config, "vm"); err != nil {
+			if requestedProxmoxIPv6(config) != "" {
+				return fmt.Errorf("配置控制面静态IPv6失败: %w", err)
+			}
 			global.APP_LOG.Warn("配置虚拟机IPv6失败，回退到IPv4-only", zap.Int("vmid", vmid), zap.Error(err))
 			// IPv6配置失败，回退到IPv4-only配置
 			hasIPv6 = false
@@ -119,7 +127,7 @@ func (p *ProxmoxProvider) configureVMNetwork(ctx context.Context, vmid int, conf
 		userIP := p.vmidToInternalIP(vmid)
 
 		// 配置云初始化网络
-		ipCmd := fmt.Sprintf("qm set %d --ipconfig0 ip=%s/24,gw=%s", vmid, userIP, p.getInternalGateway())
+		ipCmd := fmt.Sprintf("qm set %d --ipconfig0 %s", vmid, shellSingleQuote(fmt.Sprintf("ip=%s/24,gw=%s", userIP, p.getInternalGateway())))
 		_, err := p.sshClient.Execute(ipCmd)
 		if err != nil {
 			return fmt.Errorf("配置虚拟机IPv4网络失败: %w", err)
@@ -142,10 +150,16 @@ func (p *ProxmoxProvider) configurePortForwarding(ctx context.Context, vmid int,
 		if len(parts) != 2 {
 			continue
 		}
+		hostPort, hostErr := strconv.Atoi(strings.TrimSpace(parts[0]))
+		guestPort, guestErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if hostErr != nil || guestErr != nil || hostPort < 1 || hostPort > 65535 || guestPort < 1 || guestPort > 65535 {
+			global.APP_LOG.Warn("忽略无效端口转发配置", zap.Int("vmid", vmid), zap.String("port", port))
+			continue
+		}
 
 		// iptables规则进行端口转发
-		rule := fmt.Sprintf("iptables -t nat -A PREROUTING -i %s -p tcp --dport %s -j DNAT --to-destination %s:%s",
-			p.getBridgeName("dedicated_v4"), parts[0], userIP, parts[1])
+		rule := fmt.Sprintf("iptables -t nat -A PREROUTING -i %s -p tcp --dport %d -j DNAT --to-destination %s:%d",
+			shellSingleQuote(p.getBridgeName("dedicated_v4")), hostPort, shellSingleQuote(userIP), guestPort)
 
 		_, err := p.sshClient.Execute(rule)
 		if err != nil {
@@ -413,15 +427,15 @@ func (p *ProxmoxProvider) ensureIPv4OnHostInterface(ipv4 string) error {
 	if idx := strings.IndexByte(cleanIP, '/'); idx != -1 {
 		cleanIP = cleanIP[:idx]
 	}
-	if cleanIP == "" {
-		return nil
+	if parsed := net.ParseIP(cleanIP); parsed == nil || parsed.To4() == nil {
+		return fmt.Errorf("无效的独立IPv4地址: %s", cleanIP)
 	}
 
 	global.APP_LOG.Debug("检查独立IPv4是否已绑定到宿主机网络接口",
 		zap.String("ip", cleanIP))
 
 	// 检查该 IP 是否已绑定到宿主机的任意网络接口
-	checkCmd := fmt.Sprintf("ip addr show | grep -w '%s'", cleanIP)
+	checkCmd := fmt.Sprintf("ip addr show | grep -w %s", shellSingleQuote(cleanIP))
 	output, err := p.sshClient.Execute(checkCmd)
 	if err == nil && strings.Contains(output, cleanIP) {
 		global.APP_LOG.Debug("独立IPv4已绑定到宿主机接口，无需添加",
@@ -447,7 +461,7 @@ func (p *ProxmoxProvider) ensureIPv4OnHostInterface(ipv4 string) error {
 	}
 
 	// 以 /32 方式将独立 IPv4 添加到宿主机接口（路由模式，适合绝大多数云服务器场景）
-	addCmd := fmt.Sprintf("ip addr add %s/32 dev %s", cleanIP, primaryIface)
+	addCmd := fmt.Sprintf("ip addr add %s/32 dev %s", shellSingleQuote(cleanIP), shellSingleQuote(primaryIface))
 	if _, addErr := p.sshClient.Execute(addCmd); addErr != nil {
 		// 并发场景下可能已被其他操作添加，再次确认
 		output2, checkErr2 := p.sshClient.Execute(checkCmd)

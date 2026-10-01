@@ -555,11 +555,6 @@ const footerSponsors = [
     logo: 'https://cdn3.ldstatic.com/original/4X/d/1/4/d146c68151340881c884d95e0da4acdf369258c6.png',
     cardClass: 'supporter-card-linuxdo',
     logoClass: 'supporter-logo-linuxdo'
-  },
-  {
-    name: 'JTTI',
-    href: 'https://www.jtti.cc/zh/activity/special-offer.html?z=oneclickvirt',
-    logo: 'https://www.jtti.cc/static/images/common/article_logo.png'
   }
 ]
 

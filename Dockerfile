@@ -3,6 +3,8 @@
 ARG GO_VERSION=1.25.0
 FROM node:22-slim AS frontend-builder
 ARG TARGETARCH
+ARG NODE_OPTIONS=--max-old-space-size=1024
+ENV NODE_OPTIONS=${NODE_OPTIONS}
 WORKDIR /app/web
 COPY web/package*.json ./
 RUN npm ci --include=optional
@@ -26,8 +28,9 @@ COPY scripts/install_agent.sh /app/install_agent.sh
 RUN mkdir -p assets/agent && cp /app/install_agent.sh assets/agent/install_agent.sh
 RUN go version
 RUN go mod download
-RUN sed -i "s/const ServerVersion = \".*\"/const ServerVersion = \"${SERVER_VERSION}\"/" constant/version.go && \
-    sed -i "s/const CompatibleAgentVersion = \".*\"/const CompatibleAgentVersion = \"${SERVER_VERSION}\"/" constant/version.go
+# Server release branding must not change the independently maintained Agent
+# protocol compatibility floor.
+RUN sed -i "s/const ServerVersion = \".*\"/const ServerVersion = \"${SERVER_VERSION}\"/" constant/version.go
 RUN BUILD_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "docker") && \
     BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -installsuffix cgo \
@@ -38,13 +41,17 @@ FROM debian:12-slim
 ARG TARGETARCH
 
 # Install database and other services based on architecture
-RUN apt-get update && \
+RUN printf '%s\n' '#!/bin/sh' 'exit 101' > /usr/sbin/policy-rc.d && \
+    chmod 755 /usr/sbin/policy-rc.d && \
+    apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         gnupg2 wget lsb-release procps nginx supervisor ca-certificates && \
     if [ "$TARGETARCH" = "amd64" ]; then \
         echo "Installing MySQL for AMD64..." && \
-        gpg --keyserver keyserver.ubuntu.com --recv-keys B7B3B788A8D3785C && \
-        gpg --export B7B3B788A8D3785C > /usr/share/keyrings/mysql.gpg && \
+        wget -qO /usr/share/keyrings/mysql.asc https://repo.mysql.com/RPM-GPG-KEY-mysql-2025 && \
+        mysql_key_fingerprint="$(gpg --batch --show-keys --with-colons /usr/share/keyrings/mysql.asc | awk -F: '$1 == "fpr" { print $10; exit }')" && \
+        test "$mysql_key_fingerprint" = "BCA43417C3B485DD128EC6D4B7B3B788A8D3785C" && \
+        gpg --batch --yes --dearmor --output /usr/share/keyrings/mysql.gpg /usr/share/keyrings/mysql.asc && \
         echo "deb [signed-by=/usr/share/keyrings/mysql.gpg] http://repo.mysql.com/apt/debian bookworm mysql-8.0" > /etc/apt/sources.list.d/mysql.list && \
         apt-get update && \
         DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server mysql-client; \
@@ -52,7 +59,8 @@ RUN apt-get update && \
         echo "Installing MariaDB for ARM64..." && \
         DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client; \
     fi && \
-    apt-get clean
+    apt-get clean && \
+    rm -f /usr/sbin/policy-rc.d
 
 ENV TZ=Asia/Shanghai \
     SERVER_PORT=8888
@@ -89,7 +97,8 @@ RUN echo '[mysqld]' > /etc/mysql/conf.d/custom.cnf && \
     echo 'skip-name-resolve' >> /etc/mysql/conf.d/custom.cnf && \
     echo 'secure-file-priv=""' >> /etc/mysql/conf.d/custom.cnf && \
     echo 'innodb_buffer_pool_size=256M' >> /etc/mysql/conf.d/custom.cnf && \
-    echo 'innodb_log_file_size=64M' >> /etc/mysql/conf.d/custom.cnf && \
+    echo 'loose-innodb_log_file_size=64M' >> /etc/mysql/conf.d/custom.cnf && \
+    echo 'loose-innodb_redo_log_capacity=256M' >> /etc/mysql/conf.d/custom.cnf && \
     echo 'loose-binlog_expire_logs_seconds=259200' >> /etc/mysql/conf.d/custom.cnf && \
     echo 'loose-expire_logs_days=3' >> /etc/mysql/conf.d/custom.cnf && \
     echo 'max_binlog_size=256M' >> /etc/mysql/conf.d/custom.cnf && \
@@ -159,6 +168,23 @@ RUN echo 'user www-data;' > /etc/nginx/nginx.conf && \
     echo '            proxy_set_header X-Forwarded-Host $http_host;' >> /etc/nginx/nginx.conf && \
     echo '            proxy_set_header X-Forwarded-Proto $scheme;' >> /etc/nginx/nginx.conf && \
     echo '            proxy_set_header X-Forwarded-Port $server_port;' >> /etc/nginx/nginx.conf && \
+    echo '        }' >> /etc/nginx/nginx.conf && \
+    echo '        ' >> /etc/nginx/nginx.conf && \
+    echo '        # Never serve dotfiles or fall them back to the SPA.' >> /etc/nginx/nginx.conf && \
+    echo '        location ~ /\.(?!well-known(?:/|$)) {' >> /etc/nginx/nginx.conf && \
+    echo '            deny all;' >> /etc/nginx/nginx.conf && \
+    echo '            access_log off;' >> /etc/nginx/nginx.conf && \
+    echo '            log_not_found off;' >> /etc/nginx/nginx.conf && \
+    echo '        }' >> /etc/nginx/nginx.conf && \
+    echo '        ' >> /etc/nginx/nginx.conf && \
+    echo '        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {' >> /etc/nginx/nginx.conf && \
+    echo '            try_files $uri =404;' >> /etc/nginx/nginx.conf && \
+    echo '            add_header Cache-Control "public, max-age=604800, immutable";' >> /etc/nginx/nginx.conf && \
+    echo '        }' >> /etc/nginx/nginx.conf && \
+    echo '        ' >> /etc/nginx/nginx.conf && \
+    echo '        location = /index.html {' >> /etc/nginx/nginx.conf && \
+    echo '            try_files $uri =404;' >> /etc/nginx/nginx.conf && \
+    echo '            add_header Cache-Control "no-cache, no-store, must-revalidate" always;' >> /etc/nginx/nginx.conf && \
     echo '        }' >> /etc/nginx/nginx.conf && \
     echo '        ' >> /etc/nginx/nginx.conf && \
     echo '        location / {' >> /etc/nginx/nginx.conf && \

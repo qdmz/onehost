@@ -4,80 +4,80 @@
 
 | Metric | Value |
 |---|---:|
-| Registered route calls | 366 |
-| Comparable route literals | 363 |
-| Approx. covered route literals | 307 |
-| Approx. route literal coverage | 84.57% |
-| Distinct test paths | 497 |
-| Test endpoint call sites | 1111 |
+| Registered route calls | 409 |
+| Comparable route literals | 406 |
+| Approx. covered route literals | 343 |
+| Approx. route literal coverage | 84.48% |
+| Distinct test paths | 537 |
+| Test endpoint call sites | 1185 |
 | High-risk jq lines | 0 |
 | Pipe risk lines | 0 |
 | Workflow findings | 0 |
 | Retry hygiene findings | 0 |
-| Minimum route literal coverage | 82.0% |
+| Minimum route literal coverage | not enforced |
 
 ## HTTP Method Coverage
 
 | Method | Routes | Tests |
 |---|---:|---:|
-| GET | 188 | 534 |
-| POST | 120 | 406 |
-| PUT | 33 | 108 |
-| DELETE | 25 | 62 |
+| GET | 209 | 560 |
+| POST | 136 | 441 |
+| PUT | 35 | 114 |
+| DELETE | 29 | 69 |
 | PATCH | 0 | 1 |
 
 ## Uncovered Route Literals (sample)
 
-- `GET /instances/:id/snapshots` at `server/service/router/admin.go:28`
-- `POST /instances/:id/snapshots` at `server/service/router/admin.go:29`
-- `POST /snapshot-batches` at `server/service/router/admin.go:30`
-- `GET /snapshots/overview` at `server/service/router/admin.go:39`
-- `GET /snapshots` at `server/service/router/admin.go:40`
-- `GET /snapshot-tasks/:id` at `server/service/router/admin.go:41`
-- `DELETE /snapshots/:id` at `server/service/router/admin.go:42`
-- `POST /snapshots/:id/restore` at `server/service/router/admin.go:43`
-- `GET /snapshots/download/:id` at `server/service/router/admin.go:44`
-- `GET /snapshot-schedules` at `server/service/router/admin.go:45`
-- `POST /snapshot-schedules` at `server/service/router/admin.go:46`
-- `PUT /snapshot-schedules/:id` at `server/service/router/admin.go:47`
-- `DELETE /snapshot-schedules/:id` at `server/service/router/admin.go:48`
-- `GET /providers/local/detect` at `server/service/router/admin.go:65`
-- `POST /providers/import-csv` at `server/service/router/admin.go:66`
-- `POST /providers/:id/cleanup-orphans` at `server/service/router/admin.go:83`
-- `POST /configuration-tasks/:id/cancel` at `server/service/router/admin.go:116`
-- `GET /providers/:id/monitoring/sync/latest` at `server/service/router/admin.go:169`
-- `GET /providers/:id/monitoring/sync/:taskId` at `server/service/router/admin.go:170`
-- `POST /domains/sync-proxies` at `server/service/router/admin.go:200`
-- `POST /domains/:id/sync` at `server/service/router/admin.go:202`
-- `POST /system-images/sync` at `server/service/router/admin.go:241`
-- `PUT /users/:id/reset-password-notify` at `server/service/router/admin.go:256`
-- `GET /monitoring/logs` at `server/service/router/admin.go:286`
-- `GET /monitoring/provider` at `server/service/router/admin.go:287`
-- `GET /logs/read` at `server/service/router/admin.go:299`
-- `POST /logs/cleanup` at `server/service/router/admin.go:300`
-- `POST /storage/init` at `server/service/router/admin.go:304`
-- `POST /storage/cleanup` at `server/service/router/admin.go:305`
+- `GET /instances/:id/snapshots` at `server/service/router/admin.go:40`
+- `POST /instances/:id/snapshots` at `server/service/router/admin.go:41`
+- `POST /snapshot-batches` at `server/service/router/admin.go:42`
+- `GET /snapshots/overview` at `server/service/router/admin.go:57`
+- `GET /snapshots` at `server/service/router/admin.go:58`
+- `GET /snapshot-tasks/:id` at `server/service/router/admin.go:59`
+- `DELETE /snapshots/:id` at `server/service/router/admin.go:60`
+- `POST /snapshots/:id/restore` at `server/service/router/admin.go:61`
+- `GET /snapshots/download/:id` at `server/service/router/admin.go:62`
+- `GET /snapshot-schedules` at `server/service/router/admin.go:63`
+- `POST /snapshot-schedules` at `server/service/router/admin.go:64`
+- `PUT /snapshot-schedules/:id` at `server/service/router/admin.go:65`
+- `DELETE /snapshot-schedules/:id` at `server/service/router/admin.go:66`
+- `GET /providers/local/detect` at `server/service/router/admin.go:92`
+- `POST /providers/import-csv` at `server/service/router/admin.go:93`
+- `POST /providers/:id/force-recovery-sync` at `server/service/router/admin.go:110`
+- `POST /providers/:id/cleanup-orphans` at `server/service/router/admin.go:111`
+- `POST /configuration-tasks/:id/cancel` at `server/service/router/admin.go:144`
+- `GET /providers/:id/monitoring/sync/latest` at `server/service/router/admin.go:211`
+- `GET /providers/:id/monitoring/sync/:taskId` at `server/service/router/admin.go:212`
+- `POST /domains/sync-proxies` at `server/service/router/admin.go:242`
+- `POST /domains/:id/sync` at `server/service/router/admin.go:244`
+- `POST /system-images/sync` at `server/service/router/admin.go:283`
+- `PUT /users/:id/reset-password-notify` at `server/service/router/admin.go:298`
+- `GET /monitoring/logs` at `server/service/router/admin.go:328`
+- `GET /monitoring/provider` at `server/service/router/admin.go:329`
+- `GET /logs/read` at `server/service/router/admin.go:341`
+- `POST /logs/cleanup` at `server/service/router/admin.go:342`
+- `POST /storage/init` at `server/service/router/admin.go:346`
+- `POST /storage/cleanup` at `server/service/router/admin.go:347`
 - `GET callback` at `server/service/router/oauth2.go:18`
 - `POST /instances/:name/start` at `server/service/router/provider.go:46`
 - `POST /instances/:name/stop` at `server/service/router/provider.go:47`
 - `DELETE /images/:image` at `server/service/router/provider.go:51`
 - `GET instance-shares/:token/snapshots` at `server/service/router/public.go:28`
 - `GET instance-shares/:token/snapshots/:snapshotId/download` at `server/service/router/public.go:29`
-- `GET instance-shares/:token/ssh` at `server/service/router/public.go:30`
-- `GET instance-shares/:token/exec` at `server/service/router/public.go:31`
-- `GET instance-shares/:token/sftp/list` at `server/service/router/public.go:32`
-- `GET instance-shares/:token/sftp/download` at `server/service/router/public.go:33`
-- `POST instance-shares/:token/sftp/upload` at `server/service/router/public.go:34`
-- `GET instance-shares/:token/sftp/upload/status` at `server/service/router/public.go:35`
-- `POST instance-shares/:token/sftp/upload/abort` at `server/service/router/public.go:36`
-- `GET /swagger/*any` at `server/service/router/setup.go:284`
-- `GET /swagger/*any` at `server/service/router/setup.go:286`
-- `GET /v1/health` at `server/service/router/setup.go:294`
-- `GET agent/releases/:filename` at `server/service/router/setup.go:313`
-- `GET /v1/ws/agent` at `server/service/router/setup.go:364`
+- `GET instance-shares/:token/ssh` at `server/service/router/public.go:38`
+- `GET instance-shares/:token/exec` at `server/service/router/public.go:39`
+- `GET instance-shares/:token/sftp/list` at `server/service/router/public.go:40`
+- `GET instance-shares/:token/sftp/download` at `server/service/router/public.go:41`
+- `POST instance-shares/:token/sftp/upload` at `server/service/router/public.go:42`
+- `GET instance-shares/:token/sftp/upload/status` at `server/service/router/public.go:43`
+- `POST instance-shares/:token/sftp/upload/abort` at `server/service/router/public.go:44`
+- `GET /swagger/*any` at `server/service/router/setup.go:310`
+- `GET /swagger/*any` at `server/service/router/setup.go:312`
+- `GET /v1/health` at `server/service/router/setup.go:320`
+- `GET agent/releases/:filename` at `server/service/router/setup.go:339`
+- `GET /v1/ws/agent` at `server/service/router/setup.go:390`
 - `GET /user/instances/:id/snapshots` at `server/service/router/user.go:41`
 - `POST /user/instances/:id/snapshots` at `server/service/router/user.go:42`
-- `POST /user/instances/:id/snapshots/upload` at `server/service/router/user.go:43`
 
 ## Unguarded jq Findings
 

@@ -62,6 +62,35 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Native transparent egress needs only these fixed user-space tools.  Install
+# them opportunistically; the Agent capability API remains authoritative when
+# a distribution or kernel does not provide one of them.
+log_info "Checking native egress dependencies..." "正在检查宿主机原生出口依赖..."
+EGRESS_MISSING=0
+command -v ip >/dev/null 2>&1 || EGRESS_MISSING=1
+command -v nft >/dev/null 2>&1 || EGRESS_MISSING=1
+command -v wg >/dev/null 2>&1 || EGRESS_MISSING=1
+if [ "$EGRESS_MISSING" -eq 1 ]; then
+  EGRESS_INSTALL_OK=0
+  if command -v apt-get >/dev/null 2>&1; then
+    if apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+  elif command -v dnf >/dev/null 2>&1; then
+    if dnf install -y -q iproute nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+  elif command -v yum >/dev/null 2>&1; then
+    if yum install -y -q iproute nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+  elif command -v apk >/dev/null 2>&1; then
+    if apk add --quiet iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+  elif command -v pacman >/dev/null 2>&1; then
+    if pacman -Sy --noconfirm iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+  elif command -v zypper >/dev/null 2>&1; then
+    if zypper --non-interactive install iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+  fi
+  if [ "$EGRESS_INSTALL_OK" -ne 1 ]; then
+    log_warning "Native egress dependencies are incomplete; the Agent will report unsupported capabilities." "原生出口依赖不完整，Agent 将报告不支持的能力。"
+  fi
+fi
+log_success "Native egress dependency probe complete." "原生出口依赖检查完成。"
+
 # ── detect architecture ───────────────────────────────────────────────────────
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -107,7 +136,7 @@ _github_reachable() {
 
 # Pre-check which CDN mirrors are actually available (only called when GitHub is down)
 _check_cdn_available() {
-  local test_url="https://raw.githubusercontent.com/oneclickvirt/oneclickvirt/main/.back/test"
+  test_url="https://raw.githubusercontent.com/oneclickvirt/oneclickvirt/main/.back/test"
   printf '%s' "" > /tmp/ocv_working_cdns
   for cdn in $CDN_URLS; do
     if curl -sL -k --max-time 6 "${cdn}/${test_url}" 2>/dev/null | grep -q "success"; then
@@ -124,13 +153,13 @@ TMP_FILE="${INSTALL_DIR}/${BINARY_NAME}.tmp"
 
 # _dl_progress shows an animated progress bar while a download runs in background
 _dl_progress() {
-  local out="$1" total="$2" pid="$3" shown=0
+  out="$1" total="$2" pid="$3" shown=0
   # Strip leading zeros to avoid octal interpretation (e.g. Content-Length "06293879")
   total=$(echo "$total" | sed 's/^0*//')
   [ -z "$total" ] && total=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ -f "$out" ]; then
-      local cur=0
+      cur=0
       cur=$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out" 2>/dev/null)
       cur=$(printf '%s' "$cur" | tr -d '\r\n ' | grep -o '[0-9]*' | head -1)
       cur=${cur:-0}
@@ -138,10 +167,10 @@ _dl_progress() {
       cur=$(echo "$cur" | sed 's/^0*//')
       [ -z "$cur" ] && cur=0
       if [ "$total" -gt 0 ] && [ "$cur" -gt 0 ]; then
-        local pct=$((cur * 100 / total))
+        pct=$((cur * 100 / total))
         [ "$pct" -gt 100 ] && pct=100
         if [ "$pct" -gt "$shown" ]; then
-          local bar="" filled=$((pct / 2)) i=0
+          bar="" filled=$((pct / 2)) i=0
           while [ $i -lt $filled ]; do bar="${bar}#"; i=$((i+1)); done
           while [ $i -lt 50 ]; do bar="${bar}."; i=$((i+1)); done
           printf "\r [%-50s] %3d%%" "$bar" "$pct"
@@ -160,8 +189,8 @@ _dl_progress() {
 
 # download_one attempts a single URL with curl → wget fallback, showing progress
 download_one() {
-  local url="$1"
-  local total=0
+  url="$1"
+  total=0
   total=$(curl -sIkL --connect-timeout 10 "$url" 2>/dev/null | grep -i 'Content-Length' | awk '{print $2}' | tr -d '\r\n ' | grep -o '[0-9]*' | tail -1)
   total=${total:-0}
   [ -z "$total" ] && total=0
@@ -169,16 +198,18 @@ download_one() {
   total=$(echo "$total" | sed 's/^0*//')
   [ -z "$total" ] && total=0
 
-  # Try curl — check file existence rather than exit code (some servers return non-zero on valid downloads)
+  # A non-zero downloader status means the transfer was not verified, even if
+  # a partial file was left behind. Never publish that partial artifact.
   curl -fsSL --connect-timeout 20 --max-time 300 -o "$TMP_FILE" "$url" 2>/dev/null &
-  local dl_pid=$!
+  dl_pid=$!
   _dl_progress "$TMP_FILE" "$total" "$dl_pid" &
-  local mon_pid=$!
-  wait "$dl_pid" 2>/dev/null
+  mon_pid=$!
+  dl_rc=0
+  wait "$dl_pid" 2>/dev/null || dl_rc=$?
   wait "$mon_pid" 2>/dev/null
   # Validate: file must exist, be non-empty, and not start with '<' (HTML error page)
-  if [ -s "$TMP_FILE" ]; then
-    local first_byte
+  if [ "$dl_rc" -eq 0 ] && [ -s "$TMP_FILE" ]; then
+    first_byte
     first_byte=$(dd if="$TMP_FILE" bs=1 count=1 2>/dev/null)
     if [ "$first_byte" != "<" ]; then
       return 0
@@ -194,9 +225,10 @@ download_one() {
     dl_pid=$!
     _dl_progress "$TMP_FILE" "$total" "$dl_pid" &
     mon_pid=$!
-    wait "$dl_pid" 2>/dev/null
+    dl_rc=0
+    wait "$dl_pid" 2>/dev/null || dl_rc=$?
     wait "$mon_pid" 2>/dev/null
-    if [ -s "$TMP_FILE" ]; then
+    if [ "$dl_rc" -eq 0 ] && [ -s "$TMP_FILE" ]; then
       return 0
     fi
   fi
@@ -242,7 +274,7 @@ else
   # GitHub failed — check if GitHub is reachable, try CDN only if it's not
   if [ "$DOWNLOADED" -eq 0 ] && ! _github_reachable && _check_cdn_available; then
     log_warning "GitHub is unreachable, switching to CDN mirrors..." "GitHub 不可达，正在切换到 CDN 镜像..."
-    for CDN in $(cat /tmp/ocv_working_cdns); do
+    while IFS= read -r CDN; do
       CDN_TARGET="${CDN}/${GITHUB_URL}"
       rm -f "$TMP_FILE"
       if download_one "$CDN_TARGET" && [ -s "$TMP_FILE" ]; then
@@ -250,7 +282,7 @@ else
         DOWNLOADED=1
         break
       fi
-    done
+    done < /tmp/ocv_working_cdns
     rm -f /tmp/ocv_working_cdns
   fi
 
@@ -299,6 +331,97 @@ log_success "Binary installed to ${BINARY_PATH}" "二进制文件已安装到 ${
 
 # ── detect init system and install service ─────────────────────────────────────
 
+# Install the early-boot guard used by every supported init system.  The Agent
+# owns the source list and removes the temporary boot table after its first
+# successful native-egress reconciliation.  An absent/empty list is a normal
+# unconfigured-node state and is deliberately a no-op.
+create_egress_boot_guard() {
+  cat > /usr/local/bin/oneclickvirt-egress-boot-guard << 'EGUARDEOF'
+#!/bin/sh
+set -eu
+
+SOURCE_DIR="${ONECLICKVIRT_EGRESS_STATE_DIR:-/var/lib/oneclickvirt/egress}"
+SOURCE_FILE="${SOURCE_DIR}/managed-sources"
+NFT_BIN="${ONECLICKVIRT_EGRESS_NFT_BIN:-nft}"
+TABLE_FAMILY="inet"
+TABLE_NAME="oneclickvirt_egress_boot"
+
+# A fresh node has no managed source file.  Do not install a broad host-wide
+# firewall in that case; native egress becomes active only after the Agent has
+# persisted at least one binding source.
+[ -f "$SOURCE_FILE" ] || exit 0
+[ -s "$SOURCE_FILE" ] || exit 0
+command -v "$NFT_BIN" >/dev/null 2>&1 || {
+  printf '%s\n' "oneclickvirt egress boot guard: nft is unavailable" >&2
+  exit 1
+}
+
+TMP_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/oneclickvirt-egress-guard.XXXXXX")
+trap 'rm -f "$TMP_SCRIPT"' EXIT HUP INT TERM
+
+TABLE_EXISTS=0
+if "$NFT_BIN" list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then
+  TABLE_EXISTS=1
+fi
+
+if [ "$TABLE_EXISTS" -eq 1 ]; then
+  printf 'flush table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME" > "$TMP_SCRIPT"
+else
+  printf 'add table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME" > "$TMP_SCRIPT"
+fi
+cat >> "$TMP_SCRIPT" << 'NFTEOF'
+add chain inet oneclickvirt_egress_boot boot_forward { type filter hook forward priority -200; policy accept; }
+add chain inet oneclickvirt_egress_boot boot_output { type filter hook output priority -200; policy accept; }
+add chain inet oneclickvirt_egress_boot boot_input { type filter hook input priority -200; policy accept; }
+NFTEOF
+
+VALID_SOURCES=0
+while IFS= read -r source || [ -n "$source" ]; do
+  # The Agent writes one canonical CIDR per line.  Reject anything that could
+  # become nft syntax rather than silently broadening the protected set.
+  [ -n "$source" ] || {
+    printf '%s\n' "oneclickvirt egress boot guard: empty source line" >&2
+    exit 1
+  }
+  case "$source" in
+    *[!0-9A-Fa-f:./]*|*/*/*|*/)
+      printf '%s\n' "oneclickvirt egress boot guard: invalid source entry" >&2
+      exit 1
+      ;;
+  esac
+  case "$source" in
+    *:*/*) FAMILY="ip6"; MAX_PREFIX=128 ;;
+    *.*/*) FAMILY="ip"; MAX_PREFIX=32 ;;
+    *)
+      printf '%s\n' "oneclickvirt egress boot guard: source is not an IP CIDR" >&2
+      exit 1
+      ;;
+  esac
+  PREFIX=${source##*/}
+  case "$PREFIX" in
+    ''|*[!0-9]*)
+      printf '%s\n' "oneclickvirt egress boot guard: invalid CIDR prefix" >&2
+      exit 1
+      ;;
+  esac
+  if ! awk -v prefix="$PREFIX" -v maximum="$MAX_PREFIX" 'BEGIN { exit !(prefix <= maximum) }'; then
+    printf '%s\n' "oneclickvirt egress boot guard: CIDR prefix out of range" >&2
+    exit 1
+  fi
+  printf 'add rule inet oneclickvirt_egress_boot boot_forward %s saddr %s counter drop\n' "$FAMILY" "$source" >> "$TMP_SCRIPT"
+  printf 'add rule inet oneclickvirt_egress_boot boot_output %s saddr %s counter drop\n' "$FAMILY" "$source" >> "$TMP_SCRIPT"
+  printf 'add rule inet oneclickvirt_egress_boot boot_input %s saddr %s counter drop\n' "$FAMILY" "$source" >> "$TMP_SCRIPT"
+  VALID_SOURCES=$((VALID_SOURCES + 1))
+done < "$SOURCE_FILE"
+
+[ "$VALID_SOURCES" -gt 0 ] || exit 0
+"$NFT_BIN" -c -f "$TMP_SCRIPT" >/dev/null
+"$NFT_BIN" -f "$TMP_SCRIPT" >/dev/null
+EGUARDEOF
+  chmod 700 /usr/local/bin/oneclickvirt-egress-boot-guard
+  chown root:root /usr/local/bin/oneclickvirt-egress-boot-guard 2>/dev/null || true
+}
+
 # Create a helper script: /usr/local/bin/ocv (called both by install_service and as fallback)
 create_ocv_helper() {
   cat > /usr/local/bin/ocv << 'OCVEOF'
@@ -307,6 +430,20 @@ create_ocv_helper() {
 set -e
 AGENT_BIN="/opt/oneclickvirt/agent/oneclickvirt-agent"
 SVC="oneclickvirt-agent"
+ENV_FILE="/opt/oneclickvirt/agent/env"
+EGRESS_GUARD="/usr/local/bin/oneclickvirt-egress-boot-guard"
+
+_start_without_service_manager() {
+  [ -r "$ENV_FILE" ] || {
+    echo "[ocv] Agent environment file is missing or unreadable: $ENV_FILE" >&2
+    return 1
+  }
+  [ ! -x "$EGRESS_GUARD" ] || "$EGRESS_GUARD"
+  nohup sh -c 'set -a; . "$1"; set +a; exec "$2"' sh "$ENV_FILE" "$AGENT_BIN" \
+    >/var/log/oneclickvirt-agent.log 2>&1 &
+  echo "[ocv] Agent started (PID $!)"
+  echo "[ocv] Agent 已启动（PID $!）"
+}
 
 _usage() {
   echo "Usage: ocv {status|start|stop|restart|upgrade|uninstall|install|log}"
@@ -342,12 +479,16 @@ _upgrade() {
     aarch64|arm64) BIN="oneclickvirt-agent-linux-arm64" ;;
     *) echo "[ocv] Unsupported arch: $ARCH"; echo "[ocv] 不支持的架构: $ARCH"; exit 1 ;;
   esac
-  ENV_FILE="/opt/oneclickvirt/agent/env"
   AGENT_SOURCE="github"
   CONTROLLER_BASE_URL=""
   if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
+    set -a
     . "$ENV_FILE"
+    set +a
+    grep -q '^ONECLICKVIRT_EGRESS_AUTO_INSTALL=' "$ENV_FILE" 2>/dev/null || printf '%s\n' 'ONECLICKVIRT_EGRESS_AUTO_INSTALL=true' >> "$ENV_FILE"
+    grep -q '^ONECLICKVIRT_EGRESS_APPLY=' "$ENV_FILE" 2>/dev/null || printf '%s\n' 'ONECLICKVIRT_EGRESS_APPLY=true' >> "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
   fi
   if [ -n "$AGENT_SOURCE" ] && [ "$AGENT_SOURCE" = "controller" ] && [ -n "$CONTROLLER_BASE_URL" ]; then
     TMP="/opt/oneclickvirt/agent/${BIN}.tmp"
@@ -379,7 +520,7 @@ _upgrade() {
   else
   REPO="oneclickvirt/oneclickvirt"
   for API in https://api.github.com https://githubapi.spiritlhl.workers.dev https://githubapi.spiritlhl.top; do
-    local response
+    response
     response=$(curl -sL --connect-timeout 10 --max-time 30 "${API}/repos/${REPO}/releases/latest" 2>/dev/null)
     V=$(printf '%s' "$response" | grep -o '"tag_name": *"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"')
     [ -n "$V" ] && break
@@ -395,7 +536,12 @@ _upgrade() {
     fi
   done
   if [ "$DOWNLOADED" -eq 0 ]; then
-    curl -fsSL --connect-timeout 20 --max-time 180 -o "$TMP" "https://github.com/${REPO}/releases/download/${V}/${BIN}" 2>/dev/null || true
+    if ! curl -fsSL --connect-timeout 20 --max-time 180 -o "$TMP" "https://github.com/${REPO}/releases/download/${V}/${BIN}" 2>/dev/null || [ ! -s "$TMP" ]; then
+      rm -f "$TMP"
+      echo "[ocv] Download failed"
+      echo "[ocv] 下载失败"
+      exit 1
+    fi
   fi
   [ ! -s "$TMP" ] && echo "[ocv] Download failed" && echo "[ocv] 下载失败" && exit 1
   fi
@@ -416,7 +562,10 @@ _uninstall() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop "$SVC" 2>/dev/null || true
     systemctl disable "$SVC" 2>/dev/null || true
+    systemctl disable --now oneclickvirt-egress-guard 2>/dev/null || true
     rm -f "/etc/systemd/system/${SVC}.service"
+    rm -f /etc/systemd/system/oneclickvirt-egress-guard.service
+    systemctl daemon-reload 2>/dev/null || true
   fi
   if [ -f "/etc/init.d/${SVC}" ]; then
     "/etc/init.d/${SVC}" stop 2>/dev/null || true
@@ -431,6 +580,8 @@ _uninstall() {
   fi
   rm -f "$AGENT_BIN"
   rm -f /usr/local/bin/oneclickvirt-agent
+  rm -f "$EGRESS_GUARD"
+  command -v nft >/dev/null 2>&1 && nft delete table inet oneclickvirt_egress_boot 2>/dev/null || true
   rm -f /usr/local/bin/ocv
   rm -rf /opt/oneclickvirt/agent
   echo "[ocv] Agent uninstalled."
@@ -483,9 +634,7 @@ case "${1:-usage}" in
     # Fallback: start directly in background
     echo "[ocv] No service manager found, starting in foreground..."
     echo "[ocv] 未找到服务管理器，正在以前台方式启动..."
-    nohup "$AGENT_BIN" >/var/log/oneclickvirt-agent.log 2>&1 &
-    echo "[ocv] Agent started (PID $!)"
-    echo "[ocv] Agent 已启动（PID $!）"
+    _start_without_service_manager
     ;;
   stop)
     _do_stop
@@ -518,6 +667,7 @@ OCVEOF
 
 # Detect init system and install appropriate service
 install_service() {
+  create_egress_boot_guard
   create_ocv_helper
 
   # ── systemd ──
@@ -533,17 +683,37 @@ WS_URL=${WS_URL}
 AGENT_SECRET=${SECRET}
 AGENT_SOURCE=${AGENT_SOURCE}
 CONTROLLER_BASE_URL=${CONTROLLER_BASE_URL}
+ONECLICKVIRT_EGRESS_AUTO_INSTALL=true
+ONECLICKVIRT_EGRESS_APPLY=true
 EOF
     chmod 600 "$ENV_FILE"
     chown root:root "$ENV_FILE" 2>/dev/null || true
     log_info "Agent environment file created at ${ENV_FILE} with 0600 permissions." "Agent 环境文件已创建: ${ENV_FILE}（权限 0600）。"
 
+    cat > /etc/systemd/system/oneclickvirt-egress-guard.service << EOF
+[Unit]
+Description=OneClickVirt early-boot egress fail-closed guard
+Documentation=https://github.com/oneclickvirt/oneclickvirt
+DefaultDependencies=no
+After=local-fs.target nftables.service firewalld.service
+Before=network-pre.target network.target network-online.target ${SERVICE_NAME}.service docker.service containerd.service crio.service podman.service libvirtd.service lxc.service lxd.service incus.service pve-guests.service kubelet.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-${ENV_FILE}
+ExecStart=/usr/local/bin/oneclickvirt-egress-boot-guard
+RemainAfterExit=yes
+
+[Install]
+RequiredBy=network-pre.target
+EOF
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=OneClickVirt Agent
 Documentation=https://github.com/oneclickvirt/oneclickvirt
-After=network-online.target
-Wants=network-online.target
+After=network-online.target oneclickvirt-egress-guard.service
+Wants=network-online.target oneclickvirt-egress-guard.service
 
 [Service]
 Type=simple
@@ -551,7 +721,8 @@ User=root
 Group=root
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${BINARY_PATH} --ws-url \${WS_URL} --secret \${AGENT_SECRET}
+ExecStartPre=/usr/local/bin/oneclickvirt-egress-boot-guard
+ExecStart=${BINARY_PATH}
 Restart=always
 RestartSec=10
 StartLimitInterval=120
@@ -563,9 +734,22 @@ SyslogIdentifier=${SERVICE_NAME}
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME"
+    systemctl daemon-reload || {
+      log_error "Failed to reload systemd after installing the Agent unit." "安装 Agent 单元后重新加载 systemd 失败。"
+      return 1
+    }
+    systemctl enable oneclickvirt-egress-guard.service || {
+      log_error "Failed to enable the Agent egress guard." "启用 Agent 出站防护服务失败。"
+      return 1
+    }
+    systemctl enable "$SERVICE_NAME" || {
+      log_error "Failed to enable the Agent service." "启用 Agent 服务失败。"
+      return 1
+    }
+    systemctl start "$SERVICE_NAME" || {
+      log_error "Failed to start the Agent service." "启动 Agent 服务失败。"
+      return 1
+    }
     sleep 2
     if systemctl is-active --quiet "$SERVICE_NAME"; then
       log_success "Agent service started successfully (systemd)." "Agent 服务已启动（systemd）。"
@@ -590,6 +774,8 @@ WS_URL=${WS_URL}
 AGENT_SECRET=${SECRET}
 AGENT_SOURCE=${AGENT_SOURCE}
 CONTROLLER_BASE_URL=${CONTROLLER_BASE_URL}
+ONECLICKVIRT_EGRESS_AUTO_INSTALL=true
+ONECLICKVIRT_EGRESS_APPLY=true
 EOF
     chmod 600 "$ENV_FILE"
     chown root:root "$ENV_FILE" 2>/dev/null || true
@@ -598,8 +784,10 @@ EOF
 #!/bin/sh
 ### BEGIN INIT INFO
 # Provides:          ${SERVICE_NAME}
-# Required-Start:    \$network \$remote_fs \$syslog
-# Required-Stop:     \$network \$remote_fs \$syslog
+# Required-Start:    \$local_fs \$remote_fs
+# Should-Start:      nftables
+# X-Start-Before:    docker containerd crio libvirtd lxc lxd incus pve-guests kubelet
+# Required-Stop:     \$remote_fs \$syslog
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
 # Short-Description: OneClickVirt Agent
@@ -609,18 +797,25 @@ PIDFILE=/var/run/${SERVICE_NAME}.pid
 LOGFILE=/var/log/${SERVICE_NAME}.log
 BIN=${BINARY_PATH}
 ENV_FILE=${ENV_FILE}
+EGRESS_GUARD=/usr/local/bin/oneclickvirt-egress-boot-guard
 
-# Source env file to get WS_URL and AGENT_SECRET
+# Export the restricted environment file; plain POSIX dot only creates shell
+# variables and Rust cannot otherwise observe the egress flags or credentials.
 if [ -f "\$ENV_FILE" ]; then
+  set -a
   . "\$ENV_FILE"
+  set +a
 fi
-ARGS="--ws-url \${WS_URL} --secret \${AGENT_SECRET}"
 
 case "\$1" in
   start)
     echo "Starting ${SERVICE_NAME}..."
     echo "正在启动 ${SERVICE_NAME}..."
-    nohup \$BIN \$ARGS >>\$LOGFILE 2>&1 &
+    if [ -x "\$EGRESS_GUARD" ] && ! "\$EGRESS_GUARD"; then
+      echo "Egress guard refused to start ${SERVICE_NAME}" >&2
+      exit 1
+    fi
+    nohup \$BIN >>\$LOGFILE 2>&1 &
     echo \$! > \$PIDFILE
     ;;
   stop)
@@ -642,14 +837,14 @@ case "\$1" in
     ;;
 esac
 EOF
-    chmod +x "/etc/init.d/${SERVICE_NAME}"
+    chmod +x "/etc/init.d/${SERVICE_NAME}" || return 1
     if command -v update-rc.d >/dev/null 2>&1; then
-      update-rc.d "$SERVICE_NAME" defaults
+      update-rc.d "$SERVICE_NAME" defaults || return 1
     elif command -v chkconfig >/dev/null 2>&1; then
-      chkconfig --add "$SERVICE_NAME"
-      chkconfig "$SERVICE_NAME" on
+      chkconfig --add "$SERVICE_NAME" || return 1
+      chkconfig "$SERVICE_NAME" on || return 1
     fi
-    "/etc/init.d/${SERVICE_NAME}" start
+    "/etc/init.d/${SERVICE_NAME}" start || return 1
     sleep 2
     if "/etc/init.d/${SERVICE_NAME}" status | grep -q "Running"; then
       log_success "Agent service started successfully (SysV init)." "Agent 服务已启动（SysV init）。"
@@ -674,6 +869,8 @@ WS_URL=${WS_URL}
 AGENT_SECRET=${SECRET}
 AGENT_SOURCE=${AGENT_SOURCE}
 CONTROLLER_BASE_URL=${CONTROLLER_BASE_URL}
+ONECLICKVIRT_EGRESS_AUTO_INSTALL=true
+ONECLICKVIRT_EGRESS_APPLY=true
 EOF
     chmod 600 "$ENV_FILE"
     chown root:root "$ENV_FILE" 2>/dev/null || true
@@ -682,16 +879,31 @@ EOF
 #!/sbin/openrc-run
 name="${SERVICE_NAME}"
 description="OneClickVirt Agent"
-command="/bin/sh"
-command_args="-c '. ${ENV_FILE} && exec ${BINARY_PATH}'"
+ENV_FILE=${ENV_FILE}
+required_files="\$ENV_FILE"
+if [ -r "\$ENV_FILE" ]; then
+  set -a
+  . "\$ENV_FILE"
+  set +a
+fi
+command="${BINARY_PATH}"
 command_background=true
 pidfile="/var/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/\${RC_SVCNAME}.log"
 error_log="/var/log/\${RC_SVCNAME}.log"
+
+depend() {
+  after localmount nftables firewall
+  before docker containerd crio podman libvirtd lxc lxd incus kubelet
+}
+
+start_pre() {
+  /usr/local/bin/oneclickvirt-egress-boot-guard
+}
 EOF
-    chmod +x "/etc/init.d/${SERVICE_NAME}"
-    rc-update add "$SERVICE_NAME" default
-    rc-service "$SERVICE_NAME" start
+    chmod +x "/etc/init.d/${SERVICE_NAME}" || return 1
+    rc-update add "$SERVICE_NAME" default || return 1
+    rc-service "$SERVICE_NAME" start || return 1
     sleep 2
     if rc-service "$SERVICE_NAME" status 2>/dev/null; then
       log_success "Agent service started successfully (OpenRC)." "Agent 服务已启动（OpenRC）。"
@@ -715,6 +927,8 @@ WS_URL=${WS_URL}
 AGENT_SECRET=${SECRET}
 AGENT_SOURCE=${AGENT_SOURCE}
 CONTROLLER_BASE_URL=${CONTROLLER_BASE_URL}
+ONECLICKVIRT_EGRESS_AUTO_INSTALL=true
+ONECLICKVIRT_EGRESS_APPLY=true
 EOF
   chmod 600 "$ENV_FILE"
   chown root:root "$ENV_FILE" 2>/dev/null || true
@@ -723,7 +937,9 @@ EOF
   # then exec the agent binary WITHOUT CLI args so secret does NOT
   # appear in `ps aux` output (env vars are in /proc/PID/environ,
   # readable only by root).
-  nohup sh -c ". ${ENV_FILE} && exec ${BINARY_PATH}" \
+  /usr/local/bin/oneclickvirt-egress-boot-guard
+  # shellcheck disable=SC2016
+  nohup sh -c 'set -a; . "$1"; set +a; exec "$2"' sh "$ENV_FILE" "$BINARY_PATH" \
     >/var/log/oneclickvirt-agent.log 2>&1 &
   log_success "Agent started (PID $!). Log: /var/log/oneclickvirt-agent.log" "Agent 已启动（PID $!）。日志文件: /var/log/oneclickvirt-agent.log"
   log_warning "The agent will not auto-start after reboot. Install an init system for persistence." "Agent 重启后不会自动启动，如需持久化请安装 init 系统。"

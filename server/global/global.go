@@ -26,6 +26,14 @@ type MonitoringScheduler interface {
 	IsRunning() bool
 }
 
+// DatabaseConnectionAdopter lets configuration/bootstrap code hand a
+// separately validated pool to the connection manager without importing the
+// initialize package (which would create an import cycle).  The adopter owns
+// the previous managed pool and closes it after the replacement is visible.
+type DatabaseConnectionAdopter interface {
+	AdoptConnection(*gorm.DB) *gorm.DB
+}
+
 // ProviderHealthScheduler Provider健康检查调度器接口
 type ProviderHealthScheduler interface {
 	Start(ctx context.Context)
@@ -167,6 +175,8 @@ type DBManagerStats struct {
 	HeartbeatActive   bool   `json:"heartbeat_active"`
 	MaxReconnectRetry int    `json:"max_reconnect_retry"`
 	ReconnectInterval string `json:"reconnect_interval"`
+	LastError         string `json:"last_error,omitempty"`
+	LastErrorAt       string `json:"last_error_at,omitempty"`
 }
 
 // GetAppConfig returns a consistent snapshot of the application configuration.
@@ -183,10 +193,44 @@ func SetAppConfig(cfg config.Server) {
 	APP_CONFIG.Store(&cfg)
 }
 
+// UpdateAppConfig applies a side-effect-free update with compare-and-swap so
+// independent copy-on-write writers cannot lose one another's changes.
+func UpdateAppConfig(update func(*config.Server)) {
+	for {
+		previous := APP_CONFIG.Load()
+		var next config.Server
+		if previous != nil {
+			next = *previous
+		}
+		update(&next)
+		if APP_CONFIG.CompareAndSwap(previous, &next) {
+			return
+		}
+	}
+}
+
+func GetDBManagerStats() *DBManagerStats {
+	stats := APP_DB_MANAGER_STATS.Load()
+	if stats == nil {
+		return nil
+	}
+	copyOfStats := *stats
+	return &copyOfStats
+}
+
+func SetDBManagerStats(stats DBManagerStats) {
+	APP_DB_MANAGER_STATS.Store(&stats)
+}
+
 var (
-	APP_DB     *gorm.DB
-	APP_LOG    *zap.Logger
-	APP_CONFIG atomic.Pointer[config.Server] // access via GetAppConfig/SetAppConfig
+	APP_DB *gorm.DB
+	// APP_DB_CONNECTION_ADOPTER is registered by initialize once the database
+	// manager exists.  It is used by the initialization endpoint when it has
+	// already validated a replacement endpoint outside the normal heartbeat
+	// reconnect path.
+	APP_DB_CONNECTION_ADOPTER DatabaseConnectionAdopter
+	APP_LOG                   *zap.Logger
+	APP_CONFIG                atomic.Pointer[config.Server] // access via GetAppConfig/SetAppConfig
 	// CONFIG_MANAGER_READY 标记 ConfigManager 已从数据库完成初始化。
 	// 设置后，viper 文件监听器（OnConfigChange）将跳过对 global.APP_CONFIG 的覆盖，
 	// 防止启动阶段 YAML 写入触发的延迟事件在 API 保存后把旧值重新写回内存。
@@ -203,6 +247,6 @@ var (
 	APP_SHUTDOWN_CONTEXT          context.Context                         // 系统关闭上下文
 	APP_SHUTDOWN_CANCEL           context.CancelFunc                      // 系统关闭取消函数
 	APP_JWT_SECRET                string                                  // JWT密钥（从数据库加载，重启后保持不变）
-	APP_DB_MANAGER_STATS          *DBManagerStats                         // 数据库管理器统计信息（由DatabaseManager定期更新）
+	APP_DB_MANAGER_STATS          atomic.Pointer[DBManagerStats]          // 数据库管理器统计信息（由DatabaseManager定期更新）
 	APP_INIT_PROGRESS             = &InitProgress{Status: InitStatusIdle} // 系统初始化进度追踪
 )

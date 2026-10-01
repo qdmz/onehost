@@ -15,6 +15,18 @@ import (
 
 // InitAdminRouter 管理员路由
 func InitAdminRouter(Router *gin.RouterGroup) {
+	// 版本更新/回退不属于业务任务，不受任务池维护开关影响；仍严格限制为超级管理员。
+	SystemUpdateGroup := Router.Group("/v1/admin/system")
+	SystemUpdateGroup.Use(middleware.RequireSuperAdmin())
+	{
+		SystemUpdateGroup.GET("/check-updates", system.GetUpdateInfo)
+		SystemUpdateGroup.GET("/rollback-versions", system.GetRollbackVersions)
+		SystemUpdateGroup.POST("/update", system.StartUpdate)
+		SystemUpdateGroup.POST("/rollback", system.StartRollback)
+		SystemUpdateGroup.POST("/restart", system.StartRestart)
+		SystemUpdateGroup.GET("/update-status", system.GetUpdateStatus)
+	}
+
 	// 普通管理员和超管都可以访问的路由（level >= 2）
 	NormalAdminGroup := Router.Group("/v1/admin")
 	NormalAdminGroup.Use(middleware.RequireNormalAdmin())
@@ -48,6 +60,16 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		NormalAdminGroup.PUT("/snapshot-schedules/:id", admin.UpdateSnapshotSchedule)
 		NormalAdminGroup.DELETE("/snapshot-schedules/:id", admin.DeleteSnapshotSchedule)
 		NormalAdminGroup.GET("/instances/:id/ssh", admin.AdminSSHWebSocket)
+		// Provider-neutral console endpoints. Capability lookup is read-only;
+		// VNC, SPICE, and serial sessions are opened only after the selected
+		// protocol is sent back by the administrator UI.
+		NormalAdminGroup.GET("/instances/:id/console", admin.AdminInstanceConsoleInfo)
+		NormalAdminGroup.POST("/instances/:id/console/repair", admin.AdminInstanceConsoleRepair)
+		NormalAdminGroup.GET("/instances/:id/console/ws", admin.AdminInstanceConsoleWebSocket)
+		NormalAdminGroup.GET("/instances/:id/console/terminal/ws", admin.AdminInstanceConsoleTerminalWebSocket)
+		NormalAdminGroup.GET("/instances/:id/console/spice-ws", admin.AdminInstanceConsoleSpiceWebSocket)
+		NormalAdminGroup.GET("/instances/:id/console/spice/*path", admin.AdminInstanceConsoleSpiceAsset)
+		// Legacy VNC endpoints (kept for backward compatibility)
 		NormalAdminGroup.GET("/instances/:id/vnc", admin.AdminInstanceVNCInfo)
 		NormalAdminGroup.GET("/instances/:id/vnc/ws", admin.AdminInstanceVNCWebSocket)
 		NormalAdminGroup.GET("/instances/:id/sftp/list", admin.AdminInstanceSFTPList)
@@ -83,6 +105,7 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		NormalAdminGroup.GET("/providers/:id/orphaned", admin.GetOrphanedInstances)
 		NormalAdminGroup.POST("/providers/:id/sync-check", admin.CheckInstanceSync)
 		NormalAdminGroup.POST("/providers/:id/sync-instances", admin.QueueProviderInstanceSync)
+		NormalAdminGroup.POST("/providers/:id/force-recovery-sync", admin.QueueProviderRecoverySync)
 		NormalAdminGroup.POST("/providers/:id/cleanup-orphans", admin.CleanupOrphanInstances)
 
 		// 证书管理
@@ -143,6 +166,20 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		NormalAdminGroup.POST("/providers/:id/ipv4-pool", admin.SetProviderIPv4Pool)
 		NormalAdminGroup.DELETE("/providers/:id/ipv4-pool", admin.ClearProviderIPv4Pool)
 		NormalAdminGroup.DELETE("/providers/:id/ipv4-pool/:entry_id", admin.DeleteProviderIPv4PoolEntry)
+		// IPv6地址池管理（支持离散地址和任意前缀范围）
+		NormalAdminGroup.GET("/providers/:id/ipv6-pool", admin.GetProviderIPv6Pool)
+		NormalAdminGroup.POST("/providers/:id/ipv6-pool", admin.SetProviderIPv6Pool)
+		NormalAdminGroup.POST("/providers/:id/ipv6-pool/sync", admin.SyncProviderIPv6Pool)
+		NormalAdminGroup.DELETE("/providers/:id/ipv6-pool", admin.ClearProviderIPv6Pool)
+		NormalAdminGroup.DELETE("/providers/:id/ipv6-pool/:entry_id", admin.DeleteProviderIPv6PoolEntry)
+		NormalAdminGroup.GET("/providers/:id/ipv6-tunnels", admin.GetProviderIPv6Tunnels)
+		NormalAdminGroup.POST("/providers/:id/ipv6-tunnels", admin.CreateProviderIPv6Tunnel)
+		NormalAdminGroup.POST("/providers/:id/ipv6-tunnels/detect-local-ipv4", admin.DetectProviderIPv6TunnelLocalIPv4)
+		NormalAdminGroup.POST("/providers/:id/ipv6-tunnels/check", admin.CheckProviderIPv6Tunnels)
+		NormalAdminGroup.PUT("/providers/:id/ipv6-tunnels/:tunnel_id", admin.UpdateProviderIPv6Tunnel)
+		NormalAdminGroup.POST("/providers/:id/ipv6-tunnels/:tunnel_id/enable", admin.EnableProviderIPv6Tunnel)
+		NormalAdminGroup.POST("/providers/:id/ipv6-tunnels/:tunnel_id/disable", admin.DisableProviderIPv6Tunnel)
+		NormalAdminGroup.DELETE("/providers/:id/ipv6-tunnels/:tunnel_id", admin.DeleteProviderIPv6Tunnel)
 
 		// 流量管理API
 		adminTrafficAPI := &traffic.AdminTrafficAPI{}

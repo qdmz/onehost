@@ -101,6 +101,10 @@ func (p *ProxmoxProvider) createInstallerVM(ctx context.Context, vmid int, confi
 	}
 
 	ostype := proxmoxInstallerOSType(imageURL)
+	networkConfig := p.parseNetworkConfigFromInstanceConfig(config)
+	if err := p.preflightIPv6Create(ctx, config, networkConfig.NetworkType); err != nil {
+		return err
+	}
 	net0Config := fmt.Sprintf("e1000,bridge=%s,firewall=0", p.getBridgeName("nat"))
 	createCmd := fmt.Sprintf(
 		"qm create %d --agent 0 --cores %s --sockets 1 --cpu %s --memory %s --net0 %s --ostype %s --name %s %s",
@@ -145,11 +149,11 @@ func (p *ProxmoxProvider) createInstallerVM(ctx context.Context, vmid int, confi
 		time.Sleep(checkInterval)
 	}
 
-	global.APP_LOG.Warn("安装型虚拟机启动状态检查超时，但创建流程已完成",
-		zap.Int("vmid", vmid),
-		zap.String("imageURL", utils.TruncateString(imageURL, 100)))
-	updateProgress(100, "安装型虚拟机创建完成")
-	return nil
+	statusOutput, statusErr := p.sshClient.Execute(fmt.Sprintf("qm status %d", vmid))
+	if statusErr != nil {
+		return fmt.Errorf("等待安装型虚拟机 %d 启动超时（最后状态查询失败: %v）", vmid, statusErr)
+	}
+	return fmt.Errorf("等待安装型虚拟机 %d 启动超时（最后状态: %s）", vmid, strings.TrimSpace(statusOutput))
 }
 
 func (p *ProxmoxProvider) prepareInstallerISO(imageURL, imageName string, useCDN bool) (string, string, error) {

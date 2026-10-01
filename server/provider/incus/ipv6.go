@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"oneclickvirt/global"
 	"oneclickvirt/utils"
@@ -14,95 +13,80 @@ import (
 
 // IPv6Config IPv6配置结构
 type IPv6Config struct {
-	ContainerName    string
-	ContainerIPv6    string
-	HostIPv6Prefix   string
-	IPv6Length       int
-	Interface        string
-	Gateway          string
-	UseIptables      bool
-	UseNetworkDevice bool
+	ContainerName         string
+	ContainerIPv6         string
+	HostIPv6Prefix        string
+	IPv6Length            int
+	Interface             string
+	Gateway               string
+	UseIptables           bool
+	UseNetworkDevice      bool
+	RoutedCIDR            string
+	RoutedGateway         string
+	RoutedBridge          string
+	RoutedTunnelInterface string
+	InstanceType          string
 }
 
 // isPrivateIPv6 检查是否为私有IPv6地址
 func (i *IncusProvider) isPrivateIPv6(address string) bool {
-	if address == "" || !strings.Contains(address, ":") {
-		return true
+	return !utils.IsPublicIPv6(address)
+}
+
+// selectHostIPv6InterfaceNetwork keeps the selected address pool paired with
+// its owning interface. This matters on PVE-style hosts where vmbr0 owns an
+// IPv6 /128 default route while vmbr2 carries the delegated allocation prefix.
+func (i *IncusProvider) selectHostIPv6InterfaceNetwork(ctx context.Context, requireAssignable bool) (utils.IPv6InterfaceNetwork, error) {
+	preferredInterface := ""
+	defaultRouteCmd := `ip -6 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev" && i<NF) {print $(i+1); exit}}'`
+	if output, err := i.sshClient.Execute(defaultRouteCmd); err == nil {
+		preferredInterface, _ = utils.ParseFirstNetworkInterfaceOutput(output)
 	}
 
-	// 私有IPv6地址范围检查
-	privateRanges := []string{
-		"fe80:",    // 链路本地地址
-		"fc00:",    // 唯一本地地址
-		"fd00:",    // 唯一本地地址
-		"2001:db8", // 文档用途
-		"::1",      // 回环地址
-		"::ffff:",  // IPv4映射地址
-		"2002:",    // 6to4
-		"fd42:",    // Docker等使用的私有地址
+	addressCmd := "ip -o -6 addr show scope global 2>/dev/null"
+	output, err := i.sshClient.Execute(addressCmd)
+	if err != nil {
+		return utils.IPv6InterfaceNetwork{}, fmt.Errorf("获取本机IPv6接口地址失败: %w", err)
 	}
-
-	for _, prefix := range privateRanges {
-		if strings.HasPrefix(address, prefix) {
-			return true
-		}
+	selected, err := utils.SelectPublicIPv6InterfaceNetwork(output, preferredInterface, requireAssignable)
+	if err != nil {
+		return utils.IPv6InterfaceNetwork{}, fmt.Errorf("%w: output=%s", err, utils.SanitizeUserInput(strings.TrimSpace(output)))
 	}
-
-	// Teredo 前缀是 2001:0000::/32，不能把所有 2001:* 都视为私有地址。
-	if strings.HasPrefix(address, "2001:0000:") || strings.HasPrefix(address, "2001:0:") {
-		return true
-	}
-	return false
+	return selected, nil
 }
 
 // checkIPv6 检查并获取IPv6地址
 func (i *IncusProvider) checkIPv6(ctx context.Context) (string, error) {
-	// 首先尝试从本地网络接口获取全局IPv6地址
-	cmd := "ip -6 addr show | grep global | awk '{print length, $2}' | sort -nr | head -n 1 | awk '{print $2}' | cut -d '/' -f1"
+	// A routed container prefix must be present on this host. An egress API can
+	// report an address owned by an upstream NAT or tunnel and is not valid input
+	// for local IPv6 allocation.
+	cmd := "ip -o -6 addr show scope global 2>/dev/null | awk '$0 !~ / tentative/ {print $4}'"
 	output, err := i.sshClient.Execute(cmd)
 	if err == nil {
-		ipv6 := strings.TrimSpace(output)
-		if !i.isPrivateIPv6(ipv6) {
-			global.APP_LOG.Debug("从本地接口获取到IPv6地址", zap.String("ipv6", ipv6))
-			return ipv6, nil
-		}
-	}
-	// 如果本地没有全局IPv6地址，通过API获取
-	apiEndpoints := []string{
-		"ipv6.ip.sb",
-		"https://ipget.net",
-		"ipv6.ping0.cc",
-		"https://api.my-ip.io/ip",
-		"https://ipv6.icanhazip.com",
-	}
-	for _, endpoint := range apiEndpoints {
-		cmd := fmt.Sprintf("curl -sLk6m8 '%s' | tr -d '[:space:]'", endpoint)
-		output, err := i.sshClient.Execute(cmd)
-		if err == nil {
-			ipv6 := strings.TrimSpace(output)
-			if ipv6 != "" && !strings.Contains(output, "error") && !i.isPrivateIPv6(ipv6) {
-				global.APP_LOG.Debug("通过API获取到IPv6地址",
-					zap.String("endpoint", endpoint),
-					zap.String("ipv6", ipv6))
+		for _, ipv6 := range utils.ExtractIPv6Addresses(output) {
+			if !i.isPrivateIPv6(ipv6) {
+				global.APP_LOG.Debug("从本地接口获取到IPv6地址", zap.String("ipv6", ipv6))
 				return ipv6, nil
 			}
 		}
-		time.Sleep(1 * time.Second)
 	}
-	return "", fmt.Errorf("无法获取有效的IPv6地址")
+	return "", fmt.Errorf("未检测到本机绑定的有效公网IPv6地址")
 }
 
 // getContainerIPv6 获取容器内网IPv6地址
 func (i *IncusProvider) getContainerIPv6(ctx context.Context, containerName string) (string, error) {
-	cmd := fmt.Sprintf("incus list %s --format=json | jq -r '.[0].state.network.eth0.addresses[] | select(.family==\"inet6\") | select(.scope==\"global\") | .address'", shellSingleQuote(containerName))
+	// Native IPv6 is usually on eth0, whereas a static/routed allocation is
+	// attached as eth1.  Reading only eth0 leaves the later port-mapping phase
+	// without a target even though the IPv6 device was configured correctly.
+	cmd := fmt.Sprintf("incus list %s --format=json | jq -r '.[0].state.network | to_entries[]?.value.addresses[]? | select(.family==\"inet6\" and .scope==\"global\") | .address'", shellSingleQuote(containerName))
 	output, err := i.sshClient.Execute(cmd)
 	if err != nil {
 		return "", fmt.Errorf("获取容器IPv6地址失败: %w", err)
 	}
 
-	ipv6 := strings.TrimSpace(output)
-	if ipv6 == "" || ipv6 == "null" {
-		return "", fmt.Errorf("容器无内网IPv6地址")
+	ipv6, parseErr := utils.ParseFirstIPv6AddressOutput(output)
+	if parseErr != nil {
+		return "", fmt.Errorf("容器IPv6输出无效: %w", parseErr)
 	}
 
 	global.APP_LOG.Debug("获取到容器IPv6地址",
@@ -113,11 +97,45 @@ func (i *IncusProvider) getContainerIPv6(ctx context.Context, containerName stri
 
 // GetInstanceIPv6 获取实例的内网IPv6地址 (公开方法)
 func (i *IncusProvider) GetInstanceIPv6(ctx context.Context, instanceName string) (string, error) {
+	// The controller-owned allocation survives a stop and is the most reliable
+	// source while a proxy device is being added.
+	if output, err := i.sshClient.Execute(fmt.Sprintf("cat %s 2>/dev/null", shellSingleQuote(instanceName+"_v6"))); err == nil {
+		if ipv6, parseErr := utils.ParseFirstIPv6AddressOutput(output); parseErr == nil {
+			return ipv6, nil
+		}
+	}
 	return i.getContainerIPv6(ctx, instanceName)
 }
 
 // GetInstanceIPv4 获取实例的内网IPv4地址 (公开方法)
 func (i *IncusProvider) GetInstanceIPv4(ctx context.Context, instanceName string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if strings.EqualFold(strings.TrimSpace(i.config.ExecutionRule), "api_only") {
+		if i.apiClient == nil {
+			return "", fmt.Errorf("API客户端不可用")
+		}
+		state, err := i.apiGetInstanceResource(ctx, instanceName, "/state")
+		ip := ""
+		if err == nil {
+			ip = i.apiInstanceIPv4(state)
+		}
+		if ip == "" {
+			leaseIP, _, leaseErr := i.apiIPv4FromNetworkLeases(ctx, instanceName)
+			if leaseErr != nil {
+				return "", leaseErr
+			}
+			if leaseIP == "" {
+				if err != nil {
+					return "", err
+				}
+				return "", fmt.Errorf("实例尚未获得IPv4地址")
+			}
+			ip = leaseIP
+		}
+		return ip, nil
+	}
 	// 复用已有的getInstanceIP方法来获取内网IPv4地址
 	return i.getInstanceIP(instanceName)
 }
@@ -128,8 +146,8 @@ func (i *IncusProvider) GetInstancePublicIPv6(ctx context.Context, instanceName 
 	publicIPv6Cmd := fmt.Sprintf("cat %s 2>/dev/null | tail -1", shellSingleQuote(instanceName+"_v6"))
 	publicIPv6Output, err := i.sshClient.Execute(publicIPv6Cmd)
 	if err == nil {
-		publicIPv6 := utils.CleanCommandOutput(publicIPv6Output)
-		if publicIPv6 != "" && !i.isPrivateIPv6(publicIPv6) {
+		publicIPv6, parseErr := utils.ParseFirstIPv6AddressOutput(publicIPv6Output)
+		if parseErr == nil && !i.isPrivateIPv6(publicIPv6) {
 			global.APP_LOG.Debug("从文件获取到公网IPv6地址",
 				zap.String("instanceName", instanceName),
 				zap.String("publicIPv6", publicIPv6))
@@ -141,8 +159,8 @@ func (i *IncusProvider) GetInstancePublicIPv6(ctx context.Context, instanceName 
 	eth1Cmd := fmt.Sprintf("incus list %s --format json | jq -r '.[0].state.network.eth1.addresses[]? | select(.family==\"inet6\" and .scope==\"global\") | .address' 2>/dev/null", shellSingleQuote(instanceName))
 	eth1Output, err := i.sshClient.Execute(eth1Cmd)
 	if err == nil {
-		eth1IPv6 := utils.CleanCommandOutput(eth1Output)
-		if eth1IPv6 != "" && !i.isPrivateIPv6(eth1IPv6) {
+		eth1IPv6, parseErr := utils.ParseFirstIPv6AddressOutput(eth1Output)
+		if parseErr == nil && !i.isPrivateIPv6(eth1IPv6) {
 			global.APP_LOG.Debug("从eth1获取到公网IPv6地址",
 				zap.String("instanceName", instanceName),
 				zap.String("publicIPv6", eth1IPv6))
@@ -163,9 +181,9 @@ func (i *IncusProvider) GetVethInterfaceName(ctx context.Context, instanceName s
 		return "", fmt.Errorf("获取veth接口名称失败: %w", err)
 	}
 
-	vethName := utils.CleanCommandOutput(output)
-	if vethName == "" {
-		return "", fmt.Errorf("未找到veth接口名称")
+	vethName, parseErr := utils.ParseFirstNetworkInterfaceOutput(output)
+	if parseErr != nil {
+		return "", fmt.Errorf("veth接口名称输出无效: %w", parseErr)
 	}
 
 	global.APP_LOG.Debug("获取到veth接口名称",
@@ -184,10 +202,13 @@ func (i *IncusProvider) GetVethInterfaceNameV6(ctx context.Context, instanceName
 		return "", fmt.Errorf("获取veth接口名称(IPv6)失败: %w", err)
 	}
 
-	vethName := utils.CleanCommandOutput(output)
-	if vethName == "" {
+	if strings.TrimSpace(output) == "" {
 		// 如果没有eth1，可能使用eth0，返回eth0的veth接口
 		return i.GetVethInterfaceName(ctx, instanceName)
+	}
+	vethName, parseErr := utils.ParseFirstNetworkInterfaceOutput(output)
+	if parseErr != nil {
+		return "", fmt.Errorf("IPv6 veth接口名称输出无效: %w", parseErr)
 	}
 
 	global.APP_LOG.Debug("获取到veth接口名称(IPv6)",
@@ -199,18 +220,12 @@ func (i *IncusProvider) GetVethInterfaceNameV6(ctx context.Context, instanceName
 
 // getHostIPv6Prefix 获取宿主机IPv6子网前缀
 func (i *IncusProvider) getHostIPv6Prefix(ctx context.Context) (string, error) {
-	cmd := "ip -6 addr show | grep -E 'inet6.*global' | awk '{print $2}' | awk -F'/' '{print $1}' | head -n 1 | cut -d ':' -f1-5"
-	output, err := i.sshClient.Execute(cmd)
+	selected, err := i.selectHostIPv6InterfaceNetwork(ctx, false)
 	if err != nil {
-		return "", fmt.Errorf("获取IPv6子网前缀失败: %w", err)
+		return "", fmt.Errorf("无IPv6子网: %w", err)
 	}
 
-	prefix := strings.TrimSpace(output)
-	if prefix == "" {
-		return "", fmt.Errorf("无IPv6子网")
-	}
-
-	prefix = prefix + ":"
+	prefix := selected.Network.CIDR()
 	global.APP_LOG.Debug("获取到IPv6子网前缀", zap.String("prefix", prefix))
 	return prefix, nil
 }
@@ -223,25 +238,16 @@ func (i *IncusProvider) getIPv6GatewayInfo(ctx context.Context) (string, error) 
 		return "N", fmt.Errorf("获取IPv6网关信息失败: %w", err)
 	}
 
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	var gateway string
-
-	if len(lines) == 1 {
-		gateway = lines[0]
-	} else if len(lines) >= 2 {
-		// 优先选择非fe80的网关
-		for _, line := range lines {
-			if !strings.HasPrefix(line, "fe80") {
-				gateway = line
-				break
-			}
-		}
-		if gateway == "" {
-			gateway = lines[0]
+	gateways := utils.ExtractIPv6Addresses(output)
+	if len(gateways) == 0 {
+		return "N", nil
+	}
+	for _, gateway := range gateways {
+		if !strings.HasPrefix(gateway, "fe80:") {
+			return "N", nil
 		}
 	}
-
-	if strings.HasPrefix(gateway, "fe80") {
+	if strings.HasPrefix(gateways[0], "fe80:") {
 		return "Y", nil
 	}
 	return "N", nil
@@ -325,18 +331,20 @@ func (i *IncusProvider) installSipcalcRHEL(ctx context.Context) error {
 	}
 
 	// 安装rpm包
-	installCmd := fmt.Sprintf("rpm -ivh %s", filename)
+	installCmd := fmt.Sprintf("rpm -ivh %s", shellSingleQuote(filename))
 	_, err = i.sshClient.Execute(installCmd)
 	if err != nil {
 		// 尝试使用dnf/yum安装
-		_, err = i.sshClient.Execute("dnf install -y " + filename)
+		_, err = i.sshClient.Execute("dnf install -y " + shellSingleQuote(filename))
 		if err != nil {
-			_, err = i.sshClient.Execute("yum install -y " + filename)
+			_, err = i.sshClient.Execute("yum install -y " + shellSingleQuote(filename))
 		}
 	}
 
 	// 清理下载的文件
-	i.sshClient.Execute("rm -f " + filename)
+	if _, cleanupErr := i.sshClient.Execute("rm -f " + shellSingleQuote(filename)); err == nil && cleanupErr != nil {
+		return fmt.Errorf("清理sipcalc安装包失败: %w", cleanupErr)
+	}
 
 	return err
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 
 /// Generic envelope used for all frames.
 #[derive(Serialize, Deserialize, Debug)]
@@ -29,6 +29,21 @@ pub(super) struct ExecRespPayload {
     pub(super) stdout: String,
     pub(super) stderr: String,
     pub(super) exit_code: i32,
+}
+
+/// Restricted in-process API request. The body stays in the authenticated
+/// WebSocket frame and is never passed through a shell or process argument.
+#[derive(Deserialize)]
+pub(super) struct ApiReqPayload {
+    pub(super) method: String,
+    pub(super) path: String,
+    pub(super) body: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ApiRespPayload {
+    pub(super) status: u16,
+    pub(super) body: serde_json::Value,
 }
 
 /// Payload sent in the initial `info` frame.
@@ -66,4 +81,12 @@ pub(super) struct ShellHandle {
     pub(super) stdin_tx: mpsc::Sender<Vec<u8>>,
     pub(super) master: Arc<AsyncFd<OwnedFd>>,
     pub(super) child_pid: u32,
+    pub(super) _permit: Arc<OwnedSemaphorePermit>,
+    pub(super) cancel: watch::Sender<bool>,
+}
+
+impl ShellHandle {
+    pub(super) fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
 }

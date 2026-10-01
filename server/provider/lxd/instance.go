@@ -23,6 +23,9 @@ func isLXDConfigUnsupportedError(err error) bool {
 	return strings.Contains(errMsg, "unknown key") ||
 		strings.Contains(errMsg, "invalid config") ||
 		strings.Contains(errMsg, "not supported") ||
+		strings.Contains(errMsg, "does not support") ||
+		strings.Contains(errMsg, "doesn't support") ||
+		strings.Contains(errMsg, "unsupported") ||
 		strings.Contains(errMsg, "cgroup controller is missing")
 }
 
@@ -220,35 +223,6 @@ func (l *LXDProvider) configureInstanceSecurity(ctx context.Context, config prov
 		if err := l.setInstanceConfig(ctx, config.Name, "security.secureboot", "false"); err != nil {
 			global.APP_LOG.Warn("设置SecureBoot失败", zap.Error(err))
 		}
-
-		if err := l.setInstanceConfig(ctx, config.Name, "limits.cpu.priority", "0"); err != nil {
-			if isLXDConfigUnsupportedError(err) {
-				global.APP_LOG.Warn("设置CPU优先级失败，当前节点不支持该配置，已跳过", zap.Error(err))
-			} else {
-				global.APP_LOG.Warn("设置CPU优先级失败", zap.Error(err))
-			}
-		}
-
-		swapEnabled := true
-		if err := l.setInstanceConfig(ctx, config.Name, "limits.memory.swap", swapValue); err != nil {
-			if isLXDConfigUnsupportedError(err) {
-				swapEnabled = false
-				global.APP_LOG.Warn("设置内存交换失败，当前节点不支持该配置，已跳过", zap.Error(err))
-			} else {
-				swapEnabled = false
-				global.APP_LOG.Warn("设置内存交换失败", zap.Error(err))
-			}
-		}
-
-		if swapEnabled && swapValue == "true" {
-			if err := l.setInstanceConfig(ctx, config.Name, "limits.memory.swap.priority", "1"); err != nil {
-				if isLXDConfigUnsupportedError(err) {
-					global.APP_LOG.Warn("设置内存交换优先级失败，当前节点不支持该配置，已跳过", zap.Error(err))
-				} else {
-					global.APP_LOG.Warn("设置内存交换优先级失败", zap.Error(err))
-				}
-			}
-		}
 	} else {
 		nestingValue := "true"
 		if config.AllowNesting != nil && !*config.AllowNesting {
@@ -257,11 +231,10 @@ func (l *LXDProvider) configureInstanceSecurity(ctx context.Context, config prov
 
 		// 容器安全配置
 		if err := l.setInstanceConfig(ctx, config.Name, "security.nesting", nestingValue); err != nil {
-			if isLXDConfigUnsupportedError(err) {
-				global.APP_LOG.Warn("设置容器嵌套失败，当前节点不支持该配置，已跳过", zap.Error(err))
-			} else {
-				global.APP_LOG.Warn("设置容器嵌套失败", zap.Error(err))
-			}
+			// A requested nesting capability must be visible in the instance
+			// config before creation is reported successful. Otherwise Docker/runc
+			// fails later with misleading permission errors.
+			return fmt.Errorf("设置容器嵌套 security.nesting=%s 失败: %w", nestingValue, err)
 		}
 
 		// CPU优先级配置
@@ -288,7 +261,7 @@ func (l *LXDProvider) configureInstanceSecurity(ctx context.Context, config prov
 		if swapEnabled && swapValue == "true" {
 			if err := l.setInstanceConfig(ctx, config.Name, "limits.memory.swap.priority", "1"); err != nil {
 				if isLXDConfigUnsupportedError(err) {
-					global.APP_LOG.Warn("设置内存交换优先级失败，当前节点不支持该配置，已跳过", zap.Error(err))
+					global.APP_LOG.Debug("当前节点不支持内存交换优先级，已跳过", zap.Error(err))
 				} else {
 					global.APP_LOG.Warn("设置内存交换优先级失败", zap.Error(err))
 				}
@@ -355,7 +328,7 @@ func (l *LXDProvider) setInstanceConfig(ctx context.Context, instanceName string
 
 	// SSH方式设置配置（优先 key=value 新语法，兼容回退到旧语法）
 	cmdNew := fmt.Sprintf("lxc config set %s %s=%s", shellSingleQuote(instanceName), shellSingleQuote(key), shellSingleQuote(value))
-	_, newErr := client.Execute(cmdNew)
+	newOutput, newErr := client.Execute(cmdNew)
 	if newErr == nil {
 		global.APP_LOG.Debug("LXD SSH设置实例配置成功",
 			zap.String("instance", instanceName),
@@ -365,9 +338,10 @@ func (l *LXDProvider) setInstanceConfig(ctx context.Context, instanceName string
 		return nil
 	}
 
-	_, err := client.Execute(cmd)
+	legacyOutput, err := client.Execute(cmd)
 	if err != nil {
-		return fmt.Errorf("SSH设置实例配置失败: new syntax error=%v, legacy syntax error=%w", newErr, err)
+		return fmt.Errorf("SSH设置实例配置失败: new syntax error=%v, output=%s; legacy syntax error=%w, output=%s",
+			newErr, utils.RedactSensitiveCommand(newOutput, 1000), err, utils.RedactSensitiveCommand(legacyOutput, 1000))
 	}
 
 	global.APP_LOG.Debug("LXD SSH设置实例配置成功",
@@ -599,6 +573,8 @@ func (l *LXDProvider) configureInstanceSSHPassword(ctx context.Context, config p
 
 	// 生成随机密码
 	password := l.generateRandomPassword()
+	var sshSetupErr error
+	var sshSetupOutput string
 
 	// 根据系统类型选择脚本
 	var scriptName string
@@ -619,16 +595,16 @@ func (l *LXDProvider) configureInstanceSSHPassword(ctx context.Context, config p
 	scriptPath := filepath.Join("/usr/local/bin", scriptName)
 	// 检查脚本是否存在
 	if !l.isRemoteFileValid(scriptPath) {
-		global.APP_LOG.Warn("SSH脚本不存在，仅设置密码不配置SSH",
+		sshSetupErr = fmt.Errorf("宿主机SSH脚本不存在或无效: %s", scriptPath)
+		global.APP_LOG.Debug("SSH脚本不可用，将在设置密码后尝试内置恢复",
 			zap.String("scriptPath", scriptPath))
-		// 即使脚本不存在，也要设置密码
 	} else {
 		time.Sleep(3 * time.Second)
 		// 复制脚本到实例（宿主机文件操作，直接执行即可）
 		copyCmd := fmt.Sprintf("lxc file push %s %s/root/", shellSingleQuote(scriptPath), shellSingleQuote(config.Name))
-		_, err = l.sshClient.Execute(copyCmd)
+		sshSetupOutput, err = l.sshClient.Execute(copyCmd)
 		if err != nil {
-			global.APP_LOG.Warn("复制SSH脚本到实例失败，仅设置密码", zap.Error(err))
+			sshSetupErr = fmt.Errorf("复制SSH脚本到实例失败: %w", err)
 		} else {
 			// 设置脚本权限并执行 - 使用临时脚本方式以确保 agent 模式下稳定执行
 			sshExecScript := utils.BuildTempScript(utils.TempScriptConfig{
@@ -639,13 +615,7 @@ func (l *LXDProvider) configureInstanceSSHPassword(ctx context.Context, config p
 				TimeoutSeconds: 60,
 				SuccessMarker:  "PASSWORD_OK",
 			})
-			_, scriptErr := l.sshClient.ExecuteViaTempScript(sshExecScript, nil, 180*time.Second)
-			if scriptErr != nil {
-				global.APP_LOG.Warn("执行SSH配置脚本失败，将使用直接设置密码",
-					zap.String("instanceName", config.Name),
-					zap.String("scriptName", scriptName),
-					zap.Error(scriptErr))
-			}
+			sshSetupOutput, sshSetupErr = l.sshClient.ExecuteViaTempScript(sshExecScript, nil, 180*time.Second)
 			time.Sleep(3 * time.Second)
 		}
 	}
@@ -657,6 +627,26 @@ func (l *LXDProvider) configureInstanceSSHPassword(ctx context.Context, config p
 			zap.String("instanceName", config.Name),
 			zap.Error(err))
 		return fmt.Errorf("设置实例密码失败: %w", err)
+	}
+
+	if sshSetupErr != nil {
+		recoveryOutput, recoveryErr := l.recoverGuestSSHService(config.Name)
+		if recoveryErr != nil {
+			global.APP_LOG.Warn("SSH配置脚本失败且内置恢复未成功，实例密码已设置但WebSSH可能不可用",
+				zap.String("instanceName", config.Name),
+				zap.String("scriptName", scriptName),
+				zap.String("scriptOutput", utils.TruncateString(strings.ReplaceAll(sshSetupOutput, password, "[redacted]"), 1000)),
+				zap.String("recoveryOutput", utils.TruncateString(recoveryOutput, 1000)),
+				zap.Error(sshSetupErr),
+				zap.NamedError("recoveryError", recoveryErr))
+		} else {
+			global.APP_LOG.Info("SSH配置脚本失败后内置恢复成功",
+				zap.String("instanceName", config.Name),
+				zap.String("scriptName", scriptName))
+		}
+	}
+	if err := l.restoreIPv6OnlyDNS(config); err != nil {
+		return err
 	}
 
 	// 清理历史记录 - 非阻塞式，如果失败不影响整体流程

@@ -11,14 +11,17 @@ import (
 	"oneclickvirt/constant"
 	"oneclickvirt/global"
 	adminModel "oneclickvirt/model/admin"
+	monitoringModel "oneclickvirt/model/monitoring"
 	providerModel "oneclickvirt/model/provider"
 	systemModel "oneclickvirt/model/system"
 	userModel "oneclickvirt/model/user"
 	traffic_monitor "oneclickvirt/service/admin/traffic_monitor"
+	ipv6PoolService "oneclickvirt/service/ipv6pool"
 	provider2 "oneclickvirt/service/provider"
 	"oneclickvirt/service/resources"
 	"oneclickvirt/utils"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -57,6 +60,97 @@ type ResetTaskContext struct {
 	NewProviderInstanceID  string
 	NewPassword            string
 	NewPrivateIP           string
+	NewGuestIPv6           string
+	OldAllocatedIPv6       string
+	NewAllocatedIPv6       string
+	NewIPv6Metadata        ipv6PoolService.IPv6AllocationMetadata
+	OldEgressBindingID     uint
+}
+
+func applyIPv6AllocationMetadata(metadata map[string]string, allocation ipv6PoolService.IPv6AllocationMetadata) {
+	if metadata == nil || strings.TrimSpace(allocation.Address) == "" {
+		return
+	}
+	metadata["static_ipv6"] = allocation.Address
+	if strings.TrimSpace(allocation.CIDR) == "" {
+		return
+	}
+	metadata["static_ipv6_cidr"] = allocation.CIDR
+	metadata["static_ipv6_gateway"] = allocation.Gateway
+	metadata["static_ipv6_bridge"] = allocation.Bridge
+	metadata["static_ipv6_tunnel_id"] = fmt.Sprintf("%d", allocation.TunnelID)
+	metadata["static_ipv6_tunnel_interface"] = allocation.TunnelInterface
+	metadata["static_ipv6_network"] = allocation.CIDR
+}
+
+// validateResetRoutedIPv6 verifies the binding that will be moved during a
+// reset before the old guest is removed. Routed-only VM backends cannot turn a
+// legacy standalone pool address into a reachable guest route, so discovering
+// that only after deletion would leave the user without their original guest.
+func validateResetRoutedIPv6(providerType, networkType, allocatedIPv6 string, allocation ipv6PoolService.IPv6AllocationMetadata) error {
+	if !ipv6PoolService.RequiresRoutedStaticIPv6(providerType) {
+		return nil
+	}
+	if !utils.NetworkTypeHasIPv6(networkType) && strings.TrimSpace(allocatedIPv6) == "" {
+		return nil
+	}
+	if strings.TrimSpace(allocatedIPv6) == "" {
+		return fmt.Errorf("Provider类型 %s 的IPv6实例缺少可迁移的隧道路由IPv6地址池绑定，无法安全重建", providerType)
+	}
+	if strings.TrimSpace(allocation.Address) != strings.TrimSpace(allocatedIPv6) {
+		return fmt.Errorf("重建实例IPv6地址与隧道路由元数据不一致")
+	}
+	if strings.TrimSpace(allocation.CIDR) == "" || strings.TrimSpace(allocation.Gateway) == "" ||
+		strings.TrimSpace(allocation.Bridge) == "" || allocation.TunnelID == 0 || strings.TrimSpace(allocation.TunnelInterface) == "" {
+		return fmt.Errorf("Provider类型 %s 的IPv6地址池缺少隧道路由前缀、网关、网桥或接口信息，无法安全重建", providerType)
+	}
+	return nil
+}
+
+func resetReplacementInstance(resetCtx *ResetTaskContext) providerModel.Instance {
+	return providerModel.Instance{
+		UUID:            resetCtx.Instance.UUID,
+		Name:            resetCtx.OldInstanceName,
+		Provider:        resetCtx.Provider.Name,
+		ProviderID:      resetCtx.Provider.ID,
+		Image:           resetCtx.Instance.Image,
+		InstanceType:    resetCtx.Instance.InstanceType,
+		CPU:             resetCtx.Instance.CPU,
+		Memory:          resetCtx.Instance.Memory,
+		Disk:            resetCtx.Instance.Disk,
+		Bandwidth:       resetCtx.Instance.Bandwidth,
+		UserID:          resetCtx.OriginalUserID,
+		Status:          "creating",
+		DesiredState:    resetCtx.Instance.DesiredState,
+		OSType:          resetCtx.Instance.OSType,
+		NetworkType:     resetCtx.Instance.NetworkType,
+		ExpiresAt:       resetCtx.OriginalExpiresAt,
+		IsManualExpiry:  resetCtx.OriginalIsManualExpiry,
+		PublicIP:        resetCtx.Provider.Endpoint,
+		MaxTraffic:      int64(resetCtx.OriginalMaxTraffic),
+		ProviderVMID:    resetCtx.OldInstanceName,
+		EgressProfileID: resetCtx.Instance.EgressProfileID,
+	}
+}
+
+func transferResetEgressBindingInTx(tx *gorm.DB, bindingID, providerID, oldInstanceID, newInstanceID uint) error {
+	if bindingID == 0 {
+		return nil
+	}
+	if tx == nil || providerID == 0 || oldInstanceID == 0 || newInstanceID == 0 {
+		return fmt.Errorf("透明出口绑定迁移参数无效")
+	}
+	result := tx.Model(&monitoringModel.EgressDesiredBinding{}).
+		Where("id = ? AND provider_id = ? AND instance_id = ? AND pending_delete = ?",
+			bindingID, providerID, oldInstanceID, false).
+		Update("instance_id", newInstanceID)
+	if result.Error != nil {
+		return fmt.Errorf("迁移重建实例透明出口绑定失败: %v", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("透明出口绑定在重建期间发生并发变化")
+	}
+	return nil
 }
 
 // executeResetTask 执行实例重置任务
@@ -69,6 +163,19 @@ func (s *TaskService) executeResetTask(ctx context.Context, task *adminModel.Tas
 	}
 
 	var resetCtx ResetTaskContext
+	defer func() {
+		if resetCtx.NewInstanceID == 0 {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Creation or cancellation can exit before restoration. Keep the
+		// allocation, but make unfinished rows visible to the repair workflow.
+		if err := global.APP_DB.WithContext(cleanupCtx).Model(&providerModel.Port{}).
+			Where("instance_id = ? AND provider_id = ? AND status = ?", resetCtx.NewInstanceID, resetCtx.Provider.ID, "restoring").Update("status", "failed").Error; err != nil {
+			global.APP_LOG.Error("重建未完成端口状态清理失败", zap.Error(err))
+		}
+	}()
 
 	// 当任务context被取消时（超时/强制停止），确保新实例不会卡在creating状态
 	// 使用独立的background context执行清理，避免被取消的ctx影响
@@ -94,7 +201,6 @@ func (s *TaskService) executeResetTask(ctx context.Context, task *adminModel.Tas
 			}
 		}
 	}()
-
 	// 阶段1: 准备阶段 - 收集必要信息
 	if err := s.resetTask_Prepare(ctx, task, &taskReq, &resetCtx); err != nil {
 		return err
@@ -127,15 +233,20 @@ func (s *TaskService) executeResetTask(ctx context.Context, task *adminModel.Tas
 	}
 
 	// 阶段7: 恢复端口映射（使用端口映射服务）
-	if err := s.resetTask_RestorePortMappings(ctx, task, &resetCtx); err != nil {
-		// 端口映射失败不影响重置流程
-		global.APP_LOG.Warn("重置系统：端口映射恢复部分失败", zap.Error(err))
+	portRestoreErr := s.resetTask_RestorePortMappings(ctx, task, &resetCtx)
+	if portRestoreErr != nil {
+		// Keep the replacement guest and continue monitoring, but do not report
+		// a fully successful reset when its connectivity could not be restored.
+		global.APP_LOG.Warn("重置系统：端口映射恢复部分失败", zap.Error(portRestoreErr))
 	}
 
 	// 阶段8: 重新初始化监控
 	if err := s.resetTask_ReinitializeMonitoring(ctx, task, &resetCtx); err != nil {
 		// 监控初始化失败不影响重置流程
 		global.APP_LOG.Warn("重置系统：监控初始化失败", zap.Error(err))
+	}
+	if portRestoreErr != nil {
+		return fmt.Errorf("实例已重建，但端口映射恢复失败（保留实例及端口占用供修复）: %w", portRestoreErr)
 	}
 
 	s.updateTaskProgress(task.ID, 100, "step.resetCompleted")
@@ -190,6 +301,33 @@ func (s *TaskService) resetTask_Prepare(ctx context.Context, task *adminModel.Ta
 			return fmt.Errorf("获取Provider配置失败: %v", err)
 		}
 
+		var ipv6Binding providerModel.ProviderIPv6Pool
+		bindingResult := global.APP_DB.Where("provider_id = ? AND instance_id = ? AND is_allocated = ? AND deleted_at IS NULL",
+			resetCtx.Provider.ID, resetCtx.Instance.ID, true).First(&ipv6Binding)
+		if bindingResult.Error == nil {
+			resetCtx.OldAllocatedIPv6 = ipv6Binding.Address
+		} else if !errors.Is(bindingResult.Error, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("获取实例IPv6地址池绑定失败: %v", bindingResult.Error)
+		}
+
+		var egressBinding monitoringModel.EgressDesiredBinding
+		egressResult := global.APP_DB.Where("provider_id = ? AND instance_id = ? AND pending_delete = ?",
+			resetCtx.Provider.ID, resetCtx.Instance.ID, false).First(&egressBinding)
+		if egressResult.Error == nil {
+			if strings.TrimSpace(resetCtx.Instance.UUID) == "" {
+				return fmt.Errorf("实例缺少稳定UUID，无法安全迁移透明出口绑定")
+			}
+			if configured := strings.TrimSpace(resetCtx.Instance.EgressProfileID); configured != "" && configured != egressBinding.ProfileID {
+				return fmt.Errorf("实例出口配置与控制端期望状态不一致")
+			}
+			resetCtx.Instance.EgressProfileID = egressBinding.ProfileID
+			resetCtx.OldEgressBindingID = egressBinding.ID
+		} else if !errors.Is(egressResult.Error, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("获取实例透明出口绑定失败: %v", egressResult.Error)
+		} else if strings.TrimSpace(resetCtx.Instance.EgressProfileID) != "" {
+			return fmt.Errorf("实例已配置透明出口，但控制端期望状态缺失")
+		}
+
 		// 重新确定resetImageName（需要在查询实例后获取默认值）
 		if resetImageName == "" {
 			resetImageName = resetCtx.Instance.Image
@@ -214,7 +352,7 @@ func (s *TaskService) resetTask_Prepare(ctx context.Context, task *adminModel.Ta
 		// 4. 查询端口映射（包含status='active'的）
 		if err := global.APP_DB.Where("instance_id = ? AND status = ?", resetCtx.Instance.ID, "active").
 			Find(&resetCtx.OldPortMappings).Error; err != nil {
-			global.APP_LOG.Warn("获取旧端口映射失败", zap.Error(err))
+			return fmt.Errorf("获取旧端口映射失败，不能安全重建: %w", err)
 		}
 
 		return nil
@@ -222,6 +360,25 @@ func (s *TaskService) resetTask_Prepare(ctx context.Context, task *adminModel.Ta
 
 	if err != nil {
 		return err
+	}
+	if utils.NetworkTypeHasIPv6(resetCtx.Instance.NetworkType) && !ipv6PoolService.SupportsStaticIPv6(resetCtx.Provider.Type) {
+		return fmt.Errorf("Provider类型 %s 当前不支持实例IPv6网络配置，无法安全重建", resetCtx.Provider.Type)
+	}
+	if resetCtx.OldAllocatedIPv6 != "" && !ipv6PoolService.SupportsStaticIPv6(resetCtx.Provider.Type) {
+		return fmt.Errorf("Provider类型 %s 无法在重建时恢复控制面分配的静态IPv6地址", resetCtx.Provider.Type)
+	}
+	if ipv6PoolService.RequiresRoutedStaticIPv6(resetCtx.Provider.Type) &&
+		(utils.NetworkTypeHasIPv6(resetCtx.Instance.NetworkType) || resetCtx.OldAllocatedIPv6 != "") {
+		// This is one controller-side join before any destructive provider call.
+		// The binding is locked and transferred later in the short replacement
+		// transaction, so this validation never holds a DB transaction over SSH.
+		allocation, metadataErr := ipv6PoolService.NewService().GetAllocationMetadata(resetCtx.Provider.ID, resetCtx.Instance.ID)
+		if metadataErr != nil {
+			return fmt.Errorf("读取重建实例IPv6隧道路由元数据失败: %w", metadataErr)
+		}
+		if err := validateResetRoutedIPv6(resetCtx.Provider.Type, resetCtx.Instance.NetworkType, resetCtx.OldAllocatedIPv6, allocation); err != nil {
+			return err
+		}
 	}
 
 	// 如果无法从taskData解析originalStatus，则使用当前状态作为兜底
@@ -232,6 +389,11 @@ func (s *TaskService) resetTask_Prepare(ctx context.Context, task *adminModel.Ta
 	}
 
 	// 保存必要信息
+	if utils.UsesContainerRuntimePorts(resetCtx.Provider.Type, resetCtx.Instance.InstanceType) {
+		if _, err := resetRuntimePortBindings(resetCtx.OldPortMappings); err != nil {
+			return err
+		}
+	}
 	resetCtx.OldInstanceID = resetCtx.Instance.ID
 	resetCtx.OldInstanceName = resetCtx.Instance.Name
 	resetCtx.OldProviderInstanceID = providerInstanceIdentifier(resetCtx.Instance)
@@ -293,74 +455,10 @@ func (s *TaskService) resetTask_CleanupOldInstance(ctx context.Context, task *ad
 		global.APP_LOG.Warn("清理pmacct监控失败", zap.Error(err))
 	}
 
-	// 在单个事务中清理数据库记录和释放资源
-	err := s.dbService.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
-		// 1. 删除端口映射
-		portMappingService := resources.PortMappingService{}
-		if err := portMappingService.DeleteInstancePortMappingsInTx(tx, resetCtx.OldInstanceID); err != nil {
-			global.APP_LOG.Warn("删除端口映射失败", zap.Error(err))
-		}
-
-		// 2. 释放Provider资源
-		resourceService := &resources.ResourceService{}
-		if err := resourceService.ReleaseResourcesInTx(tx, resetCtx.Provider.ID, resetCtx.Instance.InstanceType,
-			resetCtx.Instance.CPU, resetCtx.Instance.Memory, resetCtx.Instance.Disk); err != nil {
-			global.APP_LOG.Warn("释放Provider资源失败", zap.Error(err))
-		}
-
-		// 3. 释放用户配额（根据实例的原始状态，而非当前状态）
-		// 实例在重置前可能是running/stopped等稳定状态，但触发重置后状态被更新为resetting
-		// 应该根据原始状态判断配额类型，而不是当前的resetting状态
-		quotaService := resources.NewQuotaService()
-		resourceUsage := resources.ResourceUsage{
-			CPU:       resetCtx.Instance.CPU,
-			Memory:    resetCtx.Instance.Memory,
-			Disk:      resetCtx.Instance.Disk,
-			Bandwidth: resetCtx.Instance.Bandwidth,
-		}
-
-		// 根据实例的原始状态（重置前的状态）释放对应的配额
-		isPendingState := constant.IsTransitionalStatus(resetCtx.OriginalStatus)
-		if resetCtx.OriginalUserID == 0 {
-			global.APP_LOG.Debug("实例无用户归属，跳过用户配额释放",
-				zap.Uint("taskId", task.ID),
-				zap.Uint("instanceId", resetCtx.OldInstanceID))
-		} else if isPendingState {
-			if err := quotaService.ReleasePendingQuota(tx, resetCtx.OriginalUserID, resourceUsage); err != nil {
-				global.APP_LOG.Warn("释放待确认配额失败", zap.Error(err))
-			}
-			global.APP_LOG.Debug("已释放待确认配额",
-				zap.String("originalStatus", resetCtx.OriginalStatus),
-				zap.Uint("userId", resetCtx.OriginalUserID))
-		} else {
-			if err := quotaService.ReleaseUsedQuota(tx, resetCtx.OriginalUserID, resourceUsage); err != nil {
-				global.APP_LOG.Warn("释放已使用配额失败", zap.Error(err))
-			}
-			global.APP_LOG.Debug("已释放已使用配额",
-				zap.String("originalStatus", resetCtx.OriginalStatus),
-				zap.Uint("userId", resetCtx.OriginalUserID))
-		}
-
-		// 4. 重命名并软删除实例记录（避免唯一索引冲突，同时保留流量统计）
-		// 在旧实例名后添加时间戳，释放 name+provider_id 的唯一索引
-		deletedName := fmt.Sprintf("%s_deleted_%d", resetCtx.Instance.Name, time.Now().Unix())
-		if err := tx.Model(&resetCtx.Instance).Update("name", deletedName).Error; err != nil {
-			return fmt.Errorf("重命名实例失败: %v", err)
-		}
-
-		// 软删除实例记录，保留流量统计数据
-		if err := tx.Delete(&resetCtx.Instance).Error; err != nil {
-			return fmt.Errorf("删除实例记录失败: %v", err)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return err
-	}
-
-	global.APP_LOG.Info("旧实例清理完成（重命名后软删除）",
+	// The database replacement is deliberately deferred to the create stage so
+	// old/new records, resource accounting and address/egress bindings can move
+	// in one atomic transaction. No remote I/O is performed in that transaction.
+	global.APP_LOG.Info("旧实例宿主资源清理完成，等待原子替换数据库记录",
 		zap.Uint("instanceId", resetCtx.OldInstanceID))
 
 	return nil
@@ -383,38 +481,27 @@ func (s *TaskService) resetTask_CreateNewInstance(ctx context.Context, task *adm
 			zap.Uint("instanceId", resetCtx.OldInstanceID))
 	}
 
-	// 在事务中创建新实例记录并分配配额
+	// 在事务中创建新实例记录、迁移IPv6绑定并分配配额。
+	// 远程Provider调用始终在事务提交后执行。
+	var newInstance providerModel.Instance
+	allocatedIPv6 := ""
+	allocatedIPv6Metadata := ipv6PoolService.IPv6AllocationMetadata{}
 	err := s.dbService.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
-		// 创建新实例记录
-		newInstance := providerModel.Instance{
-			Name:           resetCtx.OldInstanceName,
-			Provider:       resetCtx.Provider.Name,
-			ProviderID:     resetCtx.Provider.ID,
-			Image:          resetCtx.Instance.Image,
-			InstanceType:   resetCtx.Instance.InstanceType,
-			CPU:            resetCtx.Instance.CPU,
-			Memory:         resetCtx.Instance.Memory,
-			Disk:           resetCtx.Instance.Disk,
-			Bandwidth:      resetCtx.Instance.Bandwidth,
-			UserID:         resetCtx.OriginalUserID,
-			Status:         "creating",
-			OSType:         resetCtx.Instance.OSType,
-			NetworkType:    resetCtx.Instance.NetworkType, // 继承原实例的网络类型，保留IPv6配置
-			ExpiresAt:      resetCtx.OriginalExpiresAt,
-			IsManualExpiry: resetCtx.OriginalIsManualExpiry, // 继承原实例的手动过期时间设置
-			PublicIP:       resetCtx.Provider.Endpoint,
-			MaxTraffic:     int64(resetCtx.OriginalMaxTraffic),
-			ProviderVMID:   resetCtx.OldInstanceName,
+		allocatedIPv6 = ""
+		allocatedIPv6Metadata = ipv6PoolService.IPv6AllocationMetadata{}
+		// Serialize with port allocators before replacing either instance. Port
+		// rows are transferred below, never released during the remote create.
+		var lockedProvider providerModel.Provider
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").First(&lockedProvider, resetCtx.Provider.ID).Error; err != nil {
+			return fmt.Errorf("锁定重建Provider失败: %w", err)
 		}
 
-		if err := tx.Create(&newInstance).Error; err != nil {
-			return fmt.Errorf("创建新实例记录失败: %v", err)
+		resourceService := &resources.ResourceService{}
+		if err := resourceService.ReleaseResourcesInTx(tx, resetCtx.Provider.ID, resetCtx.Instance.InstanceType,
+			resetCtx.Instance.CPU, resetCtx.Instance.Memory, resetCtx.Instance.Disk); err != nil {
+			return fmt.Errorf("释放旧实例Provider资源失败: %v", err)
 		}
 
-		resetCtx.NewInstanceID = newInstance.ID
-		resetCtx.NewProviderInstanceID = newInstance.ProviderVMID
-
-		// 分配待确认配额
 		quotaService := resources.NewQuotaService()
 		resourceUsage := resources.ResourceUsage{
 			CPU:       resetCtx.Instance.CPU,
@@ -422,7 +509,70 @@ func (s *TaskService) resetTask_CreateNewInstance(ctx context.Context, task *adm
 			Disk:      resetCtx.Instance.Disk,
 			Bandwidth: resetCtx.Instance.Bandwidth,
 		}
+		if resetCtx.OriginalUserID != 0 {
+			if constant.IsTransitionalStatus(resetCtx.OriginalStatus) {
+				if err := quotaService.ReleasePendingQuota(tx, resetCtx.OriginalUserID, resourceUsage); err != nil {
+					return fmt.Errorf("释放旧实例待确认配额失败: %v", err)
+				}
+			} else if err := quotaService.ReleaseUsedQuota(tx, resetCtx.OriginalUserID, resourceUsage); err != nil {
+				return fmt.Errorf("释放旧实例已使用配额失败: %v", err)
+			}
+		}
 
+		deletedName := fmt.Sprintf("%s_deleted_%d", resetCtx.Instance.Name, time.Now().UnixNano())
+		if err := tx.Model(&providerModel.Instance{}).Where("id = ?", resetCtx.OldInstanceID).
+			Updates(map[string]interface{}{"name": deletedName, "uuid": uuid.New().String()}).Error; err != nil {
+			return fmt.Errorf("重命名旧实例失败: %v", err)
+		}
+		if err := tx.Where("id = ?", resetCtx.OldInstanceID).Delete(&providerModel.Instance{}).Error; err != nil {
+			return fmt.Errorf("删除旧实例记录失败: %v", err)
+		}
+
+		// 创建新实例记录
+		newInstance = resetReplacementInstance(resetCtx)
+
+		if err := tx.Create(&newInstance).Error; err != nil {
+			return fmt.Errorf("创建新实例记录失败: %v", err)
+		}
+		if err := transferResetPortMappingsInTx(tx, resetCtx, newInstance.ID); err != nil {
+			return err
+		}
+
+		var transferErr error
+		allocatedIPv6, transferErr = ipv6PoolService.NewService().TransferIPv6BindingWithDB(
+			tx, resetCtx.Provider.ID, resetCtx.OldInstanceID, newInstance.ID,
+		)
+		if transferErr != nil {
+			return transferErr
+		}
+		if resetCtx.OldAllocatedIPv6 != "" && allocatedIPv6 == "" {
+			return fmt.Errorf("旧实例IPv6地址池绑定在重建期间丢失")
+		}
+		if allocatedIPv6 != "" {
+			if err := tx.Model(&newInstance).Update("public_ipv6", allocatedIPv6).Error; err != nil {
+				return fmt.Errorf("保存重建实例IPv6地址失败: %v", err)
+			}
+			newInstance.PublicIPv6 = allocatedIPv6
+			metadata, metadataErr := ipv6PoolService.NewServiceWithDB(tx).GetAllocationMetadata(resetCtx.Provider.ID, newInstance.ID)
+			if metadataErr != nil {
+				return fmt.Errorf("读取重建实例IPv6路由元数据失败: %w", metadataErr)
+			}
+			if metadata.Address != "" && metadata.Address != allocatedIPv6 {
+				return fmt.Errorf("重建实例IPv6地址与路由元数据不一致")
+			}
+			if metadata.Address == "" {
+				// Native pools have no routed parent metadata, but the create
+				// request must still retain the controller-selected address.
+				metadata.Address = allocatedIPv6
+			}
+			allocatedIPv6Metadata = metadata
+		}
+		if err := transferResetEgressBindingInTx(tx, resetCtx.OldEgressBindingID, resetCtx.Provider.ID,
+			resetCtx.OldInstanceID, newInstance.ID); err != nil {
+			return err
+		}
+
+		// 分配待确认配额
 		if resetCtx.OriginalUserID != 0 {
 			if err := quotaService.AllocatePendingQuota(tx, resetCtx.OriginalUserID, resourceUsage); err != nil {
 				return fmt.Errorf("分配待确认配额失败: %v", err)
@@ -430,11 +580,10 @@ func (s *TaskService) resetTask_CreateNewInstance(ctx context.Context, task *adm
 		} else {
 			global.APP_LOG.Debug("实例无用户归属，跳过待确认配额分配",
 				zap.Uint("taskId", task.ID),
-				zap.Uint("newInstanceId", resetCtx.NewInstanceID))
+				zap.Uint("newInstanceId", newInstance.ID))
 		}
 
 		// 分配Provider资源
-		resourceService := &resources.ResourceService{}
 		if err := resourceService.AllocateResourcesInTx(tx, resetCtx.Provider.ID, resetCtx.Instance.InstanceType,
 			resetCtx.Instance.CPU, resetCtx.Instance.Memory, resetCtx.Instance.Disk); err != nil {
 			return fmt.Errorf("分配Provider资源失败: %v", err)
@@ -445,6 +594,33 @@ func (s *TaskService) resetTask_CreateNewInstance(ctx context.Context, task *adm
 
 	if err != nil {
 		return err
+	}
+	resetCtx.NewInstanceID = newInstance.ID
+	resetCtx.NewProviderInstanceID = newInstance.ProviderVMID
+	resetCtx.NewAllocatedIPv6 = allocatedIPv6
+	resetCtx.NewIPv6Metadata = allocatedIPv6Metadata
+	// Runtime -p bindings must exist before creation; restarting Docker does
+	// not add bindings that were absent from its original create request.
+	if len(resetCtx.OldPortMappings) == 0 && !(resetCtx.Provider.ConnectionType == "agent" && resetCtx.Provider.PortIP == "") {
+		var reservedCount int64
+		if err := global.APP_DB.WithContext(ctx).Model(&providerModel.Port{}).Where("instance_id = ?", newInstance.ID).Count(&reservedCount).Error; err != nil {
+			return err
+		}
+		if reservedCount == 0 {
+			if err := (&resources.PortMappingService{}).ReserveDefaultPortMappingsForReset(ctx, newInstance.ID, resetCtx.Provider.ID, resetCtx.Instance.NetworkType); err != nil {
+				return err
+			}
+			if err := global.APP_DB.WithContext(ctx).Where("instance_id = ? AND status = ?", newInstance.ID, "restoring").Find(&resetCtx.OldPortMappings).Error; err != nil {
+				return err
+			}
+		}
+	}
+	// Listener shutdown can wait for in-flight tunnels, so it must happen
+	// after the database transaction has committed, never inside it.
+	for _, port := range resetCtx.OldPortMappings {
+		if port.MappingType == "controller" && resources.StopControllerPortForwardFunc != nil {
+			resources.StopControllerPortForwardFunc(port.ID)
+		}
 	}
 
 	global.APP_LOG.Info("新实例记录创建完成",
@@ -477,6 +653,7 @@ func (s *TaskService) resetTask_CreateNewInstance(ctx context.Context, task *adm
 		},
 		SystemImageID: resetCtx.SystemImage.ID,
 	}
+	applyIPv6AllocationMetadata(createReq.InstanceConfig.Metadata, resetCtx.NewIPv6Metadata)
 	if utils.SupportsLXDContainerOptions(resetCtx.Provider.Type, resetCtx.Instance.InstanceType) {
 		createReq.InstanceConfig.Privileged = boolPtr(resetCtx.Provider.ContainerPrivileged)
 		createReq.InstanceConfig.AllowNesting = boolPtr(resetCtx.Provider.ContainerAllowNesting)
@@ -498,17 +675,10 @@ func (s *TaskService) resetTask_CreateNewInstance(ctx context.Context, task *adm
 
 	// 容器类Provider（docker/podman/containerd）端口映射特殊处理
 	// 这些Provider通过 -p 标志在创建时绑定端口，需要将端口信息写入创建请求
-	if utils.UsesContainerRuntimePorts(resetCtx.Provider.Type, resetCtx.Instance.InstanceType) && len(resetCtx.OldPortMappings) > 0 {
-		var ports []string
-		for _, oldPort := range resetCtx.OldPortMappings {
-			if oldPort.Protocol == "both" {
-				ports = append(ports,
-					fmt.Sprintf("0.0.0.0:%d:%d/tcp", oldPort.HostPort, oldPort.GuestPort),
-					fmt.Sprintf("0.0.0.0:%d:%d/udp", oldPort.HostPort, oldPort.GuestPort))
-			} else {
-				ports = append(ports,
-					fmt.Sprintf("0.0.0.0:%d:%d/%s", oldPort.HostPort, oldPort.GuestPort, oldPort.Protocol))
-			}
+	if utils.UsesContainerRuntimePorts(resetCtx.Provider.Type, resetCtx.Instance.InstanceType) {
+		ports, err := resetRuntimePortBindings(resetCtx.OldPortMappings)
+		if err != nil {
+			return err
 		}
 		createReq.InstanceConfig.Ports = ports
 	}

@@ -48,7 +48,7 @@ func (i *IncusProvider) DiscoverInstances(ctx context.Context) ([]provider.Disco
 
 // apiDiscoverInstances 通过Incus API发现实例
 func (i *IncusProvider) apiDiscoverInstances(ctx context.Context) ([]provider.DiscoveredInstance, error) {
-	url := fmt.Sprintf("https://%s:8443/1.0/instances?recursion=2", i.config.Host)
+	url := i.apiEndpoint("/1.0/instances?recursion=2")
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %w", err)
@@ -221,6 +221,9 @@ func (i *IncusProvider) apiDiscoverInstances(ctx context.Context) ([]provider.Di
 		} else {
 			discovered.UUID = fmt.Sprintf("incus-%s-%s", i.config.Name, inst.Name)
 		}
+		discovered.RuntimeIdentity = &provider.RecoveryInstanceIdentity{
+			ID: strings.TrimSpace(discovered.ProviderInstanceID), Type: discovered.InstanceType,
+		}
 
 		discoveredInstances = append(discoveredInstances, discovered)
 	}
@@ -389,6 +392,9 @@ func (i *IncusProvider) sshDiscoverInstances(ctx context.Context) ([]provider.Di
 			discovered.UUID = uuid
 		} else {
 			discovered.UUID = fmt.Sprintf("incus-%s-%s", i.config.Name, inst.Name)
+		}
+		discovered.RuntimeIdentity = &provider.RecoveryInstanceIdentity{
+			ID: strings.TrimSpace(discovered.ProviderInstanceID), Type: discovered.InstanceType,
 		}
 
 		discoveredInstances = append(discoveredInstances, discovered)

@@ -3,6 +3,7 @@ package podman
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -18,17 +19,43 @@ import (
 )
 
 const (
-	providerType      = "podman"
-	cliName           = "podman"
-	ipv4Network       = "podman-net"
-	ipv4Subnet        = "172.20.0.0/16"
-	ipv6Network       = "podman-ipv6"
-	imageDir          = "/usr/local/bin/podman_ct_images"
-	ipv6CheckFile     = "/usr/local/bin/podman_check_ipv6"
-	storageDriverFile = "/usr/local/bin/podman_storage_driver"
-	scriptRepo        = "oneclickvirt/podman"
-	serviceCheckName  = "podman"
+	providerType             = "podman"
+	cliName                  = "podman"
+	ipv4Network              = "podman-net"
+	ipv4Subnet               = "172.20.0.0/16"
+	ipv6Network              = "podman-ipv6"
+	imageDir                 = "/usr/local/bin/podman_ct_images"
+	ipv6CheckFile            = "/usr/local/bin/podman_check_ipv6"
+	ipv6NetworkModeFile      = "/usr/local/bin/podman_ipv6_network_mode"
+	ipv6ManualHelper         = "/usr/local/bin/podman-ipv6-attach.sh"
+	ipv6ManualPrefix         = "/usr/local/bin/podman_ipv6_public_prefix"
+	ipv6AllocationFile       = "/usr/local/bin/podman_ipv6_allocations"
+	ipv6NDPReadyFile         = "/usr/local/bin/podman_ipv6_ndp_ready"
+	ipv6NDPRequiredFile      = "/usr/local/bin/podman_ipv6_ndp_required"
+	ipv6NDPReadyRequiredFile = "/usr/local/bin/podman_ipv6_ndp_ready_required"
+	storageDriverFile        = "/usr/local/bin/podman_storage_driver"
+	scriptRepo               = "oneclickvirt/podman"
+	sshScriptRevision        = "20260828.2"
+	serviceCheckName         = "podman"
 )
+
+const (
+	podmanIPv6NetworkModeManaged   = "managed"
+	podmanIPv6NetworkModeUnmanaged = "unmanaged"
+	podmanIPv6NetworkModeManual    = "manual"
+	podmanIPv6NetworkModeNAT       = "nat"
+)
+
+func rejectPodmanNAT66PublicStaticIPv6(staticIPv6 string, nat66 bool) error {
+	if !nat66 || strings.TrimSpace(staticIPv6) == "" {
+		return nil
+	}
+	normalized, err := utils.NormalizeIPv6Address(staticIPv6)
+	if err == nil && utils.IsPublicIPv6(normalized) {
+		return fmt.Errorf("节点 Podman IPv6 当前仅提供 ULA NAT66 出站连接，不能分配公网静态 IPv6 %s", normalized)
+	}
+	return nil
+}
 
 // PodmanProvider Podman容器运行时Provider（独立实现，不依赖docker包）
 type PodmanProvider struct {
@@ -370,23 +397,18 @@ func (p *PodmanProvider) GetInstance(ctx context.Context, id string) (*provider.
 		return nil, fmt.Errorf("not connected")
 	}
 
-	output, err := p.sshClient.ExecuteWithLogging(fmt.Sprintf("%s inspect %s --format '{{.Name}}|{{.State.Status}}|{{.Config.Image}}|{{.Id}}|{{.Created}}'", cliName, shellSingleQuote(id)), "PODMAN_INSPECT")
+	output, err := p.sshClient.ExecuteWithLogging(fmt.Sprintf("%s inspect %s --format '{{.Name}}|{{.State.Status}}|{{.Config.Image}}|{{.Id}}'", cliName, shellSingleQuote(id)), "PODMAN_INSPECT")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get instance: %w", err)
 	}
 
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return nil, fmt.Errorf("instance not found")
-	}
-
-	fields := strings.Split(output, "|")
-	if len(fields) < 4 {
-		return nil, fmt.Errorf("invalid instance data: unexpected format")
+	record, parseErr := utils.ParseContainerInspectOutput(output)
+	if parseErr != nil {
+		return nil, fmt.Errorf("invalid Podman inspect output: %w", parseErr)
 	}
 
 	status := "unknown"
-	statusField := strings.ToLower(fields[1])
+	statusField := strings.ToLower(record.Status)
 	if strings.Contains(statusField, "running") {
 		status = "running"
 	} else if strings.Contains(statusField, "exited") {
@@ -396,10 +418,10 @@ func (p *PodmanProvider) GetInstance(ctx context.Context, id string) (*provider.
 	}
 
 	instance := &provider.Instance{
-		ID:     fields[3],
-		Name:   strings.TrimPrefix(fields[0], "/"),
+		ID:     record.ID,
+		Name:   strings.TrimPrefix(record.Name, "/"),
 		Status: status,
-		Image:  fields[2],
+		Image:  record.Image,
 	}
 
 	if status == "running" {
@@ -413,8 +435,8 @@ func (p *PodmanProvider) enrichInstanceWithNetworkInfo(instance *provider.Instan
 	cmd := fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{$config.IPAddress}}{{end}}'", cliName, shellSingleQuote(instance.Name))
 	output, err := p.sshClient.Execute(cmd)
 	if err == nil {
-		ipAddress := strings.TrimSpace(output)
-		if ipAddress != "" && ipAddress != "<no value>" {
+		ipAddress, parseErr := utils.ParseFirstIPv4AddressOutput(output)
+		if parseErr == nil {
 			instance.PrivateIP = ipAddress
 			instance.IP = ipAddress
 		}
@@ -437,8 +459,8 @@ fi
 `, shellSingleQuote(instance.Name), cliName)
 	vethOutput, err := p.sshClient.Execute(vethCmd)
 	if err == nil {
-		vethInterface := utils.CleanCommandOutput(vethOutput)
-		if vethInterface != "" {
+		vethInterface, parseErr := utils.ParseFirstNetworkInterfaceOutput(vethOutput)
+		if parseErr == nil {
 			if instance.Metadata == nil {
 				instance.Metadata = make(map[string]string)
 			}
@@ -450,8 +472,8 @@ fi
 		fallbackCmd := fmt.Sprintf("%s inspect %s --format '{{.NetworkSettings.IPAddress}}'", cliName, shellSingleQuote(instance.Name))
 		fallbackOutput, fallbackErr := p.sshClient.Execute(fallbackCmd)
 		if fallbackErr == nil {
-			ipAddress := strings.TrimSpace(fallbackOutput)
-			if ipAddress != "" && ipAddress != "<no value>" {
+			ipAddress, parseErr := utils.ParseFirstIPv4AddressOutput(fallbackOutput)
+			if parseErr == nil {
 				instance.PrivateIP = ipAddress
 				instance.IP = ipAddress
 			}
@@ -464,8 +486,8 @@ fi
 		cmd = fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{if $config.GlobalIPv6Address}}{{$config.GlobalIPv6Address}}{{end}}{{end}}'", cliName, shellSingleQuote(instance.Name))
 		output, err = p.sshClient.Execute(cmd)
 		if err == nil {
-			ipv6Address := strings.TrimSpace(output)
-			if ipv6Address != "" && ipv6Address != "<no value>" {
+			ipv6Address, parseErr := utils.ParseFirstIPv6AddressOutput(output)
+			if parseErr == nil {
 				instance.IPv6Address = ipv6Address
 			}
 		}
@@ -474,24 +496,144 @@ fi
 
 // checkIPv6NetworkAvailable 检查IPv6网络是否可用
 func (p *PodmanProvider) checkIPv6NetworkAvailable() bool {
+	_, available := p.podmanIPv6NetworkAvailability()
+	return available
+}
+
+// podmanIPv6NetworkAvailability validates the installer-owned IPv6 network
+// and reports how containers must attach to it. Older installations have no
+// mode marker, which is the original managed-network behavior.
+func (p *PodmanProvider) podmanIPv6NetworkAvailability() (string, bool) {
 	if !p.connected || !p.sshClient.HasExecutor() {
-		return false
+		return "", false
 	}
 	_, err := p.sshClient.Execute(fmt.Sprintf("%s network inspect %s", cliName, shellSingleQuote(ipv6Network)))
 	if err != nil {
-		return false
+		return "", false
 	}
-	ndpresponderCmd := fmt.Sprintf("%s inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null", cliName)
-	ndpresponderOutput, err := p.sshClient.Execute(ndpresponderCmd)
-	if err != nil || strings.TrimSpace(ndpresponderOutput) != "running" {
-		return false
+	mode, valid := p.podmanIPv6NetworkMode()
+	if !valid {
+		return "", false
+	}
+	if mode == podmanIPv6NetworkModeNAT {
+		if !p.podmanIPv6NetworkHasNAT66Subnet() {
+			if global.APP_LOG != nil {
+				global.APP_LOG.Warn("Podman NAT66网络状态无效，已禁用IPv6容器创建")
+			}
+			return "", false
+		}
+		if global.APP_LOG != nil {
+			global.APP_LOG.Debug("Podman IPv6网络使用 ULA NAT66，跳过公网 NDP responder 检查",
+				zap.String("provider", p.config.Name))
+		}
+		return podmanIPv6NetworkModeNAT, true
+	}
+	ndpRequired := p.podmanIPv6NDPRequired()
+	if ndpRequired {
+		ndpresponderCmd := fmt.Sprintf("%s inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null", cliName)
+		ndpresponderOutput, err := p.sshClient.Execute(ndpresponderCmd)
+		if err != nil || strings.TrimSpace(ndpresponderOutput) != "running" {
+			return "", false
+		}
 	}
 	ipv6ConfigCmd := fmt.Sprintf("[ -f %s ] && [ -s %s ] && [ \"$(sed -e '/^[[:space:]]*$/d' %s)\" != \"\" ] && echo 'valid' || echo 'invalid'", ipv6CheckFile, ipv6CheckFile, ipv6CheckFile)
 	ipv6ConfigOutput, err := p.sshClient.Execute(ipv6ConfigCmd)
 	if err != nil || strings.TrimSpace(ipv6ConfigOutput) != "valid" {
+		return "", false
+	}
+	if mode == podmanIPv6NetworkModeUnmanaged {
+		if _, err := p.sshClient.Execute(fmt.Sprintf("%s network inspect %s", cliName, shellSingleQuote(ipv4Network))); err != nil {
+			if global.APP_LOG != nil {
+				global.APP_LOG.Warn("Podman unmanaged IPv6网络缺少IPv4主网络，已禁用IPv6容器创建",
+					zap.Error(err))
+			}
+			return "", false
+		}
+	}
+	if mode == podmanIPv6NetworkModeManual {
+		manualReadyCheck := ""
+		if ndpRequired {
+			manualReadyCheck = fmt.Sprintf(" && test -s %s", shellSingleQuote(ipv6NDPReadyFile))
+		}
+		manualStateCmd := fmt.Sprintf("test -x %s && test -s %s && test -f %s%s", shellSingleQuote(ipv6ManualHelper), shellSingleQuote(ipv6ManualPrefix), shellSingleQuote("/usr/local/bin/podman_ipv6_targets"), manualReadyCheck)
+		if _, err := p.sshClient.Execute(manualStateCmd); err != nil {
+			if global.APP_LOG != nil {
+				global.APP_LOG.Warn("Podman manual IPv6网络尚未就绪，已禁用IPv6容器创建", zap.Error(err))
+			}
+			return "", false
+		}
+		if _, err := p.sshClient.Execute(fmt.Sprintf("%s network inspect %s", cliName, shellSingleQuote(ipv4Network))); err != nil {
+			return "", false
+		}
+	} else if ndpRequired {
+		// New installers set this marker after ndpresponder has opened its raw
+		// socket. A missing marker preserves compatibility with older healthy
+		// managed networks that predate the readiness contract.
+		readyCmd := fmt.Sprintf("if [ \"$(tr -d '[:space:]' < %s 2>/dev/null || true)\" = true ]; then test -s %s; fi", shellSingleQuote(ipv6NDPReadyRequiredFile), shellSingleQuote(ipv6NDPReadyFile))
+		if _, err := p.sshClient.Execute(readyCmd); err != nil {
+			if global.APP_LOG != nil {
+				global.APP_LOG.Warn("Podman IPv6 NDP responder 尚未就绪，已禁用IPv6容器创建", zap.Error(err))
+			}
+			return "", false
+		}
+	}
+	return mode, true
+}
+
+func (p *PodmanProvider) podmanIPv6NDPRequired() bool {
+	command := fmt.Sprintf("if [ -s %s ]; then tr -d '[:space:]' < %s; else printf true; fi", shellSingleQuote(ipv6NDPRequiredFile), shellSingleQuote(ipv6NDPRequiredFile))
+	output, err := p.sshClient.Execute(command)
+	if err != nil {
+		return true
+	}
+	return !strings.EqualFold(strings.TrimSpace(output), "false")
+}
+
+func (p *PodmanProvider) podmanIPv6NetworkMode() (string, bool) {
+	modeCmd := fmt.Sprintf("if [ -s %s ]; then tr -d '[:space:]' < %s; else printf '%s'; fi", shellSingleQuote(ipv6NetworkModeFile), shellSingleQuote(ipv6NetworkModeFile), podmanIPv6NetworkModeManaged)
+	modeOutput, err := p.sshClient.Execute(modeCmd)
+	if err != nil {
+		return "", false
+	}
+	mode, valid := parsePodmanIPv6NetworkMode(modeOutput)
+	if !valid && global.APP_LOG != nil {
+		global.APP_LOG.Warn("Podman IPv6网络模式无效，已禁用IPv6容器创建",
+			zap.String("mode", utils.TruncateString(strings.TrimSpace(modeOutput), 32)))
+	}
+	return mode, valid
+}
+
+func (p *PodmanProvider) podmanIPv6NetworkHasNAT66Subnet() bool {
+	if !p.connected || !p.sshClient.HasExecutor() {
 		return false
 	}
-	return true
+	command := fmt.Sprintf("%s network inspect %s --format '{{range .Subnets}}{{println .Subnet}}{{end}}'", cliName, shellSingleQuote(ipv6Network))
+	output, err := p.sshClient.Execute(command)
+	if err != nil {
+		return false
+	}
+	for _, network := range utils.ExtractIPv6Networks(output, 128) {
+		prefix, parseErr := netip.ParsePrefix(network.CIDR())
+		if parseErr == nil && prefix.Bits() == 64 && prefix.Addr().IsPrivate() {
+			return true
+		}
+	}
+	return false
+}
+
+func parsePodmanIPv6NetworkMode(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", podmanIPv6NetworkModeManaged:
+		return podmanIPv6NetworkModeManaged, true
+	case podmanIPv6NetworkModeUnmanaged:
+		return podmanIPv6NetworkModeUnmanaged, true
+	case podmanIPv6NetworkModeManual:
+		return podmanIPv6NetworkModeManual, true
+	case podmanIPv6NetworkModeNAT:
+		return podmanIPv6NetworkModeNAT, true
+	default:
+		return "", false
+	}
 }
 
 // ExecuteSSHCommand 执行SSH命令

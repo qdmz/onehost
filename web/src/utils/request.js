@@ -2,6 +2,7 @@ import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useUserStore } from '@/pinia/modules/user'
 import { errorHandler } from './errorHandler'
+import { notifyApiVersionMismatch } from './apiCompatibility'
 import i18n from '@/i18n'
 
 const service = axios.create({
@@ -202,6 +203,10 @@ service.interceptors.response.use(
       return service(config)
     }
 
+    if (!config?.suppressApiVersionMismatch) {
+      notifyApiVersionMismatch(error)
+    }
+    
     // 使用统一错误处理，但不自动显示错误消息
     const errorInfo = errorHandler.handleApiError(error, {
       showMessage: false, // 不自动显示错误消息，让组件自己处理

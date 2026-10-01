@@ -236,6 +236,9 @@ func handleDatabaseConnectionRestored(db *gorm.DB) {
 	global.APP_LOG.Info("数据库连接已恢复，开始恢复系统运行服务")
 	global.APP_DB = db
 	RegisterTables(db)
+	if _, err := system.InitializePersistentJWTSecret(db); err != nil {
+		global.APP_LOG.Error("数据库恢复后JWT密钥初始化失败", zap.Error(err))
+	}
 	if !CheckSystemInitialized() {
 		global.APP_LOG.Info("数据库连接已恢复，系统仍处于待初始化模式")
 		return
@@ -246,14 +249,14 @@ func handleDatabaseConnectionRestored(db *gorm.DB) {
 
 // initializeJWTSecret 初始化JWT密钥（从数据库持久化加载）
 func initializeJWTSecret() {
-	jwtSecretService := system.GetJWTSecretService()
-	if err := jwtSecretService.InitializeJWTSecret(global.APP_DB); err != nil {
+	if _, err := system.InitializePersistentJWTSecret(global.APP_DB); err != nil {
 		global.APP_LOG.Error("JWT密钥初始化失败", zap.Error(err))
-		// 使用配置文件中的默认密钥作为后备
-		global.APP_JWT_SECRET = global.GetAppConfig().JWT.SigningKey
+		// 数据库尚不可用时保留配置回退，供待初始化模式的非鉴权组件使用。
+		// 认证接口仍要求数据库连接，因此不会用该回退密钥签发生产 token。
+		if global.APP_DB == nil {
+			global.APP_JWT_SECRET = global.GetAppConfig().JWT.SigningKey
+		}
 	} else {
-		// 更新全局变量
-		global.APP_JWT_SECRET = jwtSecretService.GetSecretKey()
 		global.APP_LOG.Info("JWT密钥初始化成功")
 	}
 }
@@ -380,6 +383,12 @@ func initializeSchedulers() {
 	global.APP_PROVIDER_HEALTH_SCHEDULER = providerHealthSchedulerService
 	providerHealthSchedulerService.Start(global.APP_SHUTDOWN_CONTEXT)
 	lifecycleMgr.Register("ProviderHealthScheduler", providerHealthSchedulerService)
+
+	// 启动节点长时间离线后的实例恢复调度器。它只入队明确期望运行的
+	// stopped 实例，远端探测和主机级修复均在数据库事务之外执行。
+	instanceRecoverySchedulerService := scheduler.NewInstanceRecoverySchedulerService()
+	instanceRecoverySchedulerService.Start(global.APP_SHUTDOWN_CONTEXT)
+	lifecycleMgr.Register("InstanceRecoveryScheduler", instanceRecoverySchedulerService)
 
 	// 启动Provider实例同步调度器（使用全局shutdown context确保可以正确关闭）
 	instanceSyncSchedulerService := scheduler.NewInstanceSyncSchedulerService()

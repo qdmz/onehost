@@ -18,12 +18,42 @@ import (
 	"oneclickvirt/provider"
 	providerService "oneclickvirt/service/provider"
 	"oneclickvirt/service/resources"
+	ipv6PoolService "oneclickvirt/service/ipv6pool"
 	"oneclickvirt/utils"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// validateProviderIPv6Network rejects configurations that the selected
+// provider cannot materialize inside a guest. This runs before any provider
+// connection or remote mutation, so an unsupported backend can never report a
+// successful IPv6 instance while silently creating an IPv4-only guest.
+func validateProviderIPv6Network(providerType, networkType string) error {
+	if !utils.NetworkTypeHasIPv6(networkType) || ipv6PoolService.SupportsStaticIPv6(providerType) {
+		return nil
+	}
+	return fmt.Errorf("Provider类型 %s 当前不支持实例IPv6网络配置；请选择支持静态IPv6分配的节点类型或改用IPv4网络类型", providerType)
+}
+
+func usesControllerIPv6Pool(providerType, networkType, ipv6PortMappingMethod string) bool {
+	networkType = strings.ToLower(strings.TrimSpace(networkType))
+	if networkType != "nat_ipv4_ipv6" && networkType != "dedicated_ipv4_ipv6" && networkType != "ipv6_only" {
+		return false
+	}
+	// Incus/LXD keep the historical device_proxy/iptables modes as managed
+	// host-public-IPv6 -> guest-ULA mappings. Selecting native is an explicit
+	// request for a controller-owned public /128 attached through a routed NIC.
+	return !utils.UsesManagedIPv6NAT(providerType, networkType, ipv6PortMappingMethod)
+}
+
+func requiresConfiguredIPv6Pool(providerType, networkType, ipv6PortMappingMethod string) bool {
+	providerType = strings.ToLower(strings.TrimSpace(providerType))
+	return (providerType == "incus" || providerType == "lxd") &&
+		strings.EqualFold(strings.TrimSpace(networkType), "nat_ipv4_ipv6") &&
+		strings.EqualFold(strings.TrimSpace(ipv6PortMappingMethod), "native")
+}
 
 // executeProviderCreation 阶段2: Provider创建实例 (30% -> 60%)，根据ExecutionRule自动选择API或SSH
 func (s *Service) executeProviderCreation(ctx context.Context, task *adminModel.Task, instance *providerModel.Instance) error {
@@ -73,6 +103,9 @@ func (s *Service) executeProviderCreation(ctx context.Context, task *adminModel.
 	localProviderIPv4PortMappingMethod := dbProvider.IPv4PortMappingMethod
 	localProviderIPv6PortMappingMethod := dbProvider.IPv6PortMappingMethod
 	localProviderNetworkType := dbProvider.NetworkType
+	if err := validateProviderIPv6Network(localProviderType, localProviderNetworkType); err != nil {
+		return err
+	}
 
 	// 检查Provider是否过期或冻结
 	if localProviderIsFrozen {
@@ -410,7 +443,14 @@ func (s *Service) executeProviderCreation(ctx context.Context, task *adminModel.
 				zap.Uint("instanceId", instance.ID),
 				zap.String("allocatedIP", allocatedIP))
 		} else if allocErr != nil {
-			// 池未配置或已耗尽：记录警告但不阻止实例创建（网络侧 DHCP 仍可工作）
+			// Dedicated IPv4 modes cannot silently fall back to the managed
+			// bridge/DHCP address. Doing so advertises an independent endpoint while
+			// creating a private guest (and may leave a long-running half-configured
+			// task). Fail before any remote provider mutation; NAT modes retain the
+			// normal bridge fallback.
+			if localProviderNetworkType == "dedicated_ipv4" || localProviderNetworkType == "dedicated_ipv4_ipv6" {
+				return fmt.Errorf("独立IPv4网络需要已配置且可用的IPv4地址池: %w", allocErr)
+			}
 			global.APP_LOG.Warn("未能从 IPv4 池分配地址（池未配置或已耗尽），继续创建",
 				zap.Uint("taskId", task.ID),
 				zap.Uint("instanceId", instance.ID),
@@ -418,16 +458,101 @@ func (s *Service) executeProviderCreation(ctx context.Context, task *adminModel.
 		}
 	}
 
-	// 预先创建端口映射记录，用于统一的端口管理
-	if err := portMappingService.CreateDefaultPortMappings(instance.ID, localProviderID); err != nil {
+	// Allocate a configured IPv6 address before any remote provider call. The
+	// selected address is passed through metadata; no SSH/API work is held in a
+	// database transaction. Incus/LXD dual-stack device_proxy/iptables modes
+	// deliberately keep the guest on a ULA bridge and expose the node's public
+	// IPv6. Their native mode instead consumes a public controller allocation.
+	if usesControllerIPv6Pool(localProviderType, localProviderNetworkType, localProviderIPv6PortMappingMethod) {
+		poolService := ipv6PoolService.NewService()
+		nodeFileConfigured := strings.TrimSpace(dbProvider.IPv6AddressFilePath) != ""
+		// When a node-side file is configured, synchronize it exactly once before
+		// allocation. A configured file is an explicit source of truth; stale
+		// controller entries must not silently be used when it cannot be read.
+		if nodeFileConfigured {
+			if _, syncErr := poolService.SyncProviderFile(ctx, localProviderID); syncErr != nil {
+				return fmt.Errorf("同步节点IPv6地址文件失败: %w", syncErr)
+			}
+		}
+		hasConfiguredPool, poolErr := poolService.HasConfiguredPool(localProviderID)
+		if poolErr != nil {
+			return fmt.Errorf("检查IPv6地址池失败: %w", poolErr)
+		}
+		// An empty configured node file is an explicit empty pool, not permission
+		// to fall back to an unmanaged provider-selected address.
+		hasConfiguredPool = hasConfiguredPool || nodeFileConfigured
+		if requiresConfiguredIPv6Pool(localProviderType, localProviderNetworkType, localProviderIPv6PortMappingMethod) && !hasConfiguredPool {
+			return fmt.Errorf("Incus/LXD NAT IPv4 + 独立IPv6的native模式需要已配置且可用的IPv6地址池或节点地址文件")
+		}
+		if ipv6PoolService.RequiresRoutedStaticIPv6(localProviderType) && !hasConfiguredPool {
+			return fmt.Errorf("Provider类型 %s 的IPv6网络必须使用已启用的IPv6隧道路由地址池；请先在节点IPv6隧道面板创建并启用路由前缀", localProviderType)
+		}
+		if hasConfiguredPool && !ipv6PoolService.SupportsStaticIPv6(localProviderType) {
+			return fmt.Errorf("Provider类型 %s 当前网络后端不支持控制面静态IPv6分配；QEMU/KubeVirt等环境需要可声明静态地址的CNI或网桥", localProviderType)
+		}
+		allocatedIPv6 := ""
+		var allocErr error
+		if hasConfiguredPool {
+			allocatedIPv6, allocErr = poolService.AllocateIPv6Address(localProviderID, instance.ID)
+		}
+		if allocErr == nil && allocatedIPv6 != "" {
+			instanceConfig.Metadata["static_ipv6"] = allocatedIPv6
+			releaseAllocatedIPv6 := func(cause error) error {
+				if releaseErr := poolService.ReleaseIPv6(instance.ID); releaseErr != nil {
+					global.APP_LOG.Error("创建前校验失败后释放IPv6地址失败", zap.Uint("instanceId", instance.ID), zap.Error(releaseErr))
+				}
+				return cause
+			}
+			// This is a single bounded join after allocation, not a per-provider
+			// probe. Native pools intentionally leave the routed fields empty.
+			allocationMetadata, metadataErr := poolService.GetAllocationMetadata(localProviderID, instance.ID)
+			if metadataErr != nil {
+				return releaseAllocatedIPv6(fmt.Errorf("读取已分配IPv6路由信息失败: %w", metadataErr))
+			}
+			if allocationMetadata.Address != "" && allocationMetadata.Address != allocatedIPv6 {
+				return releaseAllocatedIPv6(fmt.Errorf("已分配IPv6地址与路由元数据不一致"))
+			}
+			if ipv6PoolService.RequiresRoutedStaticIPv6(localProviderType) && strings.TrimSpace(allocationMetadata.CIDR) == "" {
+				return releaseAllocatedIPv6(fmt.Errorf("Provider类型 %s 需要隧道路由IPv6前缀、网关和网桥，当前IPv6地址池不是隧道地址池", localProviderType))
+			}
+			if allocationMetadata.CIDR != "" {
+				instanceConfig.Metadata["static_ipv6_cidr"] = allocationMetadata.CIDR
+				instanceConfig.Metadata["static_ipv6_gateway"] = allocationMetadata.Gateway
+				instanceConfig.Metadata["static_ipv6_bridge"] = allocationMetadata.Bridge
+				instanceConfig.Metadata["static_ipv6_tunnel_id"] = strconv.FormatUint(uint64(allocationMetadata.TunnelID), 10)
+				instanceConfig.Metadata["static_ipv6_tunnel_interface"] = allocationMetadata.TunnelInterface
+				instanceConfig.Metadata["static_ipv6_network"] = allocationMetadata.CIDR
+			}
+			if dbErr := global.APP_DB.Model(instance).Update("public_ipv6", allocatedIPv6).Error; dbErr != nil {
+				global.APP_LOG.Warn("预设实例public_ipv6失败", zap.Uint("taskId", task.ID), zap.Uint("instanceId", instance.ID), zap.Error(dbErr))
+			}
+			global.APP_LOG.Debug("从 IPv6 池分配地址成功", zap.Uint("taskId", task.ID), zap.Uint("instanceId", instance.ID), zap.String("allocatedIPv6", allocatedIPv6))
+		} else if allocErr != nil {
+			// Explicit pools fail closed. Falling back here would leak a different
+			// node-assigned address and desynchronize controller state.
+			return fmt.Errorf("IPv6地址池已配置但无法分配地址: %w", allocErr)
+		}
+	}
+
+	// Agent controller mappings reserve only the controller listen ports here.
+	// The runtime does not exist yet, so its private target address can only be
+	// resolved and activated in the post-create phase.
+	deferControllerMappings := dbProvider.ConnectionType == "agent" && strings.TrimSpace(dbProvider.PortIP) == ""
+	var portAllocationErr error
+	if deferControllerMappings {
+		portAllocationErr = portMappingService.ReserveDefaultPortMappingsForCreate(ctx, instance.ID, localProviderID, localProviderNetworkType)
+	} else {
+		portAllocationErr = portMappingService.CreateDefaultPortMappings(instance.ID, localProviderID)
+	}
+	if portAllocationErr != nil {
 		global.APP_LOG.Warn("预分配端口映射失败",
 			zap.Uint("taskId", task.ID),
 			zap.Uint("instanceId", instance.ID),
-			zap.Error(err))
+			zap.Error(portAllocationErr))
 		// 对于容器类Provider（docker/podman/containerd/orbstack），端口映射通过 -p 标志在容器创建时建立，
 		// 预分配失败意味着容器将无任何端口映射，继续创建会产生无法访问的僵尸实例，必须立即终止任务。
 		if utils.UsesContainerRuntimePorts(localProviderType, instance.InstanceType) {
-			return fmt.Errorf("容器类Provider端口映射预分配失败（docker/podman/containerd/orbstack 的端口映射在容器创建时绑定，无法事后追加），无法继续创建实例: %v", err)
+			return fmt.Errorf("容器类Provider端口映射预分配失败，无法继续创建实例: %v", portAllocationErr)
 		}
 	} else {
 		// 获取已分配的端口映射。创建阶段实例仍是 creating，不能使用面向用户操作的
@@ -521,9 +646,12 @@ func (s *Service) executeProviderCreation(ctx context.Context, task *adminModel.
 	// 网络配置、IPv6 接口检测等操作都按数字 VMID 寻址，写名字会导致
 	// "instance not found" / "vmid type check failed" 等错误。
 	if strings.TrimSpace(instance.ProviderVMID) == "" {
+		// 创建成功后，持久化实例在 Provider 上的真实远端 ID（Proxmox 为数字 VMID）。
+		// 优先通过 GetInstance 回查真实远端 ID；回查失败时退化为写实例名（保证非空），
+		// 但绝不能覆盖 Provider 在创建时已持久化的原生运行时标识。
 		if remote, gErr := providerInstance.GetInstance(ctx, instance.Name); gErr == nil && remote != nil && strings.TrimSpace(remote.ID) != "" {
 			instance.ProviderVMID = remote.ID
-			if uErr := global.APP_DB.Model(instance).Update("provider_vm_id", remote.ID).Error; uErr != nil {
+			if uErr := global.APP_DB.Model(instance).Where("provider_vm_id IS NULL OR provider_vm_id = ''").Update("provider_vm_id", remote.ID).Error; uErr != nil {
 				global.APP_LOG.Warn("写入实例远端ID失败",
 					zap.Uint("taskId", task.ID),
 					zap.Uint("instanceId", instance.ID),
@@ -531,18 +659,24 @@ func (s *Service) executeProviderCreation(ctx context.Context, task *adminModel.
 					zap.Error(uErr))
 			}
 		} else {
-			// 极少数情况下列表/回查失败，退化为写实例名（保证 provider_vm_id 非空），
-			// 但优先依赖上面的真实 VMID 回写。
+			// 极少数情况下列表/回查失败，退化为写实例名（保证 provider_vm_id 非空）
 			global.APP_LOG.Warn("创建后无法获取实例真实远端ID，退化为写实例名",
 				zap.Uint("taskId", task.ID),
 				zap.Uint("instanceId", instance.ID),
 				zap.Error(gErr))
-			if uErr := global.APP_DB.Model(instance).Update("provider_vm_id", instance.Name).Error; uErr != nil {
-				global.APP_LOG.Warn("写入实例名兜底失败",
+			// A provider with a native runtime identifier (notably PVE VMID/CTID)
+			// may have persisted it during creation. Keep the generic name fallback
+			// conditional so it cannot overwrite that authoritative value.
+			result := global.APP_DB.Model(instance).
+				Where("provider_vm_id IS NULL OR provider_vm_id = ''").
+				Update("provider_vm_id", instance.Name)
+			if result.Error != nil {
+				global.APP_LOG.Warn("写入实例远端ID失败",
 					zap.Uint("taskId", task.ID),
 					zap.Uint("instanceId", instance.ID),
-					zap.Error(uErr))
-			} else {
+					zap.String("providerInstanceId", instance.Name),
+					zap.Error(result.Error))
+			} else if result.RowsAffected > 0 {
 				instance.ProviderVMID = instance.Name
 			}
 		}
@@ -639,7 +773,7 @@ func applyPreallocatedPortMappingsToConfig(instanceConfig *provider.InstanceConf
 func buildContainerRuntimePorts(portMappings []providerModel.Port) []string {
 	ports := make([]string, 0, len(portMappings))
 	for _, port := range portMappings {
-		if port.HostPort <= 0 || port.GuestPort <= 0 {
+		if port.MappingType == "controller" || port.HostPort <= 0 || port.GuestPort <= 0 {
 			continue
 		}
 		protocol := strings.ToLower(strings.TrimSpace(port.Protocol))
@@ -658,7 +792,7 @@ func buildContainerRuntimePorts(portMappings []providerModel.Port) []string {
 func buildVMPositionalPorts(portMappings []providerModel.Port) []string {
 	var sshPort, startPort, endPort int
 	for _, port := range portMappings {
-		if port.HostPort <= 0 {
+		if port.MappingType == "controller" || port.HostPort <= 0 {
 			continue
 		}
 		if port.IsSSH {

@@ -27,7 +27,12 @@ func (l *LXDProvider) getInstanceType(instanceName string) (string, error) {
 		return "", fmt.Errorf("获取实例类型失败: %w", err)
 	}
 
-	instanceType := utils.CleanCommandOutput(output)
+	instanceType, parseErr := utils.ParseFirstCommandLineMatching(output, func(value string) bool {
+		return value == "container" || value == "virtual-machine"
+	})
+	if parseErr != nil {
+		return "", fmt.Errorf("实例类型输出无效")
+	}
 	global.APP_LOG.Debug("检测到实例类型",
 		zap.String("instanceName", instanceName),
 		zap.String("type", instanceType))
@@ -70,24 +75,20 @@ func (l *LXDProvider) getVMInstanceIP(instanceName string) (string, error) {
 
 		time.Sleep(time.Duration(delay) * time.Second)
 
-		// 虚拟机通常使用 enp5s0 接口，如果没有则尝试 eth0
-		interfaces := []string{"enp5s0", "eth0"}
-
-		for _, iface := range interfaces {
-			l.mu.RLock()
-			client := l.sshClient
-			l.mu.RUnlock()
-			if client == nil {
-				return "", fmt.Errorf("SSH client不可用，无法获取虚拟机IP")
-			}
-			cmd := fmt.Sprintf("lxc list %s --format json | jq -r '.[0].state.network.%s.addresses[]? | select(.family==\"inet\") | .address' 2>/dev/null", shellSingleQuote(instanceName), iface)
-			output, err := client.Execute(cmd)
-
-			if err == nil && strings.TrimSpace(output) != "" {
-				vmIP := strings.TrimSpace(output)
+		// VM interface names vary by image and distro. Enumerate every
+		// state.network entry rather than assuming enp5s0/eth0.
+		l.mu.RLock()
+		client := l.sshClient
+		l.mu.RUnlock()
+		if client == nil {
+			return "", fmt.Errorf("SSH client不可用，无法获取虚拟机IP")
+		}
+		cmd := fmt.Sprintf("lxc list %s --format json | jq -r '.[0].state.network // {} | to_entries[] | .value.addresses[]? | select(.family==\"inet\" and (.scope==\"global\" or .scope==\"link\")) | .address' 2>/dev/null", shellSingleQuote(instanceName))
+		output, err := client.Execute(cmd)
+		if err == nil {
+			if vmIP, parseErr := utils.ParseFirstIPv4AddressOutput(output); parseErr == nil {
 				global.APP_LOG.Debug("虚拟机IPv4地址获取成功",
 					zap.String("instanceName", instanceName),
-					zap.String("interface", iface),
 					zap.String("ip", vmIP),
 					zap.Int("attempt", attempt))
 				return vmIP, nil
@@ -120,18 +121,22 @@ func (l *LXDProvider) getContainerInstanceIP(instanceName string) (string, error
 
 		time.Sleep(time.Duration(delay) * time.Second)
 
-		// 容器通常使用 eth0 接口
+		// Container images may rename the first interface; inspect all entries.
 		l.mu.RLock()
 		client := l.sshClient
 		l.mu.RUnlock()
 		if client == nil {
 			return "", fmt.Errorf("SSH client不可用，无法获取容器IP")
 		}
-		cmd := fmt.Sprintf("lxc list %s --format json | jq -r '.[0].state.network.eth0.addresses[]? | select(.family==\"inet\") | .address' 2>/dev/null", shellSingleQuote(instanceName))
+		cmd := fmt.Sprintf("lxc list %s --format json | jq -r '.[0].state.network // {} | to_entries[] | .value.addresses[]? | select(.family==\"inet\" and (.scope==\"global\" or .scope==\"link\")) | .address' 2>/dev/null", shellSingleQuote(instanceName))
 		output, err := client.Execute(cmd)
 
-		if err == nil && strings.TrimSpace(output) != "" {
-			containerIP := strings.TrimSpace(output)
+		if err == nil {
+			containerIP, parseErr := utils.ParseFirstIPv4AddressOutput(output)
+			if parseErr != nil {
+				delay *= 2
+				continue
+			}
 			global.APP_LOG.Debug("容器IPv4地址获取成功",
 				zap.String("instanceName", instanceName),
 				zap.String("ip", containerIP),
@@ -195,8 +200,7 @@ func (l *LXDProvider) getInstanceIPGeneric(instanceName string) (string, error) 
 				}
 
 				// 验证是否是有效的IPv4地址
-				parts := strings.Split(addr, ".")
-				if len(parts) == 4 {
+				if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
 					global.APP_LOG.Debug("找到有效IP地址",
 						zap.String("instanceName", instanceName),
 						zap.String("ip", addr))
@@ -261,9 +265,9 @@ func (l *LXDProvider) getHostIP() (string, error) {
 		return "", fmt.Errorf("获取主机IP失败: %w", err)
 	}
 
-	hostIP := strings.TrimSpace(output)
-	if hostIP == "" {
-		return "", fmt.Errorf("主机IP地址为空")
+	hostIP, parseErr := utils.ParseFirstIPv4AddressOutput(output)
+	if parseErr != nil {
+		return "", fmt.Errorf("主机IP地址输出无效: %w", parseErr)
 	}
 
 	global.APP_LOG.Info("从宿主机获取到IP地址",
@@ -273,6 +277,33 @@ func (l *LXDProvider) getHostIP() (string, error) {
 
 // GetInstanceIPv4 获取实例的内网IPv4地址
 func (l *LXDProvider) GetInstanceIPv4(ctx context.Context, instanceName string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if strings.EqualFold(strings.TrimSpace(l.config.ExecutionRule), "api_only") {
+		if l.apiClient == nil {
+			return "", fmt.Errorf("API客户端不可用")
+		}
+		state, err := l.apiGetInstanceResource(ctx, instanceName, "/state")
+		ip := ""
+		if err == nil {
+			ip = l.apiInstanceIPv4(state)
+		}
+		if ip == "" {
+			leaseIP, _, leaseErr := l.apiIPv4FromNetworkLeases(ctx, instanceName)
+			if leaseErr != nil {
+				return "", leaseErr
+			}
+			if leaseIP == "" {
+				if err != nil {
+					return "", err
+				}
+				return "", fmt.Errorf("实例尚未获得IPv4地址")
+			}
+			ip = leaseIP
+		}
+		return ip, nil
+	}
 	// 复用已有的getInstanceIP方法来获取内网IPv4地址
 	return l.getInstanceIP(instanceName)
 }
@@ -292,9 +323,9 @@ func (l *LXDProvider) GetVethInterfaceName(instanceName string) (string, error) 
 		return "", fmt.Errorf("获取veth接口名称失败: %w", err)
 	}
 
-	vethName := utils.CleanCommandOutput(output)
-	if vethName == "" {
-		return "", fmt.Errorf("未找到veth接口名称")
+	vethName, parseErr := utils.ParseFirstNetworkInterfaceOutput(output)
+	if parseErr != nil {
+		return "", fmt.Errorf("veth接口名称输出无效: %w", parseErr)
 	}
 
 	global.APP_LOG.Debug("获取到veth接口名称",
@@ -319,10 +350,13 @@ func (l *LXDProvider) GetVethInterfaceNameV6(instanceName string) (string, error
 		return "", fmt.Errorf("获取veth接口名称(IPv6)失败: %w", err)
 	}
 
-	vethName := utils.CleanCommandOutput(output)
-	if vethName == "" {
+	if strings.TrimSpace(output) == "" {
 		// 如果没有eth1，可能使用eth0，返回eth0的veth接口
 		return l.GetVethInterfaceName(instanceName)
+	}
+	vethName, parseErr := utils.ParseFirstNetworkInterfaceOutput(output)
+	if parseErr != nil {
+		return "", fmt.Errorf("IPv6 veth接口名称输出无效: %w", parseErr)
 	}
 
 	global.APP_LOG.Debug("获取到veth接口名称(IPv6)",

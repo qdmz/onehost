@@ -14,12 +14,16 @@ func BuildInstanceVNCInfoForUser(instanceID uint, userID uint) (gin.H, error) {
 }
 
 func ProxyInstanceVNCForUser(c *gin.Context, instanceID uint, userID uint) {
-	host, port, _, err := resolveInstanceVNCProxyTarget(instanceID, userID, false)
+	target, err := resolveInstanceConsoleTargetForProtocol(instanceID, userID, false, consoleProtocolVNC)
 	if err != nil {
 		common.ResponseWithError(c, common.ClassifyError(err))
 		return
 	}
-	proxyVNCWebSocket(c, host, port)
+	if !target.available {
+		common.ResponseWithError(c, common.NewError(common.CodeValidationError, "VNC控制台不可用: "+target.reason))
+		return
+	}
+	proxyInstanceConsoleWebSocket(c, target)
 }
 
 // AdminInstanceVNCInfo returns whether WebVNC is available for an admin request.

@@ -74,8 +74,9 @@ run_module_10() {
 
         local inst_data="{\"provider_id\":${PROVIDER_ID},\"instance_type\":\"container\",\"image\":\"${container_image}\",\"cpu\":${ACTION_TEST_CONTAINER_CPU},\"memory\":${ACTION_TEST_CONTAINER_MEMORY},\"disk\":${ACTION_TEST_CONTAINER_DISK},\"bandwidth\":1000,\"network_type\":\"nat_ipv4\"}"
         local ir
-        # Use single attempt — 400 validation errors are permanent and not worth retrying
-        if ! ir=$(test_api_retry "Create container instance" "POST" "/api/v1/admin/instances" "200" "$inst_data" 2 10 "$group"); then
+        # Instance creation is deliberately single-shot.  Retrying a POST after
+        # a lost response can create a second remote instance.
+        if ! ir=$(test_api "Create container instance" "POST" "/api/v1/admin/instances" "200" "$inst_data" "$group"); then
             log_warning "Container instance creation returned non-200; downstream container checks will be skipped"
             ir=""
         fi
@@ -96,7 +97,7 @@ run_module_10() {
                 log_info "Task failed response: $(echo "$task_r" | jq -c '.' 2>/dev/null || printf '%s' "$task_r")"
                 if is_infrastructure_failure_detail "$task_r"; then
                     local infra_detail; infra_detail=$(echo "$task_r" | jq -c '.data.errorMessage // .message // .msg // .' 2>/dev/null || printf '%s' "$task_r")
-                    log_warning "Container creation skipped due to worker network/SSH/DNS infrastructure: ${infra_detail}"
+                    log_warning "Container creation skipped due to transient worker or PVE infrastructure: ${infra_detail}"
                     record_skip_result "Create container instance task (infrastructure)" "GET" "/api/v1/admin/tasks/${maybe_task}" "${infra_detail}" "$group"
                 else
                     local task_actual; task_actual=$(safe_jq "$task_r" '.data.status // .message // .msg // "failed"' 'failed')
@@ -135,6 +136,16 @@ run_module_10() {
             else
                 container_created=true
                 container_name=$(echo "$detail" | jq -r '.data.name // empty' 2>/dev/null)
+
+                # -- Transparent egress API coverage (non-destructive paths only) --
+                test_api "Container egress status" "GET" "/api/v1/admin/instances/${container_id}/egress" "200" "" "$group"
+                test_api "Reject unsafe egress fallback" "PUT" "/api/v1/admin/instances/${container_id}/egress" "403" \
+                    '{"profile":{"id":"action-test","mode":"native","tunnel_type":"wireguard","tunnel_interface":"wg-action-test","route_table":100,"mark":100,"fail_closed":false},"source":"192.0.2.10","interface":"action-test0","apply":false}' "$group"
+                test_api "Reject invalid egress dependency set" "POST" "/api/v1/admin/instances/${container_id}/egress/dependencies" "400" \
+                    '{"package_set":"invalid"}' "$group"
+                test_api "Reject invalid egress reconcile body" "POST" "/api/v1/admin/instances/${container_id}/egress/reconcile" "400" \
+                    '{"apply":"invalid"}' "$group"
+                test_api "Reject invalid egress unbind apply flag" "DELETE" "/api/v1/admin/instances/${container_id}/egress?apply=invalid" "400" "" "$group"
 
                 # -- Config validation --
                 TOTAL_TESTS=$((TOTAL_TESTS + 1))
@@ -184,7 +195,7 @@ run_module_10() {
 
             # -- Reset password --
             local known_test_pw="NewContPass123!"
-            local rp; rp=$(test_api "Reset container password" "PUT" "/api/v1/admin/instances/${container_id}/reset-password" "200|400|500" \
+            local rp; rp=$(test_api "Reset container password" "PUT" "/api/v1/admin/instances/${container_id}/reset-password" "200|infra" \
                 "{\"password\":\"${known_test_pw}\"}" "$group")
             export TEST_INSTANCE_PASSWORD="${known_test_pw}"
             local rp_task; rp_task=$(echo "$rp" | jq -r '.data.task_id // .data.taskId // .data.id // empty' 2>/dev/null)
@@ -237,11 +248,12 @@ run_module_10() {
             fi
 
             # -- Rebuild --
-            local rb_resp; rb_resp=$(test_api "Rebuild container" "POST" "/api/v1/admin/instances/${container_id}/action" "200|400|500" \
+            local rb_resp; rb_resp=$(test_api "Rebuild container" "POST" "/api/v1/admin/instances/${container_id}/action" "200|infra" \
                 "{\"action\":\"rebuild\",\"image\":\"${container_image}\"}" "$group")
             log_info "Rebuild response: $(echo "$rb_resp" | jq -c '.' 2>/dev/null || printf '%s' "$rb_resp")"
             # Only proceed with rebuild wait if the server returned 200 (success).
-            # A 400/500 means the rebuild was rejected or failed immediately; skip the wait.
+            # Infrastructure failures are already recorded as SKIP by test_api;
+            # validation/product failures remain recorded as FAIL.
             local rb_code; rb_code=$(echo "$rb_resp" | jq -r '.code // empty' 2>/dev/null)
             if [[ "$rb_code" == "200" ]]; then
                 local rb_task; rb_task=$(echo "$rb_resp" | jq -r '.data.task_id // .data.taskId // .data.id // empty' 2>/dev/null)
@@ -352,7 +364,9 @@ run_module_10() {
 
         local vm_data="{\"provider_id\":${PROVIDER_ID},\"instance_type\":\"vm\",\"image\":\"${vm_image}\",\"cpu\":${ACTION_TEST_VM_CPU},\"memory\":${ACTION_TEST_VM_MEMORY},\"disk\":${ACTION_TEST_VM_DISK},\"bandwidth\":1000,\"network_type\":\"nat_ipv4\"}"
         local vr
-        if ! vr=$(test_api_retry "Create VM instance" "POST" "/api/v1/admin/instances" "200" "$vm_data" 2 15 "$group"); then
+        # Keep VM creation single-shot for the same reason as container creation:
+        # a timeout after acceptance must never trigger a duplicate POST.
+        if ! vr=$(test_api "Create VM instance" "POST" "/api/v1/admin/instances" "200" "$vm_data" "$group"); then
             log_warning "VM instance creation returned non-200; downstream VM checks will be skipped"
             vr=""
         fi
@@ -367,9 +381,12 @@ run_module_10() {
                 fi
             else
                 log_info "VM task failed response: $(echo "$vm_tr" | jq -c '.' 2>/dev/null || printf '%s' "$vm_tr")"
+                local vm_infra_detail; vm_infra_detail=$(echo "$vm_tr" | jq -c '.data.errorMessage // .message // .msg // .' 2>/dev/null || printf '%s' "$vm_tr")
                 if is_infrastructure_failure_detail "$vm_tr"; then
-                    local vm_infra_detail; vm_infra_detail=$(echo "$vm_tr" | jq -c '.data.errorMessage // .message // .msg // .' 2>/dev/null || printf '%s' "$vm_tr")
-                    log_warning "VM creation skipped due to worker network/SSH/DNS infrastructure: ${vm_infra_detail}"
+                    if is_vm_runtime_infrastructure_failure_detail "$vm_tr"; then
+                        mark_vm_runtime_infrastructure_unavailable "$vm_infra_detail"
+                    fi
+                    log_warning "VM creation skipped due to worker/runtime infrastructure: ${vm_infra_detail}"
                     record_skip_result "Create VM instance task (infrastructure)" "GET" "/api/v1/admin/tasks/${vm_task}" "${vm_infra_detail}" "$group"
                 else
                     local vm_task_actual; vm_task_actual=$(safe_jq "$vm_tr" '.data.status // .message // .msg // "failed"' 'failed')
@@ -521,32 +538,27 @@ run_module_10() {
         if ! env_supports_container && env_supports_vm; then
             user_image_instance_type="vm"
         fi
-        local sys_images; sys_images=$(curl -s --max-time 30 -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-            "${SERVER_URL}/api/v1/admin/system-images?page=1&pageSize=20" 2>/dev/null)
-        # Try alpine + matching provider/type/arch first for container platforms,
-        # debian first for VM-only platforms, then any matching provider/type/arch.
-        local user_image_id; user_image_id=$(echo "$sys_images" | jq -r --arg pt "$user_img_provider_type" --arg arch "$user_provider_arch" \
-            --arg it "$user_image_instance_type" \
-            '.data.list[]? | select(.osType=="alpine" and .status=="active" and .providerType==$pt and .instanceType==$it and (.architecture==$arch or $arch=="")) | .id' 2>/dev/null | head -1)
-        [[ -z "$user_image_id" || "$user_image_id" == "null" ]] && \
-            user_image_id=$(echo "$sys_images" | jq -r --arg pt "$user_img_provider_type" --arg arch "$user_provider_arch" \
-            --arg it "$user_image_instance_type" \
-            '.data.list[]? | select(.osType=="debian" and .status=="active" and .providerType==$pt and .instanceType==$it and (.architecture==$arch or $arch=="")) | .id' 2>/dev/null | head -1)
-        [[ -z "$user_image_id" || "$user_image_id" == "null" ]] && \
-            user_image_id=$(echo "$sys_images" | jq -r --arg pt "$user_img_provider_type" --arg arch "$user_provider_arch" \
-            --arg it "$user_image_instance_type" \
-            '.data.list[]? | select(.status=="active" and .providerType==$pt and .instanceType==$it and (.architecture==$arch or $arch=="")) | .id' 2>/dev/null | head -1)
-        [[ -z "$user_image_id" || "$user_image_id" == "null" ]] && \
-            user_image_id=$(echo "$sys_images" | jq -r '.data.list[0].id // .data[0].id // empty' 2>/dev/null)
-        [[ -z "$user_image_id" || "$user_image_id" == "null" ]] && user_image_id=1
-        log_info "Using system image ID=${user_image_id} (${user_img_provider_type}/${user_image_instance_type}/${user_provider_arch}) for user instance creation test"
-
-        # Create instance via user API (same as frontend does)
-        local user_inst_resp; user_inst_resp=$(test_api "User creates instance (frontend-equivalent)" "POST" \
-            "/api/v1/user/instances" "200|400|404|500" \
-            "{\"providerId\":${PROVIDER_ID},\"imageId\":${user_image_id},\"cpuId\":\"1\",\"memoryId\":\"1\",\"diskId\":\"1\",\"bandwidthId\":\"1\"}" \
-            "$group" "$USER_TOKEN")
-        local user_inst_task; user_inst_task=$(echo "$user_inst_resp" | jq -r '.data.taskId // .data.task_id // empty' 2>/dev/null)
+        local filtered_user_images; filtered_user_images=$(curl -s --max-time 30 \
+            -H "Authorization: Bearer ${USER_TOKEN}" \
+            "${SERVER_URL}/api/v1/user/images/filtered?provider_id=${PROVIDER_ID}&instance_type=${user_image_instance_type}" 2>/dev/null)
+        local user_image_filter
+        # shellcheck disable=SC2016 # jq expands $arch; Bash must preserve it verbatim.
+        user_image_filter='[.data[]? | select((.isActive == true or .status == "active") and (.architecture == $arch or $arch == ""))] | (map(select((.osType // "") == "alpine")) + map(select((.osType // "") == "debian")) + .) | .[0].id // empty'
+        local user_image_id
+        user_image_id=$(printf '%s' "$filtered_user_images" | jq -r --arg arch "$user_provider_arch" "$user_image_filter" 2>/dev/null || true)
+        local user_inst_resp="" user_inst_task=""
+        if [[ -n "$user_image_id" && "$user_image_id" != "null" ]]; then
+            log_info "Using filtered user image ID=${user_image_id} (${user_img_provider_type}/${user_image_instance_type}/${user_provider_arch}) for user instance creation test"
+            user_inst_resp=$(test_api "User creates instance (frontend-equivalent)" "POST" \
+                "/api/v1/user/instances" "200|400|404|409" \
+                "{\"providerId\":${PROVIDER_ID},\"imageId\":${user_image_id},\"cpuId\":\"1\",\"memoryId\":\"1\",\"diskId\":\"1\",\"bandwidthId\":\"1\"}" \
+                "$group" "$USER_TOKEN")
+            user_inst_task=$(echo "$user_inst_resp" | jq -r '.data.taskId // .data.task_id // empty' 2>/dev/null)
+        else
+            record_skip_result "User creates instance (frontend-equivalent)" "POST" \
+                "/api/v1/user/instances" "no active image available from user filtered-image endpoint" "$group"
+            log_warning "No active user image is available for ${user_img_provider_type}/${user_image_instance_type}/${user_provider_arch}; skipping creation request"
+        fi
         local user_inst_id=""
 
         # Wait for task if async
@@ -586,7 +598,16 @@ run_module_10() {
     # ==============================
     # Instance Share Link Tests
     # ==============================
-    local share_instance_id="${container_id:-${vm_id:-}}"
+    # The VM lifecycle above deletes its test VM before reaching this section.
+    # Do not reuse that stale ID (it would turn the share precondition into a
+    # false 404). Prefer the retained container, and only use the VM when the
+    # admin detail endpoint confirms it is still present.
+    local share_instance_id=""
+    if [[ -n "$container_id" ]] && ensure_test_instance_available "$ADMIN_TOKEN" "$container_id" "container share test"; then
+        share_instance_id="$container_id"
+    elif [[ -n "$vm_id" ]] && ensure_test_instance_available "$ADMIN_TOKEN" "$vm_id" "VM share test"; then
+        share_instance_id="$vm_id"
+    fi
     if [[ -n "$share_instance_id" ]]; then
         log_info "Testing instance share links with instance ID=${share_instance_id}..."
         local share_group="instances_share"

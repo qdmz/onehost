@@ -334,6 +334,17 @@
               >
                 {{ $t('admin.instances.connect') }}
               </el-button>
+              <el-tooltip :content="$t('user.instanceDetail.webConsole')">
+                <el-button
+                  size="small"
+                  type="info"
+                  :aria-label="$t('user.instanceDetail.webConsole')"
+                  :disabled="isInstanceBusy(scope.row) || scope.row.status !== 'running'"
+                  @click="openConsole(scope.row)"
+                >
+                  <el-icon><Monitor /></el-icon>
+                </el-button>
+              </el-tooltip>
               <el-button
                 size="small"
                 type="warning"
@@ -535,6 +546,27 @@
           </el-descriptions>
         </div>
       </div>
+      <template #footer>
+        <el-button
+          type="info"
+          :disabled="selectedInstance?.status !== 'running' || isInstanceBusy(selectedInstance)"
+          @click="openConsole(selectedInstance)"
+        >
+          <el-icon><Monitor /></el-icon>
+          {{ $t('user.instanceDetail.webConsole') }}
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="accessLoading"
+          @click="showInstanceAccessDialog(selectedInstance)"
+        >
+          <el-icon><EditPen /></el-icon>
+          {{ $t('admin.instances.editAccess') }}
+        </el-button>
+        <el-button @click="detailDialogVisible = false">
+          {{ $t('common.close') }}
+        </el-button>
+      </template>
     </el-dialog>
 
     <!-- 实例操作对话框 -->
@@ -598,6 +630,15 @@
           {{ $t('admin.instances.resetSystem') }}
         </el-button>
         <el-button
+          type="primary"
+          :disabled="isInstanceBusy(actionInstance)"
+          style="width: 100%; margin-bottom: 10px;"
+          @click="showEgressDialog(actionInstance)"
+        >
+          <el-icon><Connection /></el-icon>
+          {{ $t('admin.instances.egressAction') }}
+        </el-button>
+        <el-button
           type="success"
           :disabled="isInstanceBusy(actionInstance) || actionInstance.status !== 'running'"
           :loading="actionLoading"
@@ -654,6 +695,26 @@
         </el-button>
       </div>
     </el-dialog>
+
+    <EgressDialog
+      v-model="egressDialogVisible"
+      :instance="egressInstance"
+      @updated="loadInstances"
+    />
+
+    <InstanceAccessDialog
+      v-model="accessDialogVisible"
+      :instance="accessInstance"
+      @updated="refreshInstanceAccess"
+    />
+
+    <VNCDialog
+      v-if="consoleInstance"
+      v-model="consoleDialogVisible"
+      :instance-id="consoleInstance.id"
+      :instance-name="consoleInstance.name"
+      scope="admin"
+    />
 
     <!-- 转移实例对话框 -->
     <el-dialog
@@ -763,21 +824,25 @@ import {
   Lock, 
   Delete,
   Link,
+  Connection,
+  EditPen,
   Monitor
 } from '@element-plus/icons-vue'
 import { useInstanceManagement } from './composables/useInstanceManagement'
+import EgressDialog from './components/EgressDialog.vue'
+import InstanceAccessDialog from './components/InstanceAccessDialog.vue'
 import VNCDialog from '@/components/VNCDialog.vue'
 import SetExpiryDialog from './components/SetExpiryDialog.vue'
 
 const {
-  instances, loading, detailDialogVisible, actionDialogVisible,
-  selectedInstance, actionInstance, actionLoading, showPassword,
+  instances, loading, detailDialogVisible, actionDialogVisible, egressDialogVisible, accessDialogVisible, consoleDialogVisible, accessLoading,
+  selectedInstance, actionInstance, egressInstance, accessInstance, consoleInstance, actionLoading, showPassword,
   selectedInstances, transferDialogVisible, transferLoading, transferForm, tableRef,
   filters, pagination,
   loadInstances, handleSearch, handleReset, handleSizeChange, handleCurrentChange,
-  viewInstanceDetail, showActionDialog, performAction,
+  viewInstanceDetail, showActionDialog, showEgressDialog, showInstanceAccessDialog, refreshInstanceAccess, performAction,
   getStatusType, getStatusText, formatDate, formatMemory, formatDisk, formatTraffic,
-  isExpired, isExpiringSoon, openSSHTerminal,
+  isExpired, isExpiringSoon, openSSHTerminal, openConsole,
   handleSelectionChange, batchDeleteInstances, batchStartInstances, batchStopInstances,
   showTransferDialog, confirmTransfer, handleWindowResize,
   searchUsers, searchingUsers, userOptions, canOpenInstanceDetail, isInstanceBusy, createShareLink,

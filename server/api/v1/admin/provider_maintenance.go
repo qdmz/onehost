@@ -128,16 +128,44 @@ func parseVNCDiscoveredPort(raw string) int {
 	if json.Unmarshal([]byte(raw), &obj) != nil {
 		return 0
 	}
-	for _, key := range []string{"vncPort", "vnc_port", "vnc"} {
-		if v, ok := obj[key]; ok {
-			switch x := v.(type) {
-			case float64:
-				return int(x)
-			case string:
-				n, _ := strconv.Atoi(x)
-				return n
+	var parse func(value interface{}) int
+	parse = func(value interface{}) int {
+		switch x := value.(type) {
+		case float64:
+			return int(x)
+		case json.Number:
+			n, _ := strconv.Atoi(string(x))
+			return n
+		case int:
+			return x
+		case string:
+			n, _ := strconv.Atoi(strings.TrimSpace(x))
+			return n
+		case map[string]interface{}:
+			for _, key := range []string{"port", "vncPort", "vnc_port"} {
+				if n := parse(x[key]); n > 0 {
+					return n
+				}
 			}
 		}
+		return 0
+	}
+	for _, key := range []string{"vncPort", "vnc_port", "vnc"} {
+		if n := parse(obj[key]); n > 0 {
+			return n
+		}
+	}
+	console, _ := obj["console"].(map[string]interface{})
+	if console == nil {
+		return 0
+	}
+	for _, key := range []string{"vncPort", "vnc_port", "vnc"} {
+		if n := parse(console[key]); n > 0 {
+			return n
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(fmt.Sprint(console["protocol"])), consoleProtocolVNC) {
+		return parse(console["port"])
 	}
 	return 0
 }
@@ -246,7 +274,6 @@ var vncUpgrader = websocket.Upgrader{
 		return utils.OriginAllowedForRequest(r, origin, appConfig.System.FrontendURL, appConfig.Cors.Whitelist)
 	},
 }
-
 func proxyVNCWebSocket(c *gin.Context, host string, port int) {
 	ws, err := vncUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {

@@ -14,6 +14,13 @@ export const getAllInstances = (params) => {
   })
 }
 
+export const getAdminInstance = (id) => {
+  return request({
+    url: `/v1/admin/instances/${id}`,
+    method: 'get'
+  })
+}
+
 export const createInstance = (data) => {
   return instanceOperationRequest({
     url: '/v1/admin/instances',
@@ -50,6 +57,45 @@ export const adminBatchInstanceAction = (instanceIds, action) => {
     url: '/v1/admin/instances/batch-action',
     method: 'post',
     data: { instanceIds, action }
+  })
+}
+
+export const getInstanceEgress = (id) => {
+  return request({
+    url: `/v1/admin/instances/${id}/egress`,
+    method: 'get'
+  })
+}
+
+export const bindInstanceEgress = (id, data) => {
+  return instanceOperationRequest({
+    url: `/v1/admin/instances/${id}/egress`,
+    method: 'put',
+    data
+  })
+}
+
+export const unbindInstanceEgress = (id, apply = true) => {
+  return instanceOperationRequest({
+    url: `/v1/admin/instances/${id}/egress`,
+    method: 'delete',
+    params: { apply }
+  })
+}
+
+export const reconcileInstanceEgress = (id, apply = true) => {
+  return instanceOperationRequest({
+    url: `/v1/admin/instances/${id}/egress/reconcile`,
+    method: 'post',
+    data: { apply }
+  })
+}
+
+export const ensureInstanceEgressDependencies = (id, packageSet = 'wireguard') => {
+  return instanceOperationRequest({
+    url: `/v1/admin/instances/${id}/egress/dependencies`,
+    method: 'post',
+    data: { package_set: packageSet }
   })
 }
 

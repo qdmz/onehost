@@ -7,11 +7,17 @@ import (
 
 	"oneclickvirt/global"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh"
 )
 
 func (c *SSHClient) Execute(command string) (string, error) {
+	endUse, useErr := c.beginUse()
+	if useErr != nil {
+		return "", useErr
+	}
+	defer endUse()
 	// 检查连接健康状态，如果不健康则尝试重连
 	if !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH连接不健康，尝试重连",
@@ -23,7 +29,7 @@ func (c *SSHClient) Execute(command string) (string, error) {
 
 	// 尝试执行命令，如果失败则重试一次（可能是连接刚断开）
 	output, err := c.executeCommand(command)
-	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") {
+	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") && !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH session创建失败，尝试重连后重试",
 			zap.String("host", c.config.Host),
 			zap.Error(err))
@@ -45,6 +51,11 @@ func (c *SSHClient) Execute(command string) (string, error) {
 
 // ExecuteWithTimeout 执行SSH命令，使用自定义超时时间（用于长时间运行的命令如镜像下载）
 func (c *SSHClient) ExecuteWithTimeout(command string, timeout time.Duration) (string, error) {
+	endUse, useErr := c.beginUse()
+	if useErr != nil {
+		return "", useErr
+	}
+	defer endUse()
 	if !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH连接不健康，尝试重连",
 			zap.String("host", c.config.Host))
@@ -54,7 +65,7 @@ func (c *SSHClient) ExecuteWithTimeout(command string, timeout time.Duration) (s
 	}
 
 	output, err := c.executeCommandWithCustomTimeout(command, timeout)
-	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") {
+	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") && !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH session创建失败，尝试重连后重试",
 			zap.String("host", c.config.Host),
 			zap.Error(err))
@@ -72,7 +83,7 @@ func (c *SSHClient) ExecuteWithTimeout(command string, timeout time.Duration) (s
 
 // executeCommandWithCustomTimeout 使用自定义超时时间执行SSH命令
 func (c *SSHClient) executeCommandWithCustomTimeout(command string, timeout time.Duration) (string, error) {
-	session, err := c.client.NewSession()
+	session, err := c.newSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create SSH session: %w", err)
 	}
@@ -104,7 +115,7 @@ func (c *SSHClient) executeCommandWithCustomTimeout(command string, timeout time
 	select {
 	case <-done:
 		if execErr != nil {
-			return string(output), fmt.Errorf("command execution failed: %w", execErr)
+			return string(output), fmt.Errorf("command execution failed: %w; output: %s", execErr, TruncateString(string(output), 2000))
 		}
 		return string(output), nil
 	case <-timeoutTimer.C:
@@ -115,7 +126,7 @@ func (c *SSHClient) executeCommandWithCustomTimeout(command string, timeout time
 
 // executeCommand 执行SSH命令的内部方法
 func (c *SSHClient) executeCommand(command string) (string, error) {
-	session, err := c.client.NewSession()
+	session, err := c.newSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create SSH session: %w", err)
 	}
@@ -159,7 +170,7 @@ func (c *SSHClient) executeCommand(command string) (string, error) {
 					zap.Error(execErr),
 					zap.String("output", string(output)))
 			}
-			return string(output), fmt.Errorf("command execution failed: %w", execErr)
+			return string(output), fmt.Errorf("command execution failed: %w; output: %s", execErr, TruncateString(string(output), 2000))
 		}
 		return string(output), nil
 	case <-timeoutTimer.C:
@@ -278,6 +289,11 @@ func TestSSHConnectionLatency(config SSHConfig, testCount int) (minLatency, maxL
 
 // ExecuteWithLogging 执行命令并记录详细的调试信息，用于排查复杂命令的执行问题
 func (c *SSHClient) ExecuteWithLogging(command string, logPrefix string) (string, error) {
+	endUse, useErr := c.beginUse()
+	if useErr != nil {
+		return "", useErr
+	}
+	defer endUse()
 	// 检查连接健康状态，如果不健康则尝试重连
 	if !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH连接不健康，尝试重连",
@@ -290,7 +306,7 @@ func (c *SSHClient) ExecuteWithLogging(command string, logPrefix string) (string
 
 	// 尝试执行命令，如果失败则重试一次
 	output, err := c.executeCommandWithLogging(command, logPrefix)
-	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") {
+	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") && !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH session创建失败，尝试重连后重试",
 			zap.String("host", c.config.Host),
 			zap.String("log_prefix", logPrefix),
@@ -313,7 +329,7 @@ func (c *SSHClient) ExecuteWithLogging(command string, logPrefix string) (string
 
 // executeCommandWithLogging 执行SSH命令并记录日志的内部方法
 func (c *SSHClient) executeCommandWithLogging(command string, logPrefix string) (string, error) {
-	session, err := c.client.NewSession()
+	session, err := c.newSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create SSH session: %w", err)
 	}
@@ -388,6 +404,11 @@ func (c *SSHClient) executeCommandWithLogging(command string, logPrefix string) 
 // ExecuteRaw 执行原始命令，不添加任何环境变量包装。
 // 适用于执行本地脚本或不需要 profile 加载的简单命令。
 func (c *SSHClient) ExecuteRaw(command string, timeout time.Duration) (string, error) {
+	endUse, useErr := c.beginUse()
+	if useErr != nil {
+		return "", useErr
+	}
+	defer endUse()
 	if !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH连接不健康，尝试重连",
 			zap.String("host", c.config.Host))
@@ -397,7 +418,7 @@ func (c *SSHClient) ExecuteRaw(command string, timeout time.Duration) (string, e
 	}
 
 	output, err := c.executeCommandRaw(command, timeout)
-	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") {
+	if err != nil && strings.Contains(err.Error(), "failed to create SSH session") && !c.IsHealthy() {
 		global.APP_LOG.Warn("SSH session创建失败，尝试重连后重试",
 			zap.String("host", c.config.Host),
 			zap.Error(err))
@@ -415,7 +436,7 @@ func (c *SSHClient) ExecuteRaw(command string, timeout time.Duration) (string, e
 
 // executeCommandRaw 执行原始SSH命令（无环境变量包装）
 func (c *SSHClient) executeCommandRaw(command string, timeout time.Duration) (string, error) {
-	session, err := c.client.NewSession()
+	session, err := c.newSession()
 	if err != nil {
 		return "", fmt.Errorf("failed to create SSH session: %w", err)
 	}
@@ -448,8 +469,15 @@ func (c *SSHClient) executeCommandRaw(command string, timeout time.Duration) (st
 // ExecuteViaTempScript 通过临时脚本执行命令。
 // 对于 SSH 模式，直接上传脚本并同步执行（SSH 本身有超时机制）。
 func (c *SSHClient) ExecuteViaTempScript(scriptContent string, args []string, timeout time.Duration) (string, error) {
+	endUse, useErr := c.beginUse()
+	if useErr != nil {
+		return "", useErr
+	}
+	defer endUse()
 	// 生成唯一的临时文件路径
-	tmpPath := fmt.Sprintf("/tmp/oneclickvirt_exec_%d.sh", time.Now().UnixNano())
+	// UUID paths keep concurrent temporary scripts, marker files and logs
+	// isolated even when calls start within the same clock tick.
+	tmpPath := fmt.Sprintf("/tmp/oneclickvirt_exec_%s.sh", uuid.NewString())
 
 	// 上传脚本
 	if err := c.UploadContent(scriptContent, tmpPath, 0755); err != nil {
@@ -461,13 +489,20 @@ func (c *SSHClient) ExecuteViaTempScript(scriptContent string, args []string, ti
 	for _, arg := range args {
 		argStr += " " + shellEscape(arg)
 	}
-	execCmd := fmt.Sprintf("bash %s%s", tmpPath, argStr)
+	interpreter := TempScriptInterpreter(scriptContent)
+	execCmd := fmt.Sprintf("%s %s%s", shellEscape(interpreter), shellEscape(tmpPath), argStr)
 
 	// 执行脚本
 	output, execErr := c.ExecuteRaw(execCmd, timeout)
+	// BuildTempScript redirects diagnostics to SCRIPT_PATH.log. Read it before
+	// cleanup so callers can classify capability errors and report the actual
+	// guest failure instead of only "Process exited with status 1".
+	if logOutput, logErr := c.ExecuteRaw(fmt.Sprintf("cat %s 2>/dev/null", shellEscape(tmpPath+".log")), 10*time.Second); logErr == nil && logOutput != "" {
+		output = logOutput
+	}
 
 	// 清理临时文件（非阻塞）
-	c.ExecuteRaw(fmt.Sprintf("rm -f %s %s.marker %s.log 2>/dev/null", tmpPath, tmpPath, tmpPath), 10*time.Second)
+	c.ExecuteRaw(fmt.Sprintf("rm -f %s %s %s 2>/dev/null", shellEscape(tmpPath), shellEscape(tmpPath+".marker"), shellEscape(tmpPath+".log")), 10*time.Second)
 
 	if execErr != nil {
 		return output, fmt.Errorf("temp script execution failed: %w", execErr)

@@ -147,6 +147,7 @@
         <el-option
           :label="$t('admin.providers.natIPv4IPv6')"
           value="nat_ipv4_ipv6"
+          :disabled="!supportsStaticIPv6"
         />
         <el-option
           :label="$t('admin.providers.dedicatedIPv4')"
@@ -155,10 +156,12 @@
         <el-option
           :label="$t('admin.providers.dedicatedIPv4IPv6')"
           value="dedicated_ipv4_ipv6"
+          :disabled="!supportsStaticIPv6"
         />
         <el-option
           :label="$t('admin.providers.ipv6Only')"
           value="ipv6_only"
+          :disabled="!supportsStaticIPv6 || !supportsIPv6Only"
         />
         <el-option
           :label="$t('admin.providers.noPortMapping')"
@@ -177,6 +180,15 @@
         {{ $t('admin.providers.networkTypeTip') }}
       </el-text>
     </div>
+    <el-alert
+      v-if="hasIPv6Network && !supportsStaticIPv6"
+      :title="$t('admin.providers.ipv6Pool.networkTypeUnsupported')"
+      :description="$t('admin.providers.ipv6Pool.networkTypeUnsupportedTip', { type: modelValue.type || '-' })"
+      type="error"
+      :closable="false"
+      show-icon
+      style="margin: -4px 0 16px 120px;"
+    />
     <!-- 无端口映射模式特殊提示 -->
     <div
       v-if="modelValue.networkType === 'no_port_mapping'"
@@ -414,6 +426,10 @@
           label="Iptables"
           value="iptables"
         />
+        <el-option
+          :label="$t('admin.providers.nativePortMapping')"
+          value="native"
+        />
       </el-select>
     </el-form-item>
     <div
@@ -425,7 +441,7 @@
         size="small"
         type="info"
       >
-        {{ $t('admin.providers.ipv6PortMappingMethodTip') }}
+        {{ $t(managedIPv6NAT ? 'admin.providers.ipv6ManagedNatMappingTip' : 'admin.providers.ipv6PortMappingMethodTip') }}
       </el-text>
     </div>
 
@@ -541,155 +557,37 @@
       </ul>
     </el-alert>
 
-    <!-- IPv4 地址池管理（仅对 dedicated_ipv4 / dedicated_ipv4_ipv6 显示） -->
-    <template v-if="modelValue.networkType === 'dedicated_ipv4' || modelValue.networkType === 'dedicated_ipv4_ipv6'">
-      <el-divider
-        content-position="left"
-        style="margin-top: 24px;"
-      >
-        <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.ipv4Pool.management') }}</span>
-      </el-divider>
+    <IPv4PoolPanel :model-value="modelValue" />
+    <IPv6PoolPanel
+      :model-value="modelValue"
+      @provider-updated="emit('provider-updated', $event)"
+    />
 
-      <!-- 新提供商提示 -->
-      <el-alert
-        v-if="!modelValue.id"
-        type="info"
-        :closable="false"
-        :title="$t('admin.providers.ipv4Pool.newProviderNote')"
-        style="margin-bottom: 16px;"
-      />
-
-      <template v-else>
-        <!-- 池统计 -->
-        <el-row
-          :gutter="16"
-          style="margin-bottom: 16px;"
-        >
-          <el-col :span="8">
-            <el-statistic
-              :title="$t('admin.providers.ipv4Pool.total')"
-              :value="poolStats.total"
-            />
-          </el-col>
-          <el-col :span="8">
-            <el-statistic
-              :title="$t('admin.providers.ipv4Pool.allocated')"
-              :value="poolStats.allocated"
-            />
-          </el-col>
-          <el-col :span="8">
-            <el-statistic
-              :title="$t('admin.providers.ipv4Pool.available')"
-              :value="poolStats.available"
-            />
-          </el-col>
-        </el-row>
-
-        <!-- 添加地址 -->
-        <el-form-item :label="$t('admin.providers.ipv4Pool.addresses')">
-          <div style="width: 100%;">
-            <el-input
-              v-model="newAddresses"
-              type="textarea"
-              :rows="4"
-              :placeholder="$t('admin.providers.ipv4Pool.addressesPlaceholder')"
-              style="width: 100%; margin-bottom: 8px;"
-            />
-            <el-space>
-              <el-button
-                type="primary"
-                :loading="saving"
-                @click="addToPool"
-              >
-                {{ $t('admin.providers.ipv4Pool.addBtn') }}
-              </el-button>
-              <el-popconfirm
-                :title="$t('admin.providers.ipv4Pool.clearConfirm')"
-                @confirm="clearPool"
-              >
-                <template #reference>
-                  <el-button
-                    type="danger"
-                    plain
-                  >
-                    {{ $t('admin.providers.ipv4Pool.clearBtn') }}
-                  </el-button>
-                </template>
-              </el-popconfirm>
-            </el-space>
-          </div>
-        </el-form-item>
-
-        <!-- 当前地址列表 -->
-        <el-form-item :label="$t('admin.providers.ipv4Pool.list')">
-          <el-table
-            v-loading="poolLoading"
-            :data="poolEntries"
-            style="width: 100%"
-            size="small"
-            max-height="240"
-          >
-            <el-table-column
-              :label="$t('admin.providers.ipv4Pool.address')"
-              prop="address"
-              min-width="140"
-            />
-            <el-table-column
-              :label="$t('admin.providers.ipv4Pool.status')"
-              min-width="100"
-            >
-              <template #default="{ row }">
-                <el-tag
-                  :type="row.is_allocated ? 'warning' : 'success'"
-                  size="small"
-                >
-                  {{ row.is_allocated ? $t('admin.providers.ipv4Pool.statusAllocated') : $t('admin.providers.ipv4Pool.statusFree') }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column
-              :label="$t('admin.providers.ipv4Pool.instance')"
-              prop="instance_id"
-              min-width="110"
-            >
-              <template #default="{ row }">
-                <span>{{ row.instance_id || '-' }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column
-              width="80"
-              align="center"
-            >
-              <template #default="{ row }">
-                <el-popconfirm
-                  v-if="!row.is_allocated"
-                  :title="$t('admin.providers.ipv4Pool.deleteConfirm')"
-                  @confirm="deleteEntry(row.id)"
-                >
-                  <template #reference>
-                    <el-button
-                      type="danger"
-                      link
-                      size="small"
-                    >
-                      {{ $t('common.delete') }}
-                    </el-button>
-                  </template>
-                </el-popconfirm>
-              </template>
-            </el-table-column>
-          </el-table>
-        </el-form-item>
-      </template>
-    </template>
+    <el-divider content-position="left">
+      <span style="color: #666; font-size: 14px;">{{ $t('admin.providers.ipv6Pool.tunnels') }}</span>
+    </el-divider>
+    <el-alert
+      v-if="!modelValue.id"
+      type="info"
+      :closable="false"
+      :title="$t('admin.providers.ipv6Pool.tunnelNewProviderNote')"
+    />
+    <IPv6TunnelPanel
+      v-else
+      :provider-id="modelValue.id"
+    />
   </el-form>
 </template>
 
 <script setup>
 import { computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useIPv4Pool } from './composables/useIPv4Pool'
+import IPv4PoolPanel from './IPv4PoolPanel.vue'
+import IPv6PoolPanel from './IPv6PoolPanel.vue'
+import IPv6TunnelPanel from './IPv6TunnelPanel.vue'
+import { supportsIPv6OnlyProvider, supportsStaticIPv6Provider } from '@/utils/ipv6Capabilities'
 import { CONTAINER_ONLY_PROVIDER_TYPES, VM_ONLY_PROVIDER_TYPES } from '@/utils/providerTypes'
+import { usesManagedIPv6NAT } from '@/utils/networkType'
 
 const props = defineProps({
   modelValue: {
@@ -697,10 +595,19 @@ const props = defineProps({
     required: true
   }
 })
+const emit = defineEmits(['provider-updated'])
 
 const { t } = useI18n()
 const REQUIRED_FIXED_PORT = 22
 const commonFixedPorts = [22, 80, 443, 8080, 8443, 3306, 5432, 6379, 27017]
+const supportsStaticIPv6 = computed(() => supportsStaticIPv6Provider(props.modelValue.type))
+const supportsIPv6Only = computed(() => supportsIPv6OnlyProvider(props.modelValue.type))
+const hasIPv6Network = computed(() => ['nat_ipv4_ipv6', 'dedicated_ipv4_ipv6', 'ipv6_only'].includes(props.modelValue.networkType))
+const managedIPv6NAT = computed(() => usesManagedIPv6NAT(
+  props.modelValue.type,
+  props.modelValue.networkType,
+  props.modelValue.ipv6PortMappingMethod
+))
 
 const normalizeFixedPorts = (ports = []) => {
   const values = Array.isArray(ports) ? ports : []
@@ -731,17 +638,6 @@ const fixedPortCount = computed(() => normalizeFixedPorts(props.modelValue.fixed
 const ordinaryPortCount = computed(() => Math.max((props.modelValue.defaultPortCount || 10) - fixedPortCount.value, 0))
 const fixedPortsOverflow = computed(() => fixedPortCount.value > (props.modelValue.defaultPortCount || 10))
 const handleFixedPortsChange = () => ensureFixedPorts()
-
-const {
-  poolEntries,
-  poolStats,
-  poolLoading,
-  newAddresses,
-  saving,
-  addToPool,
-  clearPool,
-  deleteEntry,
-} = useIPv4Pool(props)
 
 watch(() => props.modelValue.fixedPorts, ensureFixedPorts, { immediate: true, deep: true })
 
@@ -803,7 +699,8 @@ watch(() => [props.modelValue.type, props.modelValue.networkType], ([type, netwo
       }
     }
   }
-  // LXD/Incus不需要额外处理，它们的IPv4和IPv6都是device_proxy或iptables
+  // LXD/Incus保留当前选择：device_proxy/iptables 为宿主IPv6映射，
+  // native 为直接分配给实例的独立公网IPv6。
   // Docker不需要额外处理，它们固定是native
 })
 </script>

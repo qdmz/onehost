@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,20 +80,26 @@ func InternalIPToVMIDCandidates(ip string) []int {
 }
 
 type ProxmoxProvider struct {
-	config           provider.NodeConfig
-	sshClient        *utils.SafeShellExecutor // 永不为nil，所有方法安全调用
-	apiClient        *http.Client
-	transport        *http.Transport
-	providerID       uint // 存储providerID用于清理
-	connected        bool
-	node             string // Proxmox 节点名
-	providerUUID     string // Provider UUID，用于查询数据库中的配置
-	healthChecker    health.HealthChecker
-	version          string             // Proxmox VE 版本，用于兼容性判断
-	mu               sync.RWMutex       // 保护并发访问
-	pendingVMIDs     map[int]bool       // 已分配但尚未创建完成的VMID集合，防止并发重复分配
-	imageImportGroup singleflight.Group // 防止同一镜像并发下载
-	kvmUnavailable   bool               // KVM硬件加速不可用时为true（软件模拟qemu64），此时所有等待时间翻倍
+	probeWG           sync.WaitGroup // initial Agent probes; tests/shutdown can join them
+	probeCancel       context.CancelFunc
+	natDataPlaneGroup singleflight.Group // Coalesces concurrent NAT data-plane reconciliation.
+	natDataPlaneMu    sync.Mutex
+	natDataPlaneReady time.Time
+	config            provider.NodeConfig
+	sshClient         *utils.SafeShellExecutor // 永不为nil，所有方法安全调用
+	apiClient         *http.Client
+	transport         *http.Transport
+	providerID        uint // 存储providerID用于清理
+	connected         bool
+	apiHealthy        bool   // API-only mode has no SSH executor to represent liveness.
+	node              string // Proxmox 节点名
+	providerUUID      string // Provider UUID，用于查询数据库中的配置
+	healthChecker     health.HealthChecker
+	version           string             // Proxmox VE 版本，用于兼容性判断
+	mu                sync.RWMutex       // 保护并发访问
+	pendingVMIDs      map[int]bool       // 已分配但尚未创建完成的VMID集合，防止并发重复分配
+	imageImportGroup  singleflight.Group // 防止同一镜像并发下载
+	kvmUnavailable    bool               // KVM硬件加速不可用时为true（软件模拟qemu64），此时所有等待时间翻倍
 	// 缓存的网桥名称（从NodeConfig加载，避免重复查询数据库）
 	bridgeNAT         string // NAT网桥名（脚本安装=vmbr1，第三方安装=配置值）
 	bridgeDedicatedV4 string // 独立IPv4网桥名（脚本安装=vmbr0，第三方安装=配置值）
@@ -146,6 +153,9 @@ func (p *ProxmoxProvider) GetSupportedInstanceTypes() []string {
 
 func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfig) error {
 	p.config = config
+	p.connected = false
+	p.apiHealthy = false
+	p.sshClient.ClearExecutor()
 	p.providerUUID = config.UUID // 存储Provider UUID
 	p.providerID = config.ID     // 存储providerID
 	p.normalizeTokenConfig()
@@ -155,6 +165,7 @@ func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfi
 
 	// 初始化网桥名称缓存（从NodeConfig中读取，避免重复查询数据库）
 	p.initBridgeNames(config)
+	p.resetNATIPv4DataPlaneCache()
 
 	// 注册transport并关联providerID
 	if p.transport != nil && p.providerID > 0 {
@@ -166,6 +177,42 @@ func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfi
 		global.APP_LOG.Warn("从本地文件加载token失败，使用配置值", zap.Error(err))
 	}
 	p.normalizeTokenConfig()
+
+	// API-only is a strict transport mode. Do not create an SSH client, run
+	// hostname/NAT/version probes, or leave a stale executor from a previous
+	// connection on the provider.
+	if strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+		if !p.hasAPIAccess() {
+			return fmt.Errorf("Proxmox执行规则为api_only，但未配置有效API Token")
+		}
+		if err := p.probeAPIConnection(ctx); err != nil {
+			return fmt.Errorf("Proxmox API连接失败: %w", err)
+		}
+		p.connected = true
+		p.apiHealthy = true
+		healthConfig := health.HealthConfig{
+			ProviderID:    p.config.ID,
+			ProviderName:  p.config.Name,
+			Host:          p.config.Host,
+			Port:          p.config.Port,
+			APIEnabled:    true,
+			APIPort:       8006,
+			APIScheme:     "https",
+			SSHEnabled:    false,
+			ServiceChecks: nil,
+			SkipTLSVerify: p.config.CACertPath == "",
+			CACertPath:    p.config.CACertPath,
+			Timeout:       10 * time.Second,
+			Token:         p.config.Token,
+			TokenID:       p.config.TokenID,
+		}
+		zapLogger, _ := zap.NewProduction()
+		p.healthChecker = health.NewProxmoxHealthChecker(healthConfig, zapLogger)
+		global.APP_LOG.Info("Proxmox provider API-only连接成功",
+			zap.String("host", utils.TruncateString(config.Host, 32)),
+			zap.String("node", utils.TruncateString(p.nodeName(), 32)))
+		return nil
+	}
 
 	// 如果本地文件没有 Token，尝试从 NodeConfig 的扩展配置中解析
 	if !p.hasAPIAccess() {
@@ -208,9 +255,9 @@ func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfi
 
 	// 获取节点名：优先使用配置中的HostName（数据库存储的），否则动态获取
 	if config.HostName != "" {
-		p.node = config.HostName
+		p.setNodeName(config.HostName)
 		global.APP_LOG.Debug("使用数据库配置的Proxmox主机名",
-			zap.String("hostName", p.node),
+			zap.String("hostName", p.nodeName()),
 			zap.String("provider", config.Name),
 			zap.String("host", utils.TruncateString(config.Host, 32)))
 	} else {
@@ -219,10 +266,10 @@ func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfi
 			global.APP_LOG.Warn("获取主机名失败，使用默认值",
 				zap.Error(err),
 				zap.String("host", utils.TruncateString(config.Host, 32)))
-			p.node = "pve" // 默认节点名
+			p.setNodeName("pve") // 默认节点名
 		} else {
 			global.APP_LOG.Debug("动态获取Proxmox主机名成功",
-				zap.String("hostName", p.node),
+				zap.String("hostName", p.nodeName()),
 				zap.String("provider", config.Name),
 				zap.String("host", utils.TruncateString(config.Host, 32)))
 		}
@@ -260,7 +307,7 @@ func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfi
 	global.APP_LOG.Info("Proxmox provider SSH连接成功",
 		zap.String("host", utils.TruncateString(config.Host, 32)),
 		zap.Int("port", config.Port),
-		zap.String("node", utils.TruncateString(p.node, 32)),
+		zap.String("node", utils.TruncateString(p.nodeName(), 32)),
 		zap.String("version", p.version),
 		zap.Bool("supportsFstrim", p.supportsCloneFstrim()),
 		zap.Bool("hasToken", p.hasAPIAccess()))
@@ -269,51 +316,107 @@ func (p *ProxmoxProvider) Connect(ctx context.Context, config provider.NodeConfi
 }
 
 func (p *ProxmoxProvider) ConnectAgent(executor utils.ShellExecutor, config provider.NodeConfig) error {
+	p.mu.Lock()
+	if p.probeCancel != nil {
+		p.probeCancel()
+	}
+	probeCtx, cancelProbe := context.WithCancel(context.Background())
+	p.probeCancel = cancelProbe
+	p.mu.Unlock()
 	p.config = config
+	p.connected = false
+	p.apiHealthy = false
 	p.providerUUID = config.UUID
 	p.providerID = config.ID
 	p.normalizeTokenConfig()
 	if err := p.configureAPITLS(p.config); err != nil {
 		return err
 	}
+	if strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+		// An Agent transport is not an SSH fallback. API-only Agent providers use
+		// the configured API token exclusively and perform no asynchronous shell
+		// probes during connection.
+		if !p.hasAPIAccess() {
+			return fmt.Errorf("Proxmox Agent+api_only未配置有效API Token")
+		}
+		if err := p.probeAPIConnection(context.Background()); err != nil {
+			return fmt.Errorf("Proxmox Agent+api_only API连接失败: %w", err)
+		}
+		p.connected = true
+		p.apiHealthy = true
+		healthConfig := health.HealthConfig{
+			ProviderID: p.config.ID, ProviderName: p.config.Name,
+			Host: p.config.Host, Port: p.config.Port,
+			APIEnabled: true, APIPort: 8006, APIScheme: "https",
+			SSHEnabled: false, ServiceChecks: nil,
+			SkipTLSVerify: p.config.CACertPath == "", CACertPath: p.config.CACertPath,
+			Timeout: 10 * time.Second, Token: p.config.Token, TokenID: p.config.TokenID,
+		}
+		zapLogger, _ := zap.NewProduction()
+		p.healthChecker = health.NewProxmoxHealthChecker(healthConfig, zapLogger)
+		return nil
+	}
 	p.sshClient.SetExecutor(executor)
 	p.connected = true
 	p.healthChecker = nil
 
 	p.initBridgeNames(config)
+	p.resetNATIPv4DataPlaneCache()
 
 	// 使用配置中的 HostName 作为节点名默认值，避免阻塞
-	p.node = config.HostName
-	if p.node == "" {
-		p.node = "pve"
+	p.setNodeName(config.HostName)
+	if p.nodeName() == "" {
+		p.setNodeName("pve")
 	}
 
 	// Agent 模式下 getNodeName 和 getProxmoxVersion 改为异步，
 	// 避免因 Agent 尚未建立 WebSocket 连接而阻塞 Provider 加载
 	if config.NodeInstallType != "third_party" {
-		go p.detectScriptNATSubnet()
+		p.startAgentProbe(func() {
+			select {
+			case <-probeCtx.Done():
+				return
+			default:
+			}
+			p.detectScriptNATSubnet()
+		})
 	}
 
-	go func() {
-		if err := p.getNodeName(context.Background()); err != nil {
+	p.startAgentProbe(func() {
+		select {
+		case <-probeCtx.Done():
+			return
+		default:
+		}
+		if err := p.getNodeName(probeCtx); err != nil {
 			global.APP_LOG.Warn("Agent模式下Proxmox节点名获取失败", zap.Error(err))
 		} else {
 			global.APP_LOG.Debug("Agent模式下Proxmox节点名获取成功",
-				zap.String("node", p.node))
+				zap.String("node", p.nodeName()))
 		}
-	}()
+	})
 
-	go func() {
+	p.startAgentProbe(func() {
+		select {
+		case <-probeCtx.Done():
+			return
+		default:
+		}
 		if err := p.getProxmoxVersion(); err != nil {
 			global.APP_LOG.Warn("Agent模式下Proxmox版本获取失败", zap.Error(err))
 		}
-	}()
+	})
 
 	global.APP_LOG.Info("Proxmox provider (Agent模式) 加载完成",
 		zap.String("name", config.Name),
 		zap.String("type", config.Type),
-		zap.String("node", utils.TruncateString(p.node, 32)))
+		zap.String("node", utils.TruncateString(p.nodeName(), 32)))
 	return nil
+}
+
+func (p *ProxmoxProvider) startAgentProbe(probe func()) {
+	p.probeWG.Add(1)
+	go func() { defer p.probeWG.Done(); probe() }()
 }
 
 func (p *ProxmoxProvider) configureAPITLS(config provider.NodeConfig) error {
@@ -343,8 +446,20 @@ func (p *ProxmoxProvider) configureAPITLS(config provider.NodeConfig) error {
 
 func (p *ProxmoxProvider) Disconnect(ctx context.Context) error {
 	p.mu.Lock()
+	if p.probeCancel != nil {
+		p.probeCancel()
+		p.probeCancel = nil
+	}
 	p.sshClient.Close() // SafeShellExecutor.Close 内部清理executor，无需置nil
 	p.mu.Unlock()
+	probeDone := make(chan struct{})
+	go func() { p.probeWG.Wait(); close(probeDone) }()
+	select {
+	case <-probeDone:
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		global.APP_LOG.Warn("等待 Proxmox Agent 探测退出超时")
+	}
 
 	// 按providerID清理transport
 	if p.providerID > 0 {
@@ -357,15 +472,31 @@ func (p *ProxmoxProvider) Disconnect(ctx context.Context) error {
 	p.transport = nil
 
 	p.connected = false
+	p.apiHealthy = false
 	return nil
 }
 
 func (p *ProxmoxProvider) IsConnected() bool {
+	if strings.EqualFold(strings.TrimSpace(p.config.ExecutionRule), "api_only") {
+		return p.connected && p.apiHealthy
+	}
 	return p.connected && p.sshClient.HasExecutor() && p.sshClient.IsHealthy()
 }
 
 // EnsureConnection 确保SSH连接可用，如果连接不健康则尝试重连
 func (p *ProxmoxProvider) EnsureConnection() error {
+	if strings.EqualFold(strings.TrimSpace(p.config.ExecutionRule), "api_only") {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.probeAPIConnection(ctx); err != nil {
+			p.connected = false
+			p.apiHealthy = false
+			return fmt.Errorf("Proxmox API重连失败: %w", err)
+		}
+		p.connected = true
+		p.apiHealthy = true
+		return nil
+	}
 	if !p.sshClient.HasExecutor() {
 		return fmt.Errorf("SSH client not initialized")
 	}
@@ -393,6 +524,19 @@ func (p *ProxmoxProvider) EnsureConnection() error {
 }
 
 func (p *ProxmoxProvider) HealthCheck(ctx context.Context) (*health.HealthResult, error) {
+	if strings.EqualFold(strings.TrimSpace(p.config.ExecutionRule), "api_only") {
+		if p.healthChecker == nil {
+			return nil, fmt.Errorf("Proxmox API-only健康检查器未初始化")
+		}
+		result, err := p.healthChecker.CheckHealth(ctx)
+		if err == nil {
+			p.apiHealthy = result.APIStatus == "online"
+			p.connected = p.apiHealthy
+		} else {
+			p.apiHealthy = false
+		}
+		return result, err
+	}
 	if p.healthChecker == nil {
 		if !p.sshClient.HasExecutor() {
 			return nil, fmt.Errorf("health checker not initialized")
@@ -491,7 +635,13 @@ func (p *ProxmoxProvider) detectScriptNATSubnet() {
 	if err != nil {
 		return
 	}
-	cidr := strings.TrimSpace(output)
+	cidr, parseErr := utils.ParseSingleCommandToken(output)
+	if parseErr != nil {
+		if strings.TrimSpace(output) != "" {
+			global.APP_LOG.Warn("远端Proxmox NAT网段文件输出无效", zap.Error(parseErr))
+		}
+		return
+	}
 	if p.applyNATSubnet(cidr) {
 		global.APP_LOG.Info("检测到脚本安装的Proxmox NAT网段", zap.String("natSubnet", cidr))
 	} else if cidr != "" {
@@ -543,10 +693,22 @@ func (p *ProxmoxProvider) getNodeName(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	p.mu.Lock()
-	p.node = utils.CleanCommandOutput(output)
-	p.mu.Unlock()
+	p.setNodeName(utils.CleanCommandOutput(output))
 	return nil
+}
+
+// nodeName returns a consistent snapshot. Agent mode discovers the node
+// asynchronously, so request paths must not read p.node directly.
+func (p *ProxmoxProvider) nodeName() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.node
+}
+
+func (p *ProxmoxProvider) setNodeName(node string) {
+	p.mu.Lock()
+	p.node = strings.TrimSpace(node)
+	p.mu.Unlock()
 }
 
 // ExecuteSSHCommand 执行SSH命令
@@ -678,20 +840,39 @@ func (p *ProxmoxProvider) parseInstanceInfo(ctx context.Context, instanceName st
 
 	// 如果数据库查询失败，尝试通过SSH命令查询
 	// 先检查是否是容器
-	checkContainerCmd := fmt.Sprintf("pct list | grep -w '%s' | awk '{print $1}'", instanceName)
+	checkContainerCmd := fmt.Sprintf("pct list | awk -v name=%s '$3 == name {print $1; exit}'", shellSingleQuote(instanceName))
 	output, err := p.sshClient.Execute(checkContainerCmd)
-	if err == nil && strings.TrimSpace(output) != "" {
-		return strings.TrimSpace(output), "container", nil
+	if err == nil {
+		if vmid, parseErr := parseProxmoxVMIDOutput(output); parseErr == nil {
+			return vmid, "container", nil
+		}
 	}
 
 	// 再检查是否是虚拟机
-	checkVMCmd := fmt.Sprintf("qm list | grep -w '%s' | awk '{print $1}'", instanceName)
+	checkVMCmd := fmt.Sprintf("qm list | awk -v name=%s '$2 == name {print $1; exit}'", shellSingleQuote(instanceName))
 	output, err = p.sshClient.Execute(checkVMCmd)
-	if err == nil && strings.TrimSpace(output) != "" {
-		return strings.TrimSpace(output), "vm", nil
+	if err == nil {
+		if vmid, parseErr := parseProxmoxVMIDOutput(output); parseErr == nil {
+			return vmid, "vm", nil
+		}
 	}
 
 	return "", "", fmt.Errorf("instance %s not found", instanceName)
+}
+
+func parseProxmoxVMIDOutput(output string) (string, error) {
+	vmid, err := utils.ParseFirstCommandLineMatching(output, func(value string) bool {
+		parsed, parseErr := strconv.Atoi(value)
+		return parseErr == nil && parsed > 0
+	})
+	if err != nil {
+		return "", err
+	}
+	value, err := strconv.Atoi(vmid)
+	if err != nil || value <= 0 {
+		return "", fmt.Errorf("invalid Proxmox VMID output: %q", vmid)
+	}
+	return strconv.Itoa(value), nil
 }
 
 // shouldFallbackToSSH 根据执行规则判断 API失败时是否可以回退到SSH
@@ -771,8 +952,8 @@ func (p *ProxmoxProvider) getProxmoxVersion() error {
 				p.version = versionStr
 				p.mu.Unlock()
 				global.APP_LOG.Debug("获取 Proxmox 版本成功",
-					zap.String("version", p.version),
-					zap.String("node", p.node))
+					zap.String("version", versionStr),
+					zap.String("node", p.nodeName()))
 				return nil
 			}
 		}
@@ -788,13 +969,14 @@ func (p *ProxmoxProvider) getProxmoxVersion() error {
 
 // supportsCloneFstrim 检查是否支持 fstrim_cloned_disks 参数（PVE 8.0+）
 func (p *ProxmoxProvider) supportsCloneFstrim() bool {
-	if p.version == "" || p.version == "unknown" {
+	version := p.GetVersion()
+	if version == "" || version == "unknown" {
 		// 如果版本未知，为了兼容性，不使用该参数
 		return false
 	}
 
 	// 解析主版本号
-	parts := strings.Split(p.version, ".")
+	parts := strings.Split(version, ".")
 	if len(parts) == 0 {
 		return false
 	}
@@ -804,7 +986,7 @@ func (p *ProxmoxProvider) supportsCloneFstrim() bool {
 	var major int
 	if _, err := fmt.Sscanf(majorStr, "%d", &major); err != nil {
 		global.APP_LOG.Warn("无法解析 Proxmox 主版本号，不使用 fstrim_cloned_disks",
-			zap.String("version", p.version),
+			zap.String("version", version),
 			zap.Error(err))
 		return false
 	}

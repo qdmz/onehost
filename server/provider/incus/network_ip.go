@@ -26,7 +26,12 @@ func (i *IncusProvider) getInstanceType(instanceName string) (string, error) {
 		return "", fmt.Errorf("获取实例类型失败: %w", err)
 	}
 
-	instanceType := utils.CleanCommandOutput(output)
+	instanceType, parseErr := utils.ParseFirstCommandLineMatching(output, func(value string) bool {
+		return value == "container" || value == "virtual-machine"
+	})
+	if parseErr != nil {
+		return "", fmt.Errorf("实例类型输出无效")
+	}
 	global.APP_LOG.Debug("检测到实例类型",
 		zap.String("instanceName", instanceName),
 		zap.String("type", instanceType))
@@ -69,24 +74,22 @@ func (i *IncusProvider) getVMInstanceIP(instanceName string) (string, error) {
 
 		time.Sleep(time.Duration(delay) * time.Second)
 
-		// 虚拟机通常使用 enp5s0 接口，如果没有则尝试 eth0
-		interfaces := []string{"enp5s0", "eth0"}
-
-		for _, iface := range interfaces {
-			cmd := fmt.Sprintf("incus list %s --format json | jq -r '.[0].state.network.%s.addresses[]? | select(.family==\"inet\") | .address' 2>/dev/null", shellSingleQuote(instanceName), iface)
-			i.mu.RLock()
-			client := i.sshClient
-			i.mu.RUnlock()
-			if client == nil {
-				return "", fmt.Errorf("SSH client不可用，无法获取虚拟机IP")
-			}
-			output, err := client.Execute(cmd)
-
-			if err == nil && strings.TrimSpace(output) != "" {
-				vmIP := strings.TrimSpace(output)
+		// VM interface names vary by image and distro (enp5s0, ens18, eth0,
+		// ...). Enumerate every state.network entry instead of assuming one
+		// device name, otherwise a perfectly healthy VM is reported as having no
+		// address and its port mapping is skipped.
+		cmd := fmt.Sprintf("incus list %s --format json | jq -r '.[0].state.network // {} | to_entries[] | .value.addresses[]? | select(.family==\"inet\" and (.scope==\"global\" or .scope==\"link\")) | .address' 2>/dev/null", shellSingleQuote(instanceName))
+		i.mu.RLock()
+		client := i.sshClient
+		i.mu.RUnlock()
+		if client == nil {
+			return "", fmt.Errorf("SSH client不可用，无法获取虚拟机IP")
+		}
+		output, err := client.Execute(cmd)
+		if err == nil {
+			if vmIP, parseErr := utils.ParseFirstIPv4AddressOutput(output); parseErr == nil {
 				global.APP_LOG.Debug("虚拟机IPv4地址获取成功",
 					zap.String("instanceName", instanceName),
-					zap.String("interface", iface),
 					zap.String("ip", vmIP),
 					zap.Int("attempt", attempt))
 				return vmIP, nil
@@ -119,8 +122,9 @@ func (i *IncusProvider) getContainerInstanceIP(instanceName string) (string, err
 
 		time.Sleep(time.Duration(delay) * time.Second)
 
-		// 容器通常使用 eth0 接口
-		cmd := fmt.Sprintf("incus list %s --format json | jq -r '.[0].state.network.eth0.addresses[]? | select(.family==\"inet\") | .address' 2>/dev/null", shellSingleQuote(instanceName))
+		// Container images may rename the first interface. Enumerate all
+		// interfaces and select a usable IPv4 address.
+		cmd := fmt.Sprintf("incus list %s --format json | jq -r '.[0].state.network // {} | to_entries[] | .value.addresses[]? | select(.family==\"inet\" and (.scope==\"global\" or .scope==\"link\")) | .address' 2>/dev/null", shellSingleQuote(instanceName))
 		i.mu.RLock()
 		client := i.sshClient
 		i.mu.RUnlock()
@@ -129,8 +133,12 @@ func (i *IncusProvider) getContainerInstanceIP(instanceName string) (string, err
 		}
 		output, err := client.Execute(cmd)
 
-		if err == nil && strings.TrimSpace(output) != "" {
-			containerIP := strings.TrimSpace(output)
+		if err == nil {
+			containerIP, parseErr := utils.ParseFirstIPv4AddressOutput(output)
+			if parseErr != nil {
+				delay *= 2
+				continue
+			}
 			global.APP_LOG.Debug("容器IPv4地址获取成功",
 				zap.String("instanceName", instanceName),
 				zap.String("ip", containerIP),
@@ -198,8 +206,7 @@ func (i *IncusProvider) getInstanceIPGeneric(instanceName string) (string, error
 						}
 
 						// 验证是否是有效的IPv4地址
-						parts := strings.Split(addr, ".")
-						if len(parts) == 4 {
+						if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
 							global.APP_LOG.Debug("通过incus list找到有效IP地址",
 								zap.String("instanceName", instanceName),
 								zap.String("ip", addr),
@@ -277,9 +284,9 @@ func (i *IncusProvider) getHostIP() (string, error) {
 		return "", fmt.Errorf("获取主机IP失败: %w", err)
 	}
 
-	hostIP := strings.TrimSpace(output)
-	if hostIP == "" {
-		return "", fmt.Errorf("主机IP为空")
+	hostIP, parseErr := utils.ParseFirstIPv4AddressOutput(output)
+	if parseErr != nil {
+		return "", fmt.Errorf("主机IP输出无效: %w", parseErr)
 	}
 
 	global.APP_LOG.Info("从宿主机获取到IP地址",

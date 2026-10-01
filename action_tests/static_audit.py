@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static audit for action_tests and API route coverage.
+"""Static audit for action tests, router contracts, and API route coverage.
 
 This script is intentionally conservative: it produces a report by default and
 only exits non-zero when --strict is supplied. It does not call live services.
@@ -24,6 +24,9 @@ METHOD_PATH_RE = re.compile(
     r"[\"'](GET|POST|PUT|DELETE|PATCH)[\"']\s+"
     r"[\"']((?:/api/v1)?/[^\"'\s)]*)[\"']",
     re.S,
+)
+CONTRACT_ROUTE_RE = re.compile(
+    r"[\"'](GET|POST|PUT|DELETE|PATCH)\s+((?:/api/v1)?/[^\"'\s]+)[\"']"
 )
 JQ_INVOKE_RE = re.compile(r"(^|[\s|;&(<`])jq(\s|$)")
 
@@ -85,7 +88,10 @@ def scan_routes(root: Path) -> list[Endpoint]:
 def scan_test_paths(root: Path) -> tuple[list[Endpoint], set[str]]:
     endpoints: list[Endpoint] = []
     paths: set[str] = set()
-    for path in iter_text_files(root, "action_tests/**/*.sh"):
+    # Router contract tests are deterministic registration checks. They cover
+    # routes such as WebSocket/console endpoints that must not be opened by a
+    # disposable integration worker merely to satisfy a static coverage audit.
+    for path in iter_text_files(root, "action_tests/**/*.sh", "server/service/router/**/*_test.go"):
         text = path.read_text(errors="ignore")
         for match in PATH_RE.finditer(text):
             paths.add(match.group(1))
@@ -95,6 +101,10 @@ def scan_test_paths(root: Path) -> tuple[list[Endpoint], set[str]]:
             line_starts.append(match.end())
         for match in METHOD_PATH_RE.finditer(compact):
             line = 1 + sum(1 for start in line_starts if start <= match.start())
+            endpoints.append(Endpoint(match.group(1), match.group(2), rel(path, root), line))
+            paths.add(match.group(2))
+        for match in CONTRACT_ROUTE_RE.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
             endpoints.append(Endpoint(match.group(1), match.group(2), rel(path, root), line))
             paths.add(match.group(2))
     return endpoints, paths
@@ -125,6 +135,14 @@ def audit_shell(root: Path) -> tuple[list[Finding], list[Finding]]:
                     or "jq -cn" in line
                     or "2>/dev/null" in line
                     or "|| true" in line
+                    # Validation queries intentionally fail the current stage.
+                    # Keep their diagnostics instead of requiring stderr to
+                    # be discarded just to satisfy this heuristic.
+                    or re.search(r"\|\|\s*(?:return|exit)\s+[1-9][0-9]*\b", line) is not None
+                    or re.search(r"^\s*(?:if|elif|while|until)\s+(?:!\s+)?jq\b", line) is not None
+                    # Command substitutions are also safe when the assignment
+                    # immediately propagates jq's status to the current stage.
+                    or re.search(r"\$\([^\n]*\bjq\b[^\n]*\)\s*\|\|\s*(?:return|exit)\s+[1-9][0-9]*\b", line) is not None
                 )
                 if not guarded:
                     jq_findings.append(Finding(rel(path, root), idx, "unguarded-jq", stripped))
@@ -177,23 +195,30 @@ def audit_workflows(root: Path) -> list[Finding]:
 
 
 def audit_retry_hygiene(root: Path) -> list[Finding]:
+    """Reject retries around non-idempotent instance creation requests.
+
+    A create request must remain single-shot: if the server accepted the
+    request but the client lost the response, replaying the POST can create a
+    duplicate remote instance.  The previous check incorrectly required a
+    retry and therefore reported the safe implementation while allowing the
+    unsafe one.
+    """
     findings: list[Finding] = []
-    create_instance_re = re.compile(
-        r"\btest_api\s+['\"][^'\"]*Create[^'\"]*['\"]\s+['\"]POST['\"]\s+['\"]"
-        r"/api/v1/admin/instances['\"]\s+['\"]([^'\"]+)['\"]"
+    create_instance_retry_re = re.compile(
+        r"\btest_api_retry\s+['\"][^'\"]*Create[^'\"]*['\"]\s+['\"]POST['\"]\s+['\"]"
+        r"/api/v1/admin/instances['\"]"
     )
     for path in iter_text_files(root, "action_tests/**/*.sh"):
         for idx, line in logical_lines(path.read_text(errors="ignore")):
             stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "test_api_retry" in stripped:
+            if not stripped or stripped.startswith("#"):
                 continue
-            match = create_instance_re.search(stripped)
-            if match and match.group(1) in {"200", "200|201"}:
+            if create_instance_retry_re.search(stripped):
                 findings.append(
                     Finding(
                         rel(path, root),
                         idx,
-                        "create-instance-without-retry",
+                        "non-idempotent-create-retry",
                         stripped,
                     )
                 )

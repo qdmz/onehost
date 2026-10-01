@@ -79,11 +79,12 @@ type CreateProviderRequest struct {
 	// 操作执行配置
 	ExecutionRule string `json:"executionRule" binding:"omitempty,oneof=auto api_only ssh_only"` // 操作轮转规则：auto(自动切换), api_only(仅API), ssh_only(仅SSH)
 	// 端口映射配置
-	DefaultPortCount int    `json:"defaultPortCount"`                                                                                                          // 每个实例默认映射端口数量，默认10
-	PortRangeStart   int    `json:"portRangeStart"`                                                                                                            // 端口映射范围起始，默认10000
-	PortRangeEnd     int    `json:"portRangeEnd"`                                                                                                              // 端口映射范围结束，默认65535
-	FixedPorts       []int  `json:"fixedPorts"`                                                                                                                // 固定实例内端口，22强制保留
-	NetworkType      string `json:"networkType" binding:"omitempty,oneof=nat_ipv4 nat_ipv4_ipv6 dedicated_ipv4 dedicated_ipv4_ipv6 ipv6_only no_port_mapping"` // 网络配置类型：nat_ipv4, nat_ipv4_ipv6, dedicated_ipv4, dedicated_ipv4_ipv6, ipv6_only, no_port_mapping
+	DefaultPortCount    int    `json:"defaultPortCount"`                                                                                                          // 每个实例默认映射端口数量，默认10
+	PortRangeStart      int    `json:"portRangeStart"`                                                                                                            // 端口映射范围起始，默认10000
+	PortRangeEnd        int    `json:"portRangeEnd"`                                                                                                              // 端口映射范围结束，默认65535
+	FixedPorts          []int  `json:"fixedPorts"`                                                                                                                // 固定实例内端口，22强制保留
+	NetworkType         string `json:"networkType" binding:"omitempty,oneof=nat_ipv4 nat_ipv4_ipv6 dedicated_ipv4 dedicated_ipv4_ipv6 ipv6_only no_port_mapping"` // 网络配置类型：nat_ipv4, nat_ipv4_ipv6, dedicated_ipv4, dedicated_ipv4_ipv6, ipv6_only, no_port_mapping
+	IPv6AddressFilePath string `json:"ipv6AddressFilePath"`                                                                                                       // 节点侧IPv6地址/CIDR文件路径
 	// Proxmox 网桥配置（NodeInstallType == "third_party" 时生效）
 	NodeInstallType   string `json:"nodeInstallType"`   // 节点安装类型：script（本项目脚本安装）, third_party（第三方安装）
 	BridgeNAT         string `json:"bridgeNAT"`         // NAT网桥（替代vmbr1），仅proxmox+third_party时生效
@@ -212,11 +213,12 @@ type UpdateProviderRequest struct {
 	// 操作执行配置
 	ExecutionRule string `json:"executionRule" binding:"omitempty,oneof=auto api_only ssh_only"` // 操作轮转规则
 	// 端口映射配置
-	DefaultPortCount int    `json:"defaultPortCount"`                                                                                                          // 每个实例默认映射端口数量，默认10
-	PortRangeStart   int    `json:"portRangeStart"`                                                                                                            // 端口映射范围起始，默认10000
-	PortRangeEnd     int    `json:"portRangeEnd"`                                                                                                              // 端口映射范围结束，默认65535
-	FixedPorts       []int  `json:"fixedPorts"`                                                                                                                // 固定实例内端口，22强制保留
-	NetworkType      string `json:"networkType" binding:"omitempty,oneof=nat_ipv4 nat_ipv4_ipv6 dedicated_ipv4 dedicated_ipv4_ipv6 ipv6_only no_port_mapping"` // 网络配置类型
+	DefaultPortCount    int    `json:"defaultPortCount"`                                                                                                          // 每个实例默认映射端口数量，默认10
+	PortRangeStart      int    `json:"portRangeStart"`                                                                                                            // 端口映射范围起始，默认10000
+	PortRangeEnd        int    `json:"portRangeEnd"`                                                                                                              // 端口映射范围结束，默认65535
+	FixedPorts          []int  `json:"fixedPorts"`                                                                                                                // 固定实例内端口，22强制保留
+	NetworkType         string `json:"networkType" binding:"omitempty,oneof=nat_ipv4 nat_ipv4_ipv6 dedicated_ipv4 dedicated_ipv4_ipv6 ipv6_only no_port_mapping"` // 网络配置类型
+	IPv6AddressFilePath string `json:"ipv6AddressFilePath"`                                                                                                       // 节点侧IPv6地址/CIDR文件路径；支持显式清空
 	// 带宽配置
 	DefaultInboundBandwidth  int `json:"defaultInboundBandwidth"`  // 默认入站带宽限制（Mbps）
 	DefaultOutboundBandwidth int `json:"defaultOutboundBandwidth"` // 默认出站带宽限制（Mbps）
@@ -414,6 +416,11 @@ type UpdateInstanceRequest struct {
 	Memory         int64           `json:"memory"`
 	Disk           int64           `json:"disk"`
 	Status         string          `json:"status"`
+	SSHHost        string          `json:"sshHost"`
+	SSHPort        int             `json:"sshPort"`
+	Username       string          `json:"username"`
+	Password       *string         `json:"password,omitempty"`
+	SSHKey         *string         `json:"sshKey,omitempty"`
 }
 
 type InstanceListRequest struct {
@@ -563,6 +570,10 @@ type CreatePortMappingRequest struct {
 	HostPort     int    `json:"hostPort"`                                              // 可选，不指定则自动分配，指定时作为起始端口
 	MappingType  string `json:"mappingType" binding:"omitempty,oneof=node controller"` // "node"（默认）或 "controller"（控制端转发）
 	InternalHost string `json:"internalHost"`                                          // 控制端转发目标地址（容器IP）
+	// IPv6Enabled is optional for backwards compatibility. NAT dual-stack
+	// providers default to both families; callers can explicitly set false
+	// when they intentionally need an IPv4-only mapping.
+	IPv6Enabled *bool `json:"ipv6Enabled,omitempty"`
 }
 
 // BatchDeletePortMappingRequest 批量删除端口映射请求（仅支持删除手动添加的端口）
@@ -666,6 +677,14 @@ type ExportRedemptionCodesRequest struct {
 type InstanceOperationTaskRequest struct {
 	InstanceId uint `json:"instanceId"`
 	ProviderId uint `json:"providerId"`
+	// Recovery is set only for the durable provider-reboot recovery workflow.
+	// It lets the task worker defer remote post-start work to one Provider-level
+	// reconciliation instead of repeating interface and address discovery for
+	// every guest in the recovered batch.
+	Recovery             bool   `json:"recovery,omitempty"`
+	RecoveryNode         string `json:"recoveryNode,omitempty"`
+	RecoveryInstanceID   string `json:"recoveryInstanceId,omitempty"`
+	RecoveryInstanceType string `json:"recoveryInstanceType,omitempty"`
 }
 
 // DeleteInstanceTaskRequest 删除实例任务数据结构
@@ -706,7 +725,7 @@ type DeletePortMappingTaskRequest struct {
 type SyncPortMappingsTaskRequest struct {
 	ProviderIDs     []uint `json:"providerIds,omitempty"`     // 指定要同步的Provider IDs（为空则同步所有）
 	DryRun          bool   `json:"dryRun,omitempty"`          // 仅生成预览，不创建同步任务
-	IncludedPortIDs []uint `json:"includedPortIds,omitempty"` // 预览后确认删除的端口ID；为空表示执行完整同步
+	IncludedPortIDs []uint `json:"includedPortIds,omitempty"` // 预览后确认删除的端口ID；执行同步时必填
 	ExcludedPortIDs []uint `json:"excludedPortIds,omitempty"` // 预览后取消勾选的端口ID
 }
 

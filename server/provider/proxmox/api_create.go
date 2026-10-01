@@ -18,6 +18,23 @@ import (
 	"go.uber.org/zap"
 )
 
+// proxmoxTemplateVolumeID returns the PVE storage-volume form accepted by the
+// LXC API for an OS template.  Passing the equivalent absolute path is only
+// permitted for root@pam and makes normal API tokens fail with
+// "Only root can pass arbitrary filesystem paths".
+func proxmoxTemplateVolumeID(storage, fileName string) string {
+	storage = strings.TrimSpace(storage)
+	fileName = strings.TrimSpace(fileName)
+	if storage == "" || fileName == "" || fileName == "." {
+		return ""
+	}
+	// The caller must provide a single file name, never a path or a volume ID.
+	if filepath.Base(fileName) != fileName || strings.ContainsAny(storage, "/:\\") || strings.ContainsAny(fileName, "/:\\") {
+		return ""
+	}
+	return fmt.Sprintf("%s:vztmpl/%s", storage, fileName)
+}
+
 // apiCreateContainer 通过API创建LXC容器
 func (p *ProxmoxProvider) apiCreateContainer(ctx context.Context, vmid int, config provider.InstanceConfig, updateProgress func(int, string)) error {
 	updateProgress(50, "通过API创建LXC容器...")
@@ -70,6 +87,17 @@ func (p *ProxmoxProvider) apiCreateContainer(ctx context.Context, vmid int, conf
 	if storage == "" {
 		storage = "local"
 	}
+	// The template is downloaded into Proxmox's local template cache above.
+	// API callers other than root@pam are not allowed to pass an arbitrary
+	// filesystem path as ostemplate (PVE::Storage::check_volume_access rejects
+	// it).  Use the storage volume form instead; it resolves to
+	// /var/lib/vz/template/cache/<fileName> for the local storage while still
+	// allowing the API token to have the normal Datastore permissions.
+	templateStorage := "local"
+	templateVolume := proxmoxTemplateVolumeID(templateStorage, fileName)
+	if templateVolume == "" {
+		return fmt.Errorf("生成容器模板卷标识失败")
+	}
 
 	// 转换参数格式
 	cpuFormatted := convertCPUFormat(config.CPU)
@@ -77,11 +105,17 @@ func (p *ProxmoxProvider) apiCreateContainer(ctx context.Context, vmid int, conf
 	diskFormatted := convertDiskFormat(config.Disk)
 
 	// 构造API请求创建容器
-	url := fmt.Sprintf("https://%s:8006/api2/json/nodes/%s/lxc", p.config.Host, p.node)
+	networkConfig := p.parseNetworkConfigFromInstanceConfig(config)
+	if err := p.preflightIPv6Create(ctx, config, networkConfig.NetworkType); err != nil {
+		return err
+	}
+
+	url := p.apiEndpoint(fmt.Sprintf("/api2/json/nodes/%s/lxc", p.nodeName()))
 
 	payload := map[string]interface{}{
 		"vmid":         vmid,
-		"ostemplate":   localImagePath,
+		"storage":      templateStorage,
+		"ostemplate":   templateVolume,
 		"cores":        cpuFormatted,
 		"memory":       memoryFormatted,
 		"swap":         "128",
@@ -92,72 +126,35 @@ func (p *ProxmoxProvider) apiCreateContainer(ctx context.Context, vmid int, conf
 		"unprivileged": "1",
 	}
 
+	// PVE holds the per-CT config lock for a short period after its create task
+	// reports completion.  Send the deterministic NAT IPv4 interface as part of
+	// that create request instead of immediately issuing a second /config PUT;
+	// on busy nodes the latter can time out despite a successfully created CT.
+	userIP := p.vmidToInternalIP(vmid)
+	netConfigStr := fmt.Sprintf("name=eth0,ip=%s/24,bridge=%s,gw=%s", userIP, p.getBridgeName("nat"), p.getInternalGateway())
+	if networkConfig.OutSpeed > 0 {
+		// Proxmox rate is MB/s while the controller configuration is Mbps.
+		rateMBps := networkConfig.OutSpeed / 8
+		if rateMBps < 1 {
+			rateMBps = 1
+		}
+		netConfigStr = fmt.Sprintf("%s,rate=%d", netConfigStr, rateMBps)
+	}
+	payload["net0"] = netConfigStr
+
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(jsonData)))
+	upid, err := p.submitProxmoxAPITask(ctx, http.MethodPost, url, jsonData)
 	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
+		return proxmoxAPICreateRequestError(vmid, fmt.Errorf("执行创建容器API请求失败: %w", err))
 	}
-	req.Header.Set("Content-Type", "application/json")
-	p.setAPIAuth(req)
-
-	resp, err := p.apiClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("执行API请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var respData map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&respData)
-		return fmt.Errorf("创建容器失败: status %d, response: %v", resp.StatusCode, respData)
-	}
-
-	updateProgress(70, "配置容器网络...")
-
-	// 解析网络配置获取带宽限制
-	networkConfig := p.parseNetworkConfigFromInstanceConfig(config)
-
-	// 配置网络（使用VMID到IP的映射函数，包含带宽限制）
-	userIP := p.vmidToInternalIP(vmid)
-	netConfigURL := fmt.Sprintf("https://%s:8006/api2/json/nodes/%s/lxc/%d/config", p.config.Host, p.node, vmid)
-
-	// 构建网络配置字符串，包含 rate 参数
-	netConfigStr := fmt.Sprintf("name=eth0,ip=%s/24,bridge=%s,gw=%s", userIP, p.getBridgeName("nat"), p.getInternalGateway())
-	if networkConfig.OutSpeed > 0 {
-		// Proxmox rate 参数单位为 MB/s，配置中的 OutSpeed 单位为 Mbps，需要转换：MB/s = Mbps ÷ 8
-		rateMBps := networkConfig.OutSpeed / 8
-		if rateMBps < 1 {
-			rateMBps = 1 // 最小1MB/s
+	if upid != "" {
+		if err := p.waitForProxmoxAPITask(ctx, upid, "创建容器"); err != nil {
+			return proxmoxAPICreateMutationError(vmid, err)
 		}
-		netConfigStr = fmt.Sprintf("%s,rate=%d", netConfigStr, rateMBps)
-	}
-
-	netPayload := map[string]interface{}{
-		"net0": netConfigStr,
-	}
-
-	netJsonData, err := json.Marshal(netPayload)
-	if err != nil {
-		global.APP_LOG.Warn("序列化网络配置失败", zap.Error(err))
-		return nil
-	}
-	netReq, err := http.NewRequestWithContext(ctx, "PUT", netConfigURL, strings.NewReader(string(netJsonData)))
-	if err != nil {
-		global.APP_LOG.Warn("创建网络配置请求失败", zap.Error(err))
-		return nil
-	}
-	netReq.Header.Set("Content-Type", "application/json")
-	p.setAPIAuth(netReq)
-
-	netResp, err := p.apiClient.Do(netReq)
-	if err != nil {
-		global.APP_LOG.Warn("配置容器网络失败", zap.Error(err))
-	} else {
-		netResp.Body.Close()
 	}
 
 	updateProgress(80, "启动容器...")
@@ -256,12 +253,14 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 
 	// 获取网络配置用于带宽限制与IPv6网卡判断
 	networkConfig := p.parseNetworkConfigFromInstanceConfig(config)
-	hasIPv6 := hasProxmoxIPv6(networkConfig.NetworkType)
+	if err := p.preflightIPv6Create(ctx, config, networkConfig.NetworkType); err != nil {
+		return err
+	}
 	var net1Bridge string
-	if hasIPv6 {
-		ipv6Mode, err := p.resolveProxmoxIPv6ModeForCreate(ctx)
+	if proxmoxVMUsesIPv6SecondNIC(networkConfig.NetworkType) {
+		ipv6Mode, err := p.resolveProxmoxIPv6ModeForConfig(ctx, config)
 		if err != nil {
-			if networkConfig.NetworkType == "ipv6_only" {
+			if networkConfig.NetworkType == "ipv6_only" || requestedProxmoxIPv6(config) != "" {
 				return fmt.Errorf("IPv6环境检查失败（ipv6_only模式要求IPv6环境）: %w", err)
 			}
 			global.APP_LOG.Warn("获取IPv6信息失败，将先创建单网卡虚拟机，后续网络配置会回退",
@@ -277,7 +276,7 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 	}
 
 	// 通过API创建虚拟机
-	url := fmt.Sprintf("https://%s:8006/api2/json/nodes/%s/qemu", p.config.Host, p.node)
+	url := p.apiEndpoint(fmt.Sprintf("/api2/json/nodes/%s/qemu", p.nodeName()))
 
 	// 根据 PVE 版本决定是否使用 fstrim_cloned_disks 参数
 	agentParam := "1"
@@ -319,23 +318,14 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 		return fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(jsonData)))
+	upid, err := p.submitProxmoxAPITask(ctx, http.MethodPost, url, jsonData)
 	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
+		return proxmoxAPICreateRequestError(vmid, fmt.Errorf("执行创建虚拟机API请求失败: %w", err))
 	}
-	req.Header.Set("Content-Type", "application/json")
-	p.setAPIAuth(req)
-
-	resp, err := p.apiClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("执行API请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var respData map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&respData)
-		return fmt.Errorf("创建虚拟机失败: status %d, response: %v", resp.StatusCode, respData)
+	if upid != "" {
+		if err := p.waitForProxmoxAPITask(ctx, upid, "创建虚拟机"); err != nil {
+			return proxmoxAPICreateMutationError(vmid, err)
+		}
 	}
 
 	updateProgress(60, "导入磁盘镜像...")
@@ -344,14 +334,14 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 	if systemArch == "aarch64" || systemArch == "armv7l" || systemArch == "armv8" || systemArch == "armv8l" {
 		_, err = p.sshClient.Execute(fmt.Sprintf("qm set %d --bios ovmf", vmid))
 		if err != nil {
-			global.APP_LOG.Warn("设置ARM BIOS失败", zap.Error(err))
+			return fmt.Errorf("设置ARM BIOS失败: %w", err)
 		}
 	}
 
-	importCmd := fmt.Sprintf("qm importdisk %d %s %s", vmid, localImagePath, storage)
+	importCmd := fmt.Sprintf("qm importdisk %d %s %s", vmid, shellSingleQuote(localImagePath), shellSingleQuote(storage))
 	_, err = p.sshClient.Execute(importCmd)
 	if err != nil {
-		return fmt.Errorf("导入磁盘失败: %w", err)
+		return proxmoxAPICreateMutationError(vmid, fmt.Errorf("导入磁盘失败: %w", err))
 	}
 
 	updateProgress(70, "配置虚拟机磁盘和启动...")
@@ -361,28 +351,45 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 	time.Sleep(p.waitScale(3 * time.Second))
 
 	// 查找并设置磁盘
-	findDiskCmd := fmt.Sprintf("pvesm list %s | awk -v vmid=\"%d\" '$5 == vmid && $1 ~ /\\.raw$/ {print $1}' | tail -n 1", storage, vmid)
-	diskOutput, _ := p.sshClient.Execute(findDiskCmd)
+	findDiskCmd := fmt.Sprintf("pvesm list %s | awk -v vmid=\"%d\" '$5 == vmid && $1 ~ /\\.raw$/ {print $1}' | tail -n 1", shellSingleQuote(storage), vmid)
+	diskOutput, findErr := p.sshClient.Execute(findDiskCmd)
+	if findErr != nil {
+		return proxmoxAPICreateMutationError(vmid, fmt.Errorf("查找导入磁盘失败: %w", findErr))
+	}
 	volid := strings.TrimSpace(diskOutput)
 
 	if volid == "" {
-		findDiskCmd = fmt.Sprintf("pvesm list %s | awk -v vmid=\"%d\" '$5 == vmid {print $1}' | tail -n 1", storage, vmid)
-		diskOutput, _ = p.sshClient.Execute(findDiskCmd)
+		findDiskCmd = fmt.Sprintf("pvesm list %s | awk -v vmid=\"%d\" '$5 == vmid {print $1}' | tail -n 1", shellSingleQuote(storage), vmid)
+		diskOutput, findErr = p.sshClient.Execute(findDiskCmd)
+		if findErr != nil {
+			return proxmoxAPICreateMutationError(vmid, fmt.Errorf("查找导入磁盘失败: %w", findErr))
+		}
 		volid = strings.TrimSpace(diskOutput)
 	}
 
-	if volid != "" {
-		_, _ = p.sshClient.Execute(fmt.Sprintf("qm set %d --scsihw virtio-scsi-pci --scsi0 %s", vmid, volid))
+	if volid == "" {
+		return proxmoxAPICreateMutationError(vmid, fmt.Errorf("找不到VM %d导入的磁盘卷", vmid))
+	}
+	if _, err = p.sshClient.Execute(fmt.Sprintf("qm set %d --scsihw virtio-scsi-pci --scsi0 %s", vmid, shellSingleQuote(volid))); err != nil {
+		return proxmoxAPICreateMutationError(vmid, fmt.Errorf("设置VM磁盘失败: %w", err))
 	}
 
-	_, _ = p.sshClient.Execute(fmt.Sprintf("qm set %d --bootdisk scsi0", vmid))
-	_, _ = p.sshClient.Execute(fmt.Sprintf("qm set %d --boot order=scsi0", vmid))
+	if _, err = p.sshClient.Execute(fmt.Sprintf("qm set %d --bootdisk scsi0", vmid)); err != nil {
+		return proxmoxAPICreateMutationError(vmid, fmt.Errorf("设置VM启动磁盘失败: %w", err))
+	}
+	if _, err = p.sshClient.Execute(fmt.Sprintf("qm set %d --boot order=scsi0", vmid)); err != nil {
+		return proxmoxAPICreateMutationError(vmid, fmt.Errorf("设置VM启动顺序失败: %w", err))
+	}
 
 	// 配置云初始化
 	if systemArch == "aarch64" || systemArch == "armv7l" || systemArch == "armv8" || systemArch == "armv8l" {
-		_, _ = p.sshClient.Execute(fmt.Sprintf("qm set %d --scsi1 %s:cloudinit", vmid, storage))
+		if _, err = p.sshClient.Execute(fmt.Sprintf("qm set %d --scsi1 %s", vmid, shellSingleQuote(fmt.Sprintf("%s:cloudinit", storage)))); err != nil {
+			return proxmoxAPICreateMutationError(vmid, fmt.Errorf("设置ARM云初始化磁盘失败: %w", err))
+		}
 	} else {
-		_, _ = p.sshClient.Execute(fmt.Sprintf("qm set %d --ide1 %s:cloudinit", vmid, storage))
+		if _, err = p.sshClient.Execute(fmt.Sprintf("qm set %d --ide1 %s", vmid, shellSingleQuote(fmt.Sprintf("%s:cloudinit", storage)))); err != nil {
+			return proxmoxAPICreateMutationError(vmid, fmt.Errorf("设置云初始化磁盘失败: %w", err))
+		}
 	}
 
 	// 调整磁盘大小
@@ -398,7 +405,10 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 		if targetDiskGB > 0 {
 			// 获取当前磁盘大小
 			getCurrentSizeCmd := fmt.Sprintf("qm config %d | grep 'scsi0' | awk -F'size=' '{print $2}' | awk '{print $1}'", vmid)
-			currentSizeOutput, _ := p.sshClient.Execute(getCurrentSizeCmd)
+			currentSizeOutput, currentSizeErr := p.sshClient.Execute(getCurrentSizeCmd)
+			if currentSizeErr != nil {
+				return proxmoxAPICreateMutationError(vmid, fmt.Errorf("读取VM当前磁盘大小失败: %w", currentSizeErr))
+			}
 			currentSize := strings.TrimSpace(currentSizeOutput)
 
 			shouldResize := true
@@ -426,7 +436,7 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 			}
 
 			if shouldResize {
-				resizeCmd := fmt.Sprintf("qm resize %d scsi0 %sG", vmid, diskFormatted)
+				resizeCmd := fmt.Sprintf("qm resize %d scsi0 %s", vmid, shellSingleQuote(diskFormatted+"G"))
 				_, err := p.sshClient.Execute(resizeCmd)
 				if err != nil {
 					// 尝试以MB为单位重试
@@ -434,7 +444,7 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 					resizeCmd = fmt.Sprintf("qm resize %d scsi0 %dM", vmid, diskMB)
 					_, err = p.sshClient.Execute(resizeCmd)
 					if err != nil {
-						global.APP_LOG.Warn("调整磁盘大小失败", zap.Int("vmid", vmid), zap.Error(err))
+						return proxmoxAPICreateMutationError(vmid, fmt.Errorf("调整VM磁盘大小失败: %w", err))
 					}
 				}
 			}
@@ -443,7 +453,9 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 
 	// 配置IP（使用VMID到IP的映射函数）
 	userIP := p.vmidToInternalIP(vmid)
-	_, _ = p.sshClient.Execute(fmt.Sprintf("qm set %d --ipconfig0 ip=%s/24,gw=%s", vmid, userIP, p.getInternalGateway()))
+	if _, err = p.sshClient.Execute(fmt.Sprintf("qm set %d --ipconfig0 %s", vmid, shellSingleQuote(fmt.Sprintf("ip=%s/24,gw=%s", userIP, p.getInternalGateway())))); err != nil {
+		return proxmoxAPICreateMutationError(vmid, fmt.Errorf("设置VM IPv4网络配置失败: %w", err))
+	}
 
 	updateProgress(80, "虚拟机配置完成...")
 
@@ -452,8 +464,7 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 	startCmd := fmt.Sprintf("qm start %d", vmid)
 	_, err = p.sshClient.Execute(startCmd)
 	if err != nil {
-		global.APP_LOG.Warn("启动虚拟机失败", zap.Int("vmid", vmid), zap.Error(err))
-		// 不返回错误，继续流程
+		return fmt.Errorf("启动虚拟机失败: %w", err)
 	} else {
 		updateProgress(90, "等待虚拟机启动...")
 
@@ -477,9 +488,11 @@ func (p *ProxmoxProvider) apiCreateVM(ctx context.Context, vmid int, config prov
 		}
 
 		if !vmRunning {
-			global.APP_LOG.Warn("虚拟机启动超时",
-				zap.Int("vmid", vmid),
-				zap.Duration("elapsed", time.Since(startTime)))
+			statusOutput, statusErr := p.sshClient.Execute(fmt.Sprintf("qm status %d", vmid))
+			if statusErr != nil {
+				return fmt.Errorf("等待虚拟机 %d 启动超时（最后状态查询失败: %v）", vmid, statusErr)
+			}
+			return fmt.Errorf("等待虚拟机 %d 启动超时（最后状态: %s）", vmid, strings.TrimSpace(statusOutput))
 		}
 
 		updateProgress(95, "检测Guest Agent...")

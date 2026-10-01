@@ -20,7 +20,7 @@ func (p *ProxmoxProvider) sshCreateInstance(ctx context.Context, config provider
 
 func (p *ProxmoxProvider) sshCreateInstanceWithProgress(ctx context.Context, config provider.InstanceConfig, progressCallback provider.ProgressCallback) error {
 	global.APP_LOG.Debug("开始在Proxmox节点上创建实例（使用SSH）",
-		zap.String("node", p.node),
+		zap.String("node", p.nodeName()),
 		zap.String("host", utils.TruncateString(p.config.Host, 32)),
 		zap.String("instance_name", config.Name),
 		zap.String("instance_type", config.InstanceType))
@@ -80,14 +80,24 @@ func (p *ProxmoxProvider) sshCreateInstanceWithProgress(ctx context.Context, con
 
 	updateProgress(90, "配置网络和启动...")
 
-	// 配置网络
-	if err := p.configureInstanceNetwork(ctx, vmid, config); err != nil {
-		global.APP_LOG.Warn("网络配置失败", zap.Int("vmid", vmid), zap.Error(err))
+	// createContainer/createVM already include the complete NAT IPv4
+	// configuration.  Avoid issuing an immediate second mutation while PVE may
+	// still hold the per-guest config lock; non-NAT modes retain their required
+	// IPv6/dedicated follow-up configuration.
+	networkConfig := p.parseNetworkConfigFromInstanceConfig(config)
+	if proxmoxNeedsPostCreateNetworkConfig(networkConfig.NetworkType) {
+		if err := p.configureInstanceNetwork(ctx, vmid, config); err != nil {
+			return fmt.Errorf("配置实例网络失败: %w", err)
+		}
+	} else {
+		global.APP_LOG.Debug("普通NAT IPv4网络已在创建命令中配置，跳过重复网络变更",
+			zap.Int("vmid", vmid))
 	}
 
-	// 启动实例
-	if err := p.sshStartInstance(ctx, fmt.Sprintf("%d", vmid)); err != nil {
-		global.APP_LOG.Warn("启动实例失败", zap.Int("vmid", vmid), zap.Error(err))
+	// 创建命令已经返回了唯一 VMID 和类型。直接按已知实例启动并确认
+	// running，避免 pct/qm list 尚未刷新时误报创建成功。
+	if err := p.sshStartKnownInstance(ctx, fmt.Sprintf("%d", vmid), config.InstanceType); err != nil {
+		return fmt.Errorf("启动已创建实例失败: %w", err)
 	}
 
 	// 虚拟机和容器的带宽限制已在创建时通过 rate 参数配置
@@ -95,14 +105,13 @@ func (p *ProxmoxProvider) sshCreateInstanceWithProgress(ctx context.Context, con
 	// 配置端口映射 - 在实例启动后配置
 	updateProgress(91, "配置端口映射...")
 	if err := p.configureInstancePortMappings(ctx, config, vmid); err != nil {
-		global.APP_LOG.Warn("配置端口映射失败", zap.Error(err))
+		return fmt.Errorf("配置端口映射失败: %w", err)
 	}
 
 	// 配置SSH密码 - 在实例启动后，使用vmid而不是实例名称
 	updateProgress(92, "配置SSH密码...")
 	if err := p.configureInstanceSSHPasswordByVMID(ctx, vmid, config); err != nil {
-		// SSH密码设置失败也不应该阻止实例创建，记录错误即可
-		global.APP_LOG.Warn("配置SSH密码失败", zap.Error(err))
+		return fmt.Errorf("配置SSH密码失败: %w", err)
 	}
 
 	// 初始化流量监控（仅当 provider 启用流量统计时才生效）
@@ -122,6 +131,7 @@ func (p *ProxmoxProvider) sshCreateInstanceWithProgress(ctx context.Context, con
 			zap.String("name", config.Name),
 			zap.Error(err))
 	}
+	p.persistCreatedRuntimeID(config.Name, vmid)
 
 	updateProgress(100, "Proxmox实例创建完成")
 
@@ -184,7 +194,7 @@ func (p *ProxmoxProvider) createContainer(ctx context.Context, vmid int, config 
 			tmpPath := localImagePath + ".tmp"
 			output, err := p.downloadRemoteFileWithFallback(downloadURL, systemConfig.ImageURL, tmpPath, localImagePath, 30*time.Minute)
 			if err != nil {
-				p.sshClient.Execute(fmt.Sprintf("rm -f %s", tmpPath))
+				p.sshClient.Execute(fmt.Sprintf("rm -f %s", shellSingleQuote(tmpPath)))
 				return nil, fmt.Errorf("下载镜像失败: %s: %w", utils.TruncateString(output, 300), err)
 			}
 			global.APP_LOG.Debug("容器镜像下载完成",
@@ -198,6 +208,13 @@ func (p *ProxmoxProvider) createContainer(ctx context.Context, vmid int, config 
 	}
 
 	updateProgress(50, "创建LXC容器...")
+
+	// Do the required routed/native IPv6 check before pct create. A failed
+	// network setup must never leave an unusable half-created container.
+	networkConfig := p.parseNetworkConfigFromInstanceConfig(config)
+	if err := p.preflightIPv6Create(ctx, config, networkConfig.NetworkType); err != nil {
+		return err
+	}
 
 	// 获取存储盘配置 - 从数据库查询Provider记录
 	var providerRecord providerModel.Provider
@@ -222,14 +239,13 @@ func (p *ProxmoxProvider) createContainer(ctx context.Context, vmid int, config 
 
 	// 构建容器创建命令
 	createCmd := fmt.Sprintf(
-		"pct create %d %s -cores %s -memory %s -swap 128 -rootfs %s:%s -onboot 1 -features nesting=1 -hostname %s",
+		"pct create %d %s -cores %s -memory %s -swap 128 -rootfs %s -onboot 1 -features nesting=1 -hostname %s",
 		vmid,
-		localImagePath,
-		cpuFormatted,
-		memoryFormatted,
-		storage,
-		diskFormatted,
-		config.Name,
+		shellSingleQuote(localImagePath),
+		shellSingleQuote(cpuFormatted),
+		shellSingleQuote(memoryFormatted),
+		shellSingleQuote(fmt.Sprintf("%s:%s", storage, diskFormatted)),
+		shellSingleQuote(config.Name),
 	)
 
 	global.APP_LOG.Debug("执行容器创建命令", zap.String("command", createCmd))
@@ -243,7 +259,6 @@ func (p *ProxmoxProvider) createContainer(ctx context.Context, vmid int, config 
 
 	// 配置网络（使用VMID到IP的映射函数，充分利用IP地址空间）
 	// 使用 Proxmox 原生的 rate 参数限制带宽
-	networkConfig := p.parseNetworkConfigFromInstanceConfig(config)
 	userIP := p.vmidToInternalIP(vmid)
 	netConfigStr := fmt.Sprintf("name=eth0,ip=%s/24,bridge=%s,gw=%s", userIP, p.getBridgeName("nat"), p.getInternalGateway())
 
@@ -255,7 +270,7 @@ func (p *ProxmoxProvider) createContainer(ctx context.Context, vmid int, config 
 			rateMBps = 1 // 最小1MB/s
 		}
 		netConfigStrWithRate := fmt.Sprintf("%s,rate=%d", netConfigStr, rateMBps)
-		netCmd := fmt.Sprintf("pct set %d --net0 %s", vmid, netConfigStrWithRate)
+		netCmd := fmt.Sprintf("pct set %d --net0 %s", vmid, shellSingleQuote(netConfigStrWithRate))
 		_, err = p.sshClient.Execute(netCmd)
 		if err != nil {
 			// 带rate参数失败，fallback到不带rate的配置
@@ -264,27 +279,24 @@ func (p *ProxmoxProvider) createContainer(ctx context.Context, vmid int, config 
 				zap.Int("rateMBps", rateMBps),
 				zap.Error(err))
 
-			netCmd = fmt.Sprintf("pct set %d --net0 %s", vmid, netConfigStr)
+			netCmd = fmt.Sprintf("pct set %d --net0 %s", vmid, shellSingleQuote(netConfigStr))
 			_, err = p.sshClient.Execute(netCmd)
 			if err != nil {
-				global.APP_LOG.Warn("容器网络配置失败", zap.Int("vmid", vmid), zap.Error(err))
+				return fmt.Errorf("配置容器网络失败: %w", err)
 			}
 		}
 	} else {
 		// 不需要rate限速，直接配置
-		netCmd := fmt.Sprintf("pct set %d --net0 %s", vmid, netConfigStr)
+		netCmd := fmt.Sprintf("pct set %d --net0 %s", vmid, shellSingleQuote(netConfigStr))
 		_, err = p.sshClient.Execute(netCmd)
 		if err != nil {
-			global.APP_LOG.Warn("容器网络配置失败", zap.Int("vmid", vmid), zap.Error(err))
+			return fmt.Errorf("配置容器网络失败: %w", err)
 		}
 	}
 
 	updateProgress(80, "启动容器...")
-	time.Sleep(p.waitScale(3 * time.Second))
-	// 启动容器
-	_, err = p.sshClient.Execute(fmt.Sprintf("pct start %d", vmid))
-	if err != nil {
-		global.APP_LOG.Warn("容器启动失败", zap.Int("vmid", vmid), zap.Error(err))
+	if err := p.sshStartKnownInstance(ctx, fmt.Sprintf("%d", vmid), "container"); err != nil {
+		return fmt.Errorf("启动容器失败: %w", err)
 	}
 
 	// 等待容器启动

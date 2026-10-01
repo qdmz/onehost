@@ -8,10 +8,12 @@ run_module_19() {
 
     local speedtest_instance_id="${TEST_INSTANCE_ID:-}"
     if [[ -z "$speedtest_instance_id" || -z "$PROVIDER_ID" ]]; then
+        record_skip_result "Speedtest prerequisites" "HARNESS" "module-19" "No instance or provider from prerequisite modules" "$group"
         chain_break "$group" "No instance or provider"
         return 0
     fi
     if ! ensure_test_instance_available "$ADMIN_TOKEN" "$speedtest_instance_id" "speedtest instance"; then
+        record_skip_result "Speedtest prerequisites" "HARNESS" "module-19" "Test instance is no longer available" "$group"
         chain_break "$group" "Test instance is no longer available"
         return 0
     fi
@@ -21,7 +23,7 @@ run_module_19() {
         "/api/v1/admin/traffic/overview" "200" "" "$group" "$ADMIN_TOKEN")
 
     # -- Deploy monitoring agent if not done --
-    test_api "Ensure monitoring agent" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/monitoring/agent" "200|400|409|500" \
+    test_api "Ensure monitoring agent" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/monitoring/agent" "200|infra" \
         '{"action":"deploy"}' "$group" "$ADMIN_TOKEN"
 
     # -- Start traffic monitoring --
@@ -33,7 +35,7 @@ run_module_19() {
         "${SERVER_URL}/api/v1/admin/instances/${speedtest_instance_id}" 2>/dev/null | jq -r '.data.status // empty' 2>/dev/null)
     if [[ "$inst_status" == "running" || "$inst_status" == "stopped" ]]; then
         local action_resp; action_resp=$(test_api "Speedtest instance action" "POST" \
-            "/api/v1/admin/instances/${speedtest_instance_id}/action" "200|400|404|409|500" \
+            "/api/v1/admin/instances/${speedtest_instance_id}/action" "200|infra" \
             '{"action":"restart"}' "$group" "$ADMIN_TOKEN")
         wait_instance_operation_settled "$speedtest_instance_id" "$action_resp" "running" "speedtest restart ${speedtest_instance_id}" "$ADMIN_TOKEN" "$INSTANCE_TASK_MAX_WAIT" 10 "$group" || true
     else

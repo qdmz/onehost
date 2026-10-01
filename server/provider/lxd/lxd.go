@@ -3,6 +3,7 @@ package lxd
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"oneclickvirt/global"
+	providerModel "oneclickvirt/model/provider"
 	"oneclickvirt/provider"
 	"oneclickvirt/provider/health"
 	"oneclickvirt/utils"
@@ -27,6 +29,7 @@ type LXDProvider struct {
 	transport        *http.Transport
 	providerID       uint // 存储providerID用于清理
 	connected        bool
+	apiHealthy       bool // API-only mode has no SSH executor to represent liveness.
 	healthChecker    health.HealthChecker
 	version          string             // LXD 版本
 	mu               sync.RWMutex       // 保护并发访问
@@ -67,6 +70,14 @@ func (l *LXDProvider) GetSupportedInstanceTypes() []string {
 func (l *LXDProvider) Connect(ctx context.Context, config provider.NodeConfig) error {
 	l.config = config
 	l.providerID = config.ID // 存储providerID
+	l.connected = false
+	l.apiHealthy = false
+	l.sshClient.ClearExecutor()
+	if l.transport != nil {
+		// A failed reconnect must not retain a certificate from a previous
+		// configuration and accidentally keep API mode enabled.
+		l.transport.TLSClientConfig = nil
+	}
 
 	// Transport 已在 NewLXDProvider 中创建，现在关联providerID
 	if l.transport != nil && l.providerID > 0 {
@@ -95,6 +106,20 @@ func (l *LXDProvider) Connect(ctx context.Context, config provider.NodeConfig) e
 	} else {
 		global.APP_LOG.Debug("未找到LXD证书配置，仅使用SSH",
 			zap.String("host", utils.TruncateString(config.Host, 50)))
+	}
+
+	if strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+		if !l.hasAPIAccess() {
+			return fmt.Errorf("LXD执行规则为api_only，但未配置有效mTLS证书")
+		}
+		if err := l.probeAPIConnection(ctx); err != nil {
+			return fmt.Errorf("LXD API连接失败: %w", err)
+		}
+		l.connected = true
+		l.apiHealthy = true
+		l.healthChecker = l.newAPIOnlyHealthChecker()
+		global.APP_LOG.Info("LXD provider API-only连接成功", zap.String("host", utils.TruncateString(config.Host, 50)))
+		return nil
 	}
 
 	// 设置SSH超时配置
@@ -133,7 +158,7 @@ func (l *LXDProvider) Connect(ctx context.Context, config provider.NodeConfig) e
 		Username:      config.Username,
 		Password:      config.Password,
 		PrivateKey:    config.PrivateKey,
-		APIEnabled:    config.CertPath != "" && config.KeyPath != "",
+		APIEnabled:    l.hasAPIAccess(),
 		APIPort:       8443,
 		APIScheme:     "https",
 		SSHEnabled:    true,
@@ -164,8 +189,29 @@ func (l *LXDProvider) Connect(ctx context.Context, config provider.NodeConfig) e
 func (l *LXDProvider) ConnectAgent(executor utils.ShellExecutor, config provider.NodeConfig) error {
 	l.config = config
 	l.providerID = config.ID
+	l.connected = false
+	l.apiHealthy = false
+	if l.transport != nil {
+		// Preserve mTLS for an API-only Agent provider; ordinary Agent mode does
+		// not use the API transport and clears any stale TLS config.
+		if !strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+			l.transport.TLSClientConfig = nil
+		}
+	}
 	if l.transport != nil && l.providerID > 0 {
 		provider.GetTransportCleanupManager().RegisterTransportWithProvider(l.transport, l.providerID)
+	}
+	if strings.EqualFold(strings.TrimSpace(config.ExecutionRule), "api_only") {
+		if !l.hasAPIAccess() {
+			return fmt.Errorf("LXD Agent+api_only未配置有效mTLS证书")
+		}
+		if err := l.probeAPIConnection(context.Background()); err != nil {
+			return fmt.Errorf("LXD Agent+api_only API连接失败: %w", err)
+		}
+		l.connected = true
+		l.apiHealthy = true
+		l.healthChecker = l.newAPIOnlyHealthChecker()
+		return nil
 	}
 	l.sshClient.SetExecutor(executor)
 	l.connected = true
@@ -253,15 +299,31 @@ func (l *LXDProvider) Disconnect(ctx context.Context) error {
 	l.transport = nil
 
 	l.connected = false
+	l.apiHealthy = false
 	return nil
 }
 
 func (l *LXDProvider) IsConnected() bool {
+	if strings.EqualFold(strings.TrimSpace(l.config.ExecutionRule), "api_only") {
+		return l.connected && l.apiHealthy
+	}
 	return l.connected && l.sshClient.HasExecutor() && l.sshClient.IsHealthy()
 }
 
 // EnsureConnection 确保SSH连接可用，如果连接不健康则尝试重连
 func (l *LXDProvider) EnsureConnection() error {
+	if strings.EqualFold(strings.TrimSpace(l.config.ExecutionRule), "api_only") {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := l.probeAPIConnection(ctx); err != nil {
+			l.connected = false
+			l.apiHealthy = false
+			return fmt.Errorf("LXD API重连失败: %w", err)
+		}
+		l.connected = true
+		l.apiHealthy = true
+		return nil
+	}
 	if !l.sshClient.HasExecutor() {
 		return fmt.Errorf("SSH client not initialized")
 	}
@@ -289,6 +351,19 @@ func (l *LXDProvider) EnsureConnection() error {
 }
 
 func (l *LXDProvider) HealthCheck(ctx context.Context) (*health.HealthResult, error) {
+	if strings.EqualFold(strings.TrimSpace(l.config.ExecutionRule), "api_only") {
+		if l.healthChecker == nil {
+			return nil, fmt.Errorf("LXD API-only健康检查器未初始化")
+		}
+		result, err := l.healthChecker.CheckHealth(ctx)
+		if err == nil {
+			l.apiHealthy = result.APIStatus == "online"
+			l.connected = l.apiHealthy
+		} else {
+			l.apiHealthy = false
+		}
+		return result, err
+	}
 	if l.healthChecker == nil {
 		if !l.sshClient.HasExecutor() {
 			return nil, fmt.Errorf("health checker not initialized")
@@ -348,14 +423,22 @@ func (l *LXDProvider) CreateInstance(ctx context.Context, config provider.Instan
 		return fmt.Errorf("not connected")
 	}
 
+	forceSSHIPv6 := requiresSSHIPv6Network(config, l.config.ID)
+	if forceSSHIPv6 && !l.shouldUseSSH() {
+		return fmt.Errorf("LXD控制面IPv6网络配置当前需要SSH路径，api_only无法安全配置IPv6地址和端口映射")
+	}
 	// 根据执行规则判断使用哪种方式
 	forceSSHInstaller := l.shouldUseWindowsInstallerSSH(ctx, &config)
-	if l.shouldUseAPI() && !forceSSHInstaller {
+	if l.shouldUseAPI() && !forceSSHInstaller && !forceSSHIPv6 {
 		if err := l.apiCreateInstance(ctx, config); err == nil {
 			global.APP_LOG.Debug("LXD API调用成功 - 创建实例", zap.String("name", utils.TruncateString(config.Name, 50)))
 			return nil
 		} else {
 			global.APP_LOG.Warn("LXD API失败", zap.Error(err))
+			var committedErr *apiCreateCommittedError
+			if errors.As(err, &committedErr) {
+				return err
+			}
 
 			if fallbackErr := l.ensureSSHBeforeFallback(err, "创建实例"); fallbackErr != nil {
 				return fallbackErr
@@ -377,14 +460,22 @@ func (l *LXDProvider) CreateInstanceWithProgress(ctx context.Context, config pro
 		return fmt.Errorf("not connected")
 	}
 
+	forceSSHIPv6 := requiresSSHIPv6Network(config, l.config.ID)
+	if forceSSHIPv6 && !l.shouldUseSSH() {
+		return fmt.Errorf("LXD控制面IPv6网络配置当前需要SSH路径，api_only无法安全配置IPv6地址和端口映射")
+	}
 	// 根据执行规则判断使用哪种方式
 	forceSSHInstaller := l.shouldUseWindowsInstallerSSH(ctx, &config)
-	if l.shouldUseAPI() && !forceSSHInstaller {
+	if l.shouldUseAPI() && !forceSSHInstaller && !forceSSHIPv6 {
 		if err := l.apiCreateInstanceWithProgress(ctx, config, progressCallback); err == nil {
 			global.APP_LOG.Debug("LXD API调用成功 - 创建实例", zap.String("name", utils.TruncateString(config.Name, 50)))
 			return nil
 		} else {
 			global.APP_LOG.Warn("LXD API失败", zap.Error(err))
+			var committedErr *apiCreateCommittedError
+			if errors.As(err, &committedErr) {
+				return err
+			}
 
 			if fallbackErr := l.ensureSSHBeforeFallback(err, "创建实例"); fallbackErr != nil {
 				return fallbackErr
@@ -399,6 +490,29 @@ func (l *LXDProvider) CreateInstanceWithProgress(ctx context.Context, config pro
 
 	// SSH 方式
 	return l.sshCreateInstanceWithProgress(ctx, config, progressCallback)
+}
+
+func hasRequestedStaticIPv6(config provider.InstanceConfig) bool {
+	return config.Metadata != nil && strings.TrimSpace(config.Metadata["static_ipv6"]) != ""
+}
+
+func requiresSSHIPv6Network(config provider.InstanceConfig, providerID uint) bool {
+	networkType := ""
+	if config.Metadata != nil {
+		networkType = strings.TrimSpace(config.Metadata["network_type"])
+	}
+	if networkType == "" && global.APP_DB != nil && providerID > 0 {
+		var providerConfig providerModel.Provider
+		if err := global.APP_DB.Select("network_type").First(&providerConfig, providerID).Error; err == nil {
+			networkType = strings.TrimSpace(providerConfig.NetworkType)
+		}
+	}
+	switch networkType {
+	case "nat_ipv4_ipv6", "dedicated_ipv4_ipv6", "ipv6_only":
+		return true
+	default:
+		return hasRequestedStaticIPv6(config)
+	}
 }
 
 func (l *LXDProvider) StartInstance(ctx context.Context, id string) error {
@@ -488,6 +602,12 @@ func (l *LXDProvider) RestartInstance(ctx context.Context, id string) error {
 func (l *LXDProvider) DeleteInstance(ctx context.Context, id string) error {
 	if !l.connected {
 		return fmt.Errorf("not connected")
+	}
+
+	// Host firewall rules survive removal of the LXD instance. Clean them while
+	// the controller still has the instance IP and guest-port mapping.
+	if err := l.cleanupInstancePortMappings(ctx, id); err != nil {
+		return fmt.Errorf("删除LXD实例前清理端口映射失败: %w", err)
 	}
 
 	// 根据执行规则判断使用哪种方式
@@ -597,7 +717,7 @@ func (l *LXDProvider) ExecuteSSHCommand(ctx context.Context, command string) (st
 
 // 检查是否有 API 访问权限
 func (l *LXDProvider) hasAPIAccess() bool {
-	return l.config.CertPath != "" && l.config.KeyPath != ""
+	return l.transport != nil && l.transport.TLSClientConfig != nil
 }
 
 // shouldUseAPI 根据执行规则判断是否应该使用API
@@ -666,12 +786,30 @@ func (l *LXDProvider) ensureSSHBeforeFallback(apiErr error, operation string) er
 
 // SetupPortMappingWithIP 公开的方法：在远程服务器上创建端口映射（用于手动添加端口）
 func (l *LXDProvider) SetupPortMappingWithIP(ctx context.Context, instanceName string, hostPort, guestPort int, protocol, method, instanceIP string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(l.config.ExecutionRule), "api_only") {
+		port := providerModel.Port{HostPort: hostPort, GuestPort: guestPort, Protocol: protocol, MappingMethod: method}
+		if strings.Contains(instanceIP, ":") {
+			port.IPv6Enabled, port.IPv6Address = true, instanceIP
+		}
+		return l.ConfigurePortMappingsAPI(ctx, instanceName, []providerModel.Port{port})
+	}
 	return l.setupPortMappingWithIP(instanceName, hostPort, guestPort, protocol, method, instanceIP)
 }
 
 // RemovePortMapping 公开的方法：从远程服务器上删除端口映射（用于手动删除端口）
 func (l *LXDProvider) RemovePortMapping(instanceName string, hostPort int, protocol string, method string) error {
 	return l.removePortMapping(instanceName, hostPort, protocol, method)
+}
+
+// RemovePortMappingWithDetails removes a mapping when the controller already
+// has the guest and range information. This is used by cleanup tasks after a
+// port row or its instance has been soft-deleted and therefore cannot be
+// recovered by a normal database lookup.
+func (l *LXDProvider) RemovePortMappingWithDetails(instanceName string, hostPort, guestPort, hostPortEnd, guestPortEnd, portCount int, protocol, method, instanceIP string) error {
+	return l.removePortMappingWithRange(instanceName, hostPort, guestPort, hostPortEnd, guestPortEnd, portCount, protocol, method, instanceIP)
 }
 
 func init() {

@@ -5,15 +5,14 @@ import (
 	adminModel "oneclickvirt/model/admin"
 	authModel "oneclickvirt/model/auth"
 	checkinModel "oneclickvirt/model/checkin"
-	"oneclickvirt/model/config"
 	domainModel "oneclickvirt/model/domain"
 	firewallModel "oneclickvirt/model/firewall"
 	kycModel "oneclickvirt/model/kyc"
 	monitoringModel "oneclickvirt/model/monitoring"
 	oauth2Model "oneclickvirt/model/oauth2"
 	permissionModel "oneclickvirt/model/permission"
-	productModel "oneclickvirt/model/product"
 	providerModel "oneclickvirt/model/provider"
+	productModel "oneclickvirt/model/product"
 	resourceModel "oneclickvirt/model/resource"
 	systemModel "oneclickvirt/model/system"
 	userModel "oneclickvirt/model/user"
@@ -28,29 +27,19 @@ import (
 // Gorm 初始化数据库并产生数据库全局变量
 // 使用DatabaseManager实现连接管理、自动重连和心跳检测
 func Gorm() *gorm.DB {
-	dbType := global.GetAppConfig().System.DbType
+	snapshot := global.GetAppConfig()
+	dbType := snapshot.System.DbType
 	if dbType == "" {
 		dbType = "mysql"
 	}
 
 	// 获取数据库管理器
 	dbManager := GetDatabaseManager()
+	previousDB := global.APP_DB
+	managedPreviousDB := dbManager.GetDB()
 
 	// 初始化数据库连接（包含自动重连和心跳检测）
-	mysqlConfig := config.MysqlConfig{
-		Path:         global.GetAppConfig().Mysql.Path,
-		Port:         global.GetAppConfig().Mysql.Port,
-		Config:       global.GetAppConfig().Mysql.Config,
-		Dbname:       global.GetAppConfig().Mysql.Dbname,
-		Username:     global.GetAppConfig().Mysql.Username,
-		Password:     global.GetAppConfig().Mysql.Password,
-		MaxIdleConns: global.GetAppConfig().Mysql.MaxIdleConns,
-		MaxOpenConns: global.GetAppConfig().Mysql.MaxOpenConns,
-		LogMode:      global.GetAppConfig().Mysql.LogMode,
-		LogZap:       global.GetAppConfig().Mysql.LogZap,
-		MaxLifetime:  global.GetAppConfig().Mysql.MaxLifetime,
-		AutoCreate:   global.GetAppConfig().Mysql.AutoCreate,
-	}
+	mysqlConfig := snapshot.Mysql.ConnectionConfig()
 
 	db, err := dbManager.Initialize(mysqlConfig)
 	if err != nil {
@@ -61,12 +50,21 @@ func Gorm() *gorm.DB {
 	}
 
 	global.APP_LOG.Info("数据库连接成功",
-		zap.String("dbType", dbType),
+		zap.String("dbType", global.GetAppConfig().System.DbType),
 		zap.String("engine", global.GetAppConfig().Mysql.Engine))
 
 	// 提前设置全局 APP_DB，使 RegisterTables 内部调用的服务（如 FixAllDuplicateData）
 	// 能通过 global.APP_DB 访问数据库连接，避免出现「数据库连接不可用」警告
 	global.APP_DB = db
+	// The manager publishes its replacement before this function can update the
+	// global pointer. Retire the old pool only after the pointer is visible so a
+	// live request never receives a closed pool during first-run reinitialization.
+	closeDatabasePool(previousDB, db)
+	if managedPreviousDB != previousDB {
+		// Keep the manager and global hand-off leak-free even if a previous
+		// initialization path temporarily used a different pool.
+		closeDatabasePool(managedPreviousDB, db)
+	}
 
 	// 检查系统是否已初始化（表已存在）
 	// 如果已初始化则跳过自动迁移，避免MariaDB上AutoMigrate挂起的问题
@@ -133,16 +131,18 @@ func RegisterTables(db *gorm.DB) {
 		&oauth2Model.OAuth2Provider{}, // OAuth2提供商配置表
 
 		// 实例相关表
-		&providerModel.Instance{},          // 虚拟机/容器实例表
-		&providerModel.Provider{},          // 服务提供商配置表
-		&providerModel.AdminGroupSetting{}, // 管理员分组设置表
-		&providerModel.Port{},              // 端口映射表
-		&providerModel.ProviderIPv4Pool{},  // IPv4地址池表（dedicated_ipv4类型服务商）
-		&providerModel.InstanceShareLink{}, // 临时实例授权分享表
-		&providerModel.InstanceSnapshot{},  // 实例快照表
-		&providerModel.SnapshotSchedule{},  // 实例计划快照表
-		&providerModel.SnapshotTask{},      // 实例快照后台任务表
-		&adminModel.Task{},                 // 用户任务表
+		&providerModel.Instance{},           // 虚拟机/容器实例表
+		&providerModel.Provider{},           // 服务提供商配置表
+		&providerModel.AdminGroupSetting{},  // 管理员分组设置表
+		&providerModel.Port{},               // 端口映射表
+		&providerModel.ProviderIPv4Pool{},   // IPv4地址池表（dedicated_ipv4类型服务商）
+		&providerModel.ProviderIPv6Pool{},   // IPv6地址池表（支持离散地址和CIDR范围）
+		&providerModel.ProviderIPv6Tunnel{}, // Provider宿主机IPv6隧道配置
+		&providerModel.InstanceShareLink{},  // 临时实例授权分享表
+		&providerModel.InstanceSnapshot{},   // 实例快照表
+		&providerModel.SnapshotSchedule{},   // 实例计划快照表
+		&providerModel.SnapshotTask{},       // 实例快照后台任务表
+		&adminModel.Task{},                  // 用户任务表
 
 		// 资源管理表
 		&resourceModel.ResourceReservation{}, // 资源预留表
@@ -184,10 +184,12 @@ func RegisterTables(db *gorm.DB) {
 		&monitoringModel.UserTrafficHistory{},     // 用户流量历史表
 		&monitoringModel.PerformanceMetric{},      // 性能指标历史表
 		// Agent监控表
-		&monitoringModel.AgentMonitor{},     // Agent监控映射表
-		&monitoringModel.ResourceMetric{},   // 资源监控数据表（24小时保留）
-		&monitoringModel.MonitoringConfig{}, // Provider监控配置表
-		&monitoringModel.MonitorSyncTask{},  // Provider监控同步后台任务表
+		&monitoringModel.AgentMonitor{},         // Agent监控映射表
+		&monitoringModel.ResourceMetric{},       // 资源监控数据表（24小时保留）
+		&monitoringModel.MonitoringConfig{},     // Provider监控配置表
+		&monitoringModel.MonitorSyncTask{},      // Provider监控同步后台任务表
+		&monitoringModel.EgressDesiredProfile{}, // 独立出口控制端期望配置
+		&monitoringModel.EgressDesiredBinding{}, // 独立出口控制端实例绑定
 		// 防火墙/滥用屏蔽表
 		&firewallModel.BlockRule{},            // 屏蔽规则表
 		&firewallModel.BlockRuleApplication{}, // 屏蔽规则应用记录表
@@ -223,6 +225,7 @@ func RegisterTables(db *gorm.DB) {
 		return
 	}
 	ensureAuditLogTextCharset(db)
+	backfillInstanceDesiredStates(db)
 	global.APP_LOG.Info("数据库表注册成功")
 
 	// AutoMigrate完成后再确认重复数据（表已存在才安全执行）
@@ -239,6 +242,38 @@ func RegisterTables(db *gorm.DB) {
 	firewallSvc := &firewallService.Service{}
 	if err := firewallSvc.EnsureDefaultRules(); err != nil {
 		global.APP_LOG.Warn("初始化默认屏蔽规则失败（可忽略）", zap.Error(err))
+	}
+}
+
+// backfillInstanceDesiredStates gives pre-existing rows a conservative
+// controller-side lifecycle intent after AutoMigrate adds desired_state.
+// Imported rows deliberately remain stopped until an administrator explicitly
+// starts them.  The two updates are bounded set-based SQL statements, so a
+// large installation is not walked row-by-row during startup.
+func backfillInstanceDesiredStates(db *gorm.DB) {
+	if db == nil {
+		return
+	}
+
+	if err := db.Model(&providerModel.Instance{}).
+		Where("desired_state IS NULL OR desired_state = ?", "").
+		Update("desired_state", providerModel.InstanceDesiredStateStopped).Error; err != nil {
+		global.APP_LOG.Warn("回填实例运行意图默认值失败", zap.Error(err))
+		return
+	}
+
+	result := db.Model(&providerModel.Instance{}).
+		Where("desired_state = ? AND is_imported = ?", providerModel.InstanceDesiredStateStopped, false).
+		Where("(status IN ? OR traffic_stopped = ? OR expiry_stopped = ?)",
+			[]string{"creating", "running", "starting", "restarting", "traffic_stopped", "expiry_stopped"}, true, true).
+		Update("desired_state", providerModel.InstanceDesiredStateRunning)
+	if result.Error != nil {
+		global.APP_LOG.Warn("回填历史实例运行意图失败", zap.Error(result.Error))
+		return
+	}
+	if result.RowsAffected > 0 {
+		global.APP_LOG.Info("已回填历史实例运行意图",
+			zap.Int64("count", result.RowsAffected))
 	}
 }
 

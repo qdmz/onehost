@@ -81,22 +81,47 @@ func ResolveInstanceSSHTarget(instance *providerModel.Instance) (*SSHAccessTarge
 	if strings.TrimSpace(instance.Username) == "" {
 		return nil, fmt.Errorf("实例缺少 SSH 用户名")
 	}
-	if strings.TrimSpace(instance.Password) == "" {
-		return nil, fmt.Errorf("实例缺少 SSH 密码，无法建立远程连接")
+	if strings.TrimSpace(instance.Password) == "" && strings.TrimSpace(instance.SSHKey) == "" {
+		return nil, fmt.Errorf("实例缺少 SSH 凭据（密码或私钥），无法建立远程连接")
 	}
 
 	target := &SSHAccessTarget{
 		ProviderID: instance.ProviderID,
 		Username:   instance.Username,
 		Password:   instance.Password,
+		PrivateKey: instance.SSHKey,
 	}
+	manualHost := strings.TrimSpace(instance.SSHHost)
 
 	var provider providerModel.Provider
 	hasProvider := false
-	if err := global.APP_DB.Select("id", "connection_type", "endpoint", "port_ip").
-		Where("id = ?", instance.ProviderID).
-		First(&provider).Error; err == nil {
-		hasProvider = true
+	if global.APP_DB != nil {
+		if err := global.APP_DB.Select("id", "connection_type", "endpoint", "port_ip").
+			Where("id = ?", instance.ProviderID).
+			First(&provider).Error; err == nil {
+			hasProvider = true
+		}
+	}
+
+	// An administrator-supplied SSH host/port is an explicit access override.
+	// It must win over stale discovery data and existing port mappings; otherwise
+	// editing an imported instance appears to succeed but Web SSH/SFTP continue
+	// connecting to the old mapped endpoint. The normal mapping/IP resolution
+	// below remains unchanged when no override was supplied.
+	if manualHost != "" {
+		target.Host = manualHost
+		target.Port = instance.SSHPort
+		if target.Port <= 0 {
+			target.Port = 22
+		}
+		if hasProvider && provider.ConnectionType == "agent" {
+			// Manual imported-instance access data may not match the discovered
+			// private IP. Use the administrator's explicit host for the agent
+			// fallback rather than silently routing to stale discovery data.
+			target.FallbackAgentTunnelHost = manualHost
+			target.FallbackAgentTunnelPort = target.Port
+		}
+		return target, nil
 	}
 
 	var sshPortMapping providerModel.Port
@@ -109,7 +134,9 @@ func ResolveInstanceSSHTarget(instance *providerModel.Instance) (*SSHAccessTarge
 				target.Port = 22
 			}
 		} else {
-			if hasProvider {
+			if manualHost != "" {
+				target.Host = manualHost
+			} else if hasProvider {
 				target.Host = providerPortHost(&provider)
 			}
 			if strings.TrimSpace(target.Host) == "" {
@@ -117,6 +144,9 @@ func ResolveInstanceSSHTarget(instance *providerModel.Instance) (*SSHAccessTarge
 					target.Host = instance.PublicIP
 				} else {
 					target.Host = instance.PrivateIP
+					if strings.TrimSpace(target.Host) == "" {
+						target.Host = instance.IPv6Address
+					}
 				}
 			}
 			target.Port = sshPortMapping.HostPort
@@ -132,13 +162,17 @@ func ResolveInstanceSSHTarget(instance *providerModel.Instance) (*SSHAccessTarge
 			}
 		}
 	} else {
-		if instance.PublicIP != "" {
+		if manualHost != "" {
+			target.Host = manualHost
+		} else if instance.PublicIP != "" {
 			target.Host = instance.PublicIP
 		} else if instance.PrivateIP != "" {
 			target.Host = instance.PrivateIP
 			if hasProvider && provider.ConnectionType == "agent" {
 				target.UseAgentTunnel = true
 			}
+		} else if instance.IPv6Address != "" {
+			target.Host = instance.IPv6Address
 		}
 		target.Port = instance.SSHPort
 		if target.Port == 0 {
@@ -244,11 +278,17 @@ func openSSHClientViaAgentTunnel(target *SSHAccessTarget, host string, port int,
 		return nil, fmt.Errorf("agent 隧道建立失败: %w", err)
 	}
 
-	sshConn, chans, reqs, err := ssh.NewClientConn(tunnelConn, fmt.Sprintf("%s:%d", host, port), sshConfig)
+	handshakeTimeout := sshConfig.Timeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 20 * time.Second
+	}
+	_ = tunnelConn.SetDeadline(time.Now().Add(handshakeTimeout))
+	sshConn, chans, reqs, err := ssh.NewClientConn(tunnelConn, net.JoinHostPort(strings.Trim(host, "[]"), fmt.Sprintf("%d", port)), sshConfig)
 	if err != nil {
 		tunnelConn.Close()
 		return nil, fmt.Errorf("通过 agent 隧道建立 SSH 连接失败: %w", err)
 	}
+	_ = tunnelConn.SetDeadline(time.Time{})
 	return ssh.NewClient(sshConn, chans, reqs), nil
 }
 

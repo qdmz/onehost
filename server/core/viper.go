@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -44,12 +43,12 @@ func Viper(path ...string) *viper.Viper {
 		fmt.Fprintf(os.Stderr, "[VIPER WARN] 配置文件读取失败: %v，将使用默认配置\n", err)
 		// 仍然从默认值构建配置并设置全局变量，避免 GetAppConfig() 返回零值
 		var defaultCfg config.Server
-		if uerr := v.Unmarshal(&defaultCfg); uerr == nil {
+		if uerr := unmarshalConfig(v, &defaultCfg); uerr == nil {
+			normalizeDatabaseConfig(&defaultCfg)
 			global.SetAppConfig(defaultCfg)
 		}
 		return v
 	}
-
 	v.WatchConfig()
 	v.OnConfigChange(func(e fsnotify.Event) {
 		// 一旦 ConfigManager 已从数据库完成初始化，配置的权威来源由 ConfigManager 管理，
@@ -63,15 +62,16 @@ func Viper(path ...string) *viper.Viper {
 		}
 		fmt.Printf("[VIPER] 配置文件变更: %s\n", e.Name)
 		var newCfg config.Server
-		if err := v.Unmarshal(&newCfg); err != nil {
+		if err := unmarshalConfig(v, &newCfg); err != nil {
 			fmt.Fprintf(os.Stderr, "[VIPER WARN] 热重载配置解析失败: %v，保持原有配置\n", err)
 		} else {
+			normalizeDatabaseConfig(&newCfg)
 			global.SetAppConfig(newCfg)
 		}
 	})
 
 	var initCfg config.Server
-	if err := v.Unmarshal(&initCfg); err != nil {
+	if err := unmarshalConfig(v, &initCfg); err != nil {
 		fmt.Fprintf(os.Stderr, "[VIPER WARN] 初始配置解析失败: %v，将使用默认配置\n", err)
 		// 即使解析失败也要设置基本配置，避免 GetAppConfig() 返回零值
 		// （零值 Cors.Mode=="" 会导致 CORS 使用白名单模式，非 localhost 请求返回 403）
@@ -82,10 +82,22 @@ func Viper(path ...string) *viper.Viper {
 		fallbackCfg.Cors.Mode = "whitelist"
 		global.SetAppConfig(fallbackCfg)
 	} else {
+		normalizeDatabaseConfig(&initCfg)
 		global.SetAppConfig(initCfg)
 	}
 
 	return v
+}
+
+func unmarshalConfig(v *viper.Viper, cfg *config.Server) error {
+	if err := v.Unmarshal(cfg); err != nil {
+		return err
+	}
+	return config.DecodeDatabase(v, cfg)
+}
+
+func normalizeDatabaseConfig(cfg *config.Server) {
+	config.NormalizeDatabase(cfg)
 }
 
 // setDefaults 设置配置项安全默认值。
@@ -99,6 +111,19 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("system.use-redis", false)
 	v.SetDefault("system.iplimit-count", 15000)
 	v.SetDefault("system.iplimit-time", 3600)
+	v.SetDefault("system.enable-instance-recovery", true)
+	v.SetDefault("system.instance-recovery-interval", 3)
+	v.SetDefault("system.instance-recovery-offline-minutes", 30)
+	v.SetDefault("mysql.path", "127.0.0.1")
+	v.SetDefault("mysql.port", "3306")
+	v.SetDefault("mysql.config", "charset=utf8mb4&parseTime=True&loc=Asia%2FShanghai&time_zone=%27%2B08%3A00%27")
+	v.SetDefault("mysql.db-name", "oneclickvirt")
+	v.SetDefault("mysql.username", "root")
+	v.SetDefault("mysql.engine", "InnoDB")
+	v.SetDefault("mysql.max-idle-conns", 20)
+	v.SetDefault("mysql.max-open-conns", 200)
+	v.SetDefault("mysql.max-lifetime", 1800)
+	v.SetDefault("mysql.auto-create", true)
 
 	// 生成随机安全的 JWT 默认签名密钒（如果 config.yaml 未配置）
 	randomKey := generateSecureJWTKey()
@@ -163,20 +188,7 @@ func applyEnvOverrides(v *viper.Viper) {
 // DSN and turn the port into tcp/"3306", breaking every restart even though
 // the persisted YAML is correct.
 func normalizeDeploymentEnvValue(name, value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) < 2 || name == "DB_PASSWORD" {
-		return value
-	}
-
-	if value[0] == '"' && value[len(value)-1] == '"' {
-		if unquoted, err := strconv.Unquote(value); err == nil {
-			return strings.TrimSpace(unquoted)
-		}
-	}
-	if value[0] == '\'' && value[len(value)-1] == '\'' {
-		return strings.TrimSpace(value[1 : len(value)-1])
-	}
-	return value
+	return config.NormalizeDatabaseEnvValue(name, value)
 }
 
 // generateSecureJWTKey 生成一个随机 256 位十六进制字符串作为 JWT 签名密钒。

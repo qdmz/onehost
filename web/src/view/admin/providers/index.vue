@@ -80,6 +80,7 @@
         @traffic-monitor="handleEnableTrafficMonitor"
         @health-check="checkHealth"
         @sync-instances="syncInstances"
+        @force-recovery-sync="forceRecoverySync"
         @set-expiry="handleSetProviderExpiry"
         @freeze="freezeServer"
         @unfreeze="unfreezeServer"
@@ -106,6 +107,7 @@
       @submit="handleProviderFormSubmit"
       @cancel="cancelAddServer"
       @reset-level-limits="resetLevelLimitsToDefault"
+      @provider-updated="handleProviderUpdated"
     />
 
     <!-- 自动配置结果对话框 -->
@@ -180,7 +182,7 @@ const {
   handleSizeChange, handleCurrentChange, handleSelectionChange,
   handleDeleteProvider, handleBatchDelete, handleBatchFreeze, handleBatchHealthCheck,
   handleSetProviderExpiry, freezeServer, unfreezeServer, checkHealth,
-  handleExportCSV, handleImportCSV, cleanupOrphans, syncInstances
+  handleExportCSV, handleImportCSV, cleanupOrphans, syncInstances, forceRecoverySync
 } = useProviderCRUD()
 
 const importCsvInput = ref(null)
@@ -203,6 +205,11 @@ const {
   resetLevelLimitsToDefault, cancelAddServer,
   editProvider, submitAddServer
 } = useProviderForm(loadProviders)
+
+const handleProviderUpdated = async (updates = {}) => {
+  Object.assign(addProviderForm, updates)
+  await loadProviders()
+}
 
 const showModeSelectDialog = ref(false)
 

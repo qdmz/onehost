@@ -4,6 +4,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/platform_interface.sh"
+source "${SCRIPT_DIR}/runtime_readiness.sh"
 
 declare -A ENV_INSTALL_SCRIPTS=(
     [docker]="https://raw.githubusercontent.com/oneclickvirt/docker/main/scripts/dockerinstall.sh"
@@ -17,12 +18,140 @@ declare -A ENV_INSTALL_SCRIPTS=(
 )
 PVE_BUILD_BACKEND="https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts/build_backend.sh"
 PVE_BUILD_NAT="https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts/build_nat_network.sh"
+PVE_LAST_JOB_STATE=""
+
+# Network reloads can briefly make SSH appear healthy before dropping it again.
+# Require a small consecutive-success window before a completed mutating job is
+# allowed to advance to a reboot or the next configuration stage.
+pve_wait_for_ssh_stable() {
+    local ip="$1"
+    local max_wait="${2:-${PVE_REMOTE_SSH_STABLE_WAIT:-180}}"
+    local probes="${PVE_REMOTE_STABLE_PROBES:-3}"
+    local interval="${PVE_REMOTE_STABLE_INTERVAL:-5}"
+    local probe_timeout="${PVE_REMOTE_STABLE_PROBE_TIMEOUT:-30}"
+    local elapsed=0 successes=0
+    [[ "$max_wait" =~ ^[0-9]+$ && "$max_wait" -gt 0 ]] || max_wait=180
+    [[ "$probes" =~ ^[0-9]+$ && "$probes" -gt 0 ]] || probes=3
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=5
+    [[ "$probe_timeout" =~ ^[0-9]+$ && "$probe_timeout" -gt 0 ]] || probe_timeout=30
+
+    while [[ $elapsed -le $max_wait ]]; do
+        if wait_for_ssh "$ip" "$probe_timeout" >/dev/null 2>&1 && \
+           platform_exec_once "$ip" "true" "$probe_timeout" >/dev/null 2>&1; then
+            successes=$((successes + 1))
+            [[ $successes -ge $probes ]] && return 0
+        else
+            successes=0
+        fi
+        [[ $elapsed -eq $max_wait ]] && break
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    return 1
+}
+
+pve_mark_job_completed() {
+    local ip="$1" label="$2" message="${3:-Detached PVE job '${label}' completed}"
+    if ! pve_wait_for_ssh_stable "$ip"; then
+        PVE_LAST_JOB_STATE="completed_unstable"
+        log_error "Detached PVE job '${label}' completed, but SSH did not remain stable before the next stage"
+        return 75
+    fi
+    PVE_LAST_JOB_STATE="completed"
+    log_success "$message"
+    return 0
+}
+
+# Some Debian cloud images schedule ifupdown2 through a one-shot systemd unit
+# during the first reboot.  That unit installs the package and reboots again,
+# so SSH can briefly recover before dropping a second time.  Do not start the
+# post-reboot installer pass while that bootstrap unit is still pending.
+pve_wait_for_ifupdown2_bootstrap() {
+    local ip="$1"
+    local max_wait="${2:-${PVE_IFUPDOWN2_BOOTSTRAP_MAX_WAIT:-900}}"
+    local interval="${PVE_IFUPDOWN2_BOOTSTRAP_POLL_INTERVAL:-10}"
+    local recovery_wait="${PVE_REMOTE_SSH_RECOVERY_WAIT:-600}"
+    local elapsed=0 query="" query_rc=0 state="" pending=false logged=false
+    [[ "$max_wait" =~ ^[0-9]+$ && "$max_wait" -gt 0 ]] || max_wait=900
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=10
+    [[ "$recovery_wait" =~ ^[0-9]+$ && "$recovery_wait" -gt 0 ]] || recovery_wait=600
+
+    while [[ $elapsed -le $max_wait ]]; do
+        query_rc=0
+        query=$(platform_exec_once "$ip" '
+if [ -e /etc/systemd/system/ifupdown2-install.service ] || [ -e /usr/local/bin/install_ifupdown2.sh ]; then
+    echo PENDING
+elif [ -s /usr/local/bin/ifupdown2_installed.txt ]; then
+    echo COMPLETE
+else
+    echo NONE
+fi
+' 30 2>/dev/null) || query_rc=$?
+        if [[ $query_rc -ne 0 ]]; then
+            if [[ "$pending" == true ]]; then
+                log_info "ifupdown2 bootstrap reboot interrupted SSH; waiting up to ${recovery_wait}s for recovery"
+            fi
+            wait_for_ssh "$ip" "$recovery_wait" >/dev/null 2>&1 || {
+                [[ "$pending" == true ]] && log_warning "SSH did not recover while waiting for the ifupdown2 bootstrap reboot"
+                return 75
+            }
+            elapsed=$((elapsed + interval))
+            continue
+        fi
+        state=$(printf '%s\n' "$query" | tr -d '\r' | tail -n 1)
+        case "$state" in
+            COMPLETE)
+                pending=true
+                log_info "ifupdown2 bootstrap completed; waiting for SSH to remain stable"
+                pve_wait_for_ssh_stable "$ip" "$recovery_wait" || return 75
+                return 0
+                ;;
+            PENDING)
+                pending=true
+                if [[ "$logged" == false ]]; then
+                    log_info "Waiting for the scheduled ifupdown2 bootstrap before the PVE post-reboot pass"
+                    logged=true
+                fi
+                ;;
+            NONE)
+                # No bootstrap unit is normal on images that already ship
+                # ifupdown/ifupdown2.  Only a previously observed pending unit
+                # requires the extra stability window.
+                if [[ "$pending" == true ]]; then
+                    pve_wait_for_ssh_stable "$ip" "$recovery_wait" || return 75
+                fi
+                return 0
+                ;;
+            *)
+                log_warning "Unexpected ifupdown2 bootstrap state '${state:-empty}'; continuing to observe"
+                ;;
+        esac
+        [[ $elapsed -eq $max_wait ]] && break
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    if [[ "$pending" == true ]]; then
+        log_warning "ifupdown2 bootstrap did not finish within ${max_wait}s"
+        return 75
+    fi
+    return 0
+}
 
 mysql_root_exec() {
     local db_password="${DB_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
-    local args=(-u root -h 127.0.0.1)
-    [[ -n "$db_password" ]] && args+=("-p${db_password}")
-    mysql "${args[@]}" "$@"
+    local client=""
+    if command -v mysql >/dev/null 2>&1; then
+        client="mysql"
+    elif command -v mariadb >/dev/null 2>&1; then
+        client="mariadb"
+    else
+        log_error "Neither mysql nor mariadb client is installed"
+        return 1
+    fi
+    # Keep credentials out of argv and preserve arbitrary punctuation in the
+    # password. Both clients accept MYSQL_PWD and the same protocol options.
+    MYSQL_PWD="$db_password" "$client" -u root -h 127.0.0.1 "$@"
 }
 
 ensure_worker_dns() {
@@ -182,7 +311,11 @@ create_test_node() {
     result=$(try_create_with_fallback "$env_type" "$hours")
     _rc=$?
     if [[ $_rc -ne 0 || -z "$result" ]]; then
-        log_error "All platforms failed to create a test node"
+        if [[ $_rc -eq 75 ]]; then
+            log_warning "No platform has temporary capacity for a test node"
+        else
+            log_error "All platforms failed to create a test node"
+        fi
         # Propagate exit code 75 (EX_TEMPFAIL) so callers can detect transient
         # resource exhaustion even though this function runs inside $().
         return $_rc
@@ -308,7 +441,7 @@ ENV_INSTALL_CMD
         return 0
     fi
     log_info "Using remote ${env} installer: ${url}"
-    printf '%s\n' "${noninteractive_prefix} curl -sSL '${url}' -o /tmp/envinstall.sh && chmod +x /tmp/envinstall.sh && ${env_prefix} bash /tmp/envinstall.sh"
+    printf '%s\n' "${noninteractive_prefix} curl -fsSL --connect-timeout 30 --max-time 600 '${url}' -o /tmp/envinstall.sh && chmod +x /tmp/envinstall.sh && ${env_prefix} bash /tmp/envinstall.sh"
 }
 
 build_pve_aux_command() {
@@ -352,13 +485,319 @@ base64 -d /tmp/pve-${kind}.sh.gz.b64 | gzip -dc > /tmp/pve-${kind}.sh && rm -f /
 PVE_AUX_CMD
         return 0
     fi
-    printf '%s\n' "${command_prefix} curl -sSL '${url}' | bash"
+    printf '%s\n' "${command_prefix} curl -fsSL --connect-timeout 30 --max-time 600 '${url}' -o /tmp/pve-${kind}.sh && chmod +x /tmp/pve-${kind}.sh; rc=\$?; if [ \"\$rc\" -eq 0 ]; then bash /tmp/pve-${kind}.sh; rc=\$?; fi; rm -f /tmp/pve-${kind}.sh; exit \"\$rc\""
+}
+
+# Run a PVE installer/bridge script as a detached remote job.  Both the PVE
+# installer and build_nat_network.sh can reload networking, so the SSH session
+# may disappear while the remote process is still doing useful work.  A
+# status file makes completion observable after SSH recovers and prevents the
+# generic SSH retry loop from launching the same mutating script twice.
+pve_run_remote_job() {
+    local ip="$1" command="$2" label="${3:-pve-job}" max_wait="${4:-3600}"
+    local poll_interval="${PVE_REMOTE_POLL_INTERVAL:-10}"
+    local recovery_wait="${PVE_REMOTE_SSH_RECOVERY_WAIT:-600}"
+    local running_grace_wait="${PVE_REMOTE_RUNNING_GRACE_WAIT:-900}"
+    [[ "$max_wait" =~ ^[0-9]+$ && "$max_wait" -gt 0 ]] || max_wait=3600
+    [[ "$poll_interval" =~ ^[0-9]+$ && "$poll_interval" -gt 0 ]] || poll_interval=10
+    [[ "$recovery_wait" =~ ^[0-9]+$ && "$recovery_wait" -gt 0 ]] || recovery_wait=600
+    [[ "$running_grace_wait" =~ ^[0-9]+$ && "$running_grace_wait" -gt 0 ]] || running_grace_wait=900
+
+    local safe_label token state_dir script_file log_file status_file started_file pid_file lock_dir payload
+    safe_label=$(printf '%s' "$label" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')
+    [[ -n "$safe_label" ]] || safe_label="pve-job"
+    token="${safe_label}-$$-$(date +%s)-${RANDOM}"
+    state_dir="/tmp/oneclickvirt-pve-jobs"
+    script_file="${state_dir}/${token}.sh"
+    log_file="${state_dir}/${token}.log"
+    status_file="${state_dir}/${token}.status"
+    started_file="${state_dir}/${token}.started"
+    pid_file="${state_dir}/${token}.pid"
+    lock_dir="${state_dir}/${token}.lock"
+    PVE_LAST_JOB_STATE="unknown"
+    payload=$(printf '%s' "$command" | base64 | tr -d '\n') || return 1
+
+    local launcher
+    launcher=$(printf '%s\n' \
+        "set -o errexit -o nounset" \
+        "mkdir -p ${state_dir}" \
+        "if mkdir ${lock_dir} 2>/dev/null; then" \
+        "  rm -f ${status_file} ${started_file} ${pid_file} ${log_file} ${script_file}" \
+        "  printf '%s' '${payload}' | base64 -d > ${script_file}" \
+        "  chmod 700 ${script_file}" \
+        "  printf '%s\\n' STARTED > ${started_file}" \
+        "  nohup bash -c 'bash ${script_file} >${log_file} 2>&1; rc=\$?; printf \"%s\\n\" \"\$rc\" > ${status_file}.tmp; mv -f ${status_file}.tmp ${status_file}; rm -f ${script_file} ${pid_file}; rmdir ${lock_dir} 2>/dev/null || true' </dev/null >/dev/null 2>&1 &" \
+        "  printf '%s\\n' \"\$!\" > ${pid_file}" \
+        "  printf '%s\\n' STARTED" \
+        "else" \
+        "  if [ -s ${status_file} ]; then cat ${status_file}; else echo RUNNING; fi" \
+        "fi")
+
+    log_info "Starting detached PVE job '${label}' (network may be unavailable while it runs)..."
+    local launch_rc=0
+    platform_exec_once "$ip" "$launcher" 60 >/dev/null 2>&1 || launch_rc=$?
+    if [[ $launch_rc -ne 0 ]]; then
+        log_warning "Detached PVE job '${label}' lost its initial SSH response (exit=${launch_rc}); checking for remote completion"
+    fi
+
+    local elapsed=0 query_output="" state="" query_rc=0 ssh_recovery_attempted=false launch_attempts=1
+    while [[ $elapsed -lt $max_wait ]]; do
+        query_output=""
+        query_rc=0
+        query_output=$(platform_exec_once "$ip" \
+            "if [ -s ${status_file} ]; then cat ${status_file}; elif [ -f ${started_file} ] || [ -d ${lock_dir} ]; then echo RUNNING; else echo NOT_STARTED; fi" \
+            30 2>/dev/null) || query_rc=$?
+        if [[ $query_rc -ne 0 ]]; then
+            if [[ "$ssh_recovery_attempted" == "false" ]]; then
+                ssh_recovery_attempted=true
+                log_info "PVE job '${label}' is not reachable over SSH; waiting up to ${recovery_wait}s for network recovery"
+                if ! wait_for_ssh "$ip" "$recovery_wait" >/dev/null 2>&1; then
+                    log_warning "SSH did not recover while observing PVE job '${label}'"
+                    return 75
+                fi
+                # Count a lost-transport observation against the primary
+                # budget even when the provider's wait helper returns early;
+                # repeated flaps must not create an unbounded polling loop.
+                elapsed=$((elapsed + poll_interval))
+                continue
+            fi
+            sleep "$poll_interval"
+            elapsed=$((elapsed + poll_interval))
+            continue
+        fi
+        ssh_recovery_attempted=false
+        if [[ $query_rc -eq 0 ]]; then
+            state=$(printf '%s\n' "$query_output" | tr -d '\r' | tail -n 1)
+            if [[ "$state" =~ ^[0-9]+$ ]]; then
+                if [[ "$state" -eq 0 ]]; then
+                    pve_mark_job_completed "$ip" "$label" "Detached PVE job '${label}' completed"
+                    return $?
+                fi
+                local remote_log
+                remote_log=$(platform_exec_once "$ip" "tail -80 ${log_file} 2>/dev/null || true" 30 2>/dev/null || true)
+                [[ -n "$remote_log" ]] && log_warning "Detached PVE job '${label}' output:\n${remote_log}"
+                PVE_LAST_JOB_STATE="failed"
+                log_warning "Detached PVE job '${label}' completed with exit=${state}"
+                return 1
+            fi
+            if [[ "$state" == "NOT_STARTED" && $launch_rc -ne 0 ]]; then
+                # The launcher itself did not reach the host.  Give the SSH
+                # endpoint one recovery cycle before classifying it as infra.
+                if wait_for_ssh "$ip" "$recovery_wait" >/dev/null 2>&1; then
+                    launch_attempts=$((launch_attempts + 1))
+                    if [[ "$launch_attempts" -gt 2 ]]; then
+                        log_error "Detached PVE job '${label}' was not started after SSH recovery"
+                        PVE_LAST_JOB_STATE="not_started"
+                        return 75
+                    fi
+                    launch_rc=0
+                    platform_exec_once "$ip" "$launcher" 60 >/dev/null 2>&1 || launch_rc=$?
+                    continue
+                fi
+                PVE_LAST_JOB_STATE="unknown"
+                return 75
+            fi
+        fi
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+    done
+
+    log_warning "Detached PVE job '${label}' did not expose a completion status within ${max_wait}s; waiting for SSH recovery (${recovery_wait}s)"
+    local final_query_rc=1
+    state="UNKNOWN"
+    if wait_for_ssh "$ip" "$recovery_wait" >/dev/null 2>&1; then
+        final_query_rc=0
+        query_output=$(platform_exec_once "$ip" \
+            "if [ -s ${status_file} ]; then cat ${status_file}; elif [ -f ${started_file} ] || [ -d ${lock_dir} ]; then echo RUNNING; else echo NOT_STARTED; fi" \
+            30 2>/dev/null) || final_query_rc=$?
+        state=$(printf '%s\n' "$query_output" | tr -d '\r' | tail -n 1)
+        if [[ $final_query_rc -eq 0 && "$state" =~ ^[0-9]+$ ]]; then
+            if [[ "$state" -eq 0 ]]; then
+                pve_mark_job_completed "$ip" "$label" "Detached PVE job '${label}' completed after SSH recovery"
+                return $?
+            fi
+            PVE_LAST_JOB_STATE="failed"
+            log_warning "Detached PVE job '${label}' completed after recovery with exit=${state}"
+            return 1
+        fi
+        if [[ $final_query_rc -eq 0 && "$state" == "RUNNING" ]]; then
+            # Never restart a worker while its mutating installer is still
+            # running.  Give a long network reload a separate grace window,
+            # then classify the result as infrastructure if it remains live.
+            local grace_elapsed=0 grace_query_rc grace_state
+            log_warning "Detached PVE job '${label}' is still running after the primary wait; observing for ${running_grace_wait}s before classifying it"
+            while [[ $grace_elapsed -lt $running_grace_wait ]]; do
+                sleep "$poll_interval"
+                grace_elapsed=$((grace_elapsed + poll_interval))
+                grace_query_rc=0
+                query_output=$(platform_exec_once "$ip" \
+                    "if [ -s ${status_file} ]; then cat ${status_file}; elif [ -f ${started_file} ] || [ -d ${lock_dir} ]; then echo RUNNING; else echo UNKNOWN; fi" \
+                    30 2>/dev/null) || grace_query_rc=$?
+                if [[ $grace_query_rc -ne 0 ]]; then
+                    # A second network flap during the grace window should
+                    # consume recovery time, not be mistaken for a completed
+                    # timeout.  Never launch a replacement job here.
+                    wait_for_ssh "$ip" "$recovery_wait" >/dev/null 2>&1 || true
+                    continue
+                fi
+                grace_state=$(printf '%s\n' "$query_output" | tr -d '\r' | tail -n 1)
+                if [[ "$grace_state" =~ ^[0-9]+$ ]]; then
+                    if [[ "$grace_state" -eq 0 ]]; then
+                        pve_mark_job_completed "$ip" "$label" "Detached PVE job '${label}' completed during the extended recovery window"
+                        return $?
+                    fi
+                    PVE_LAST_JOB_STATE="failed"
+                    log_warning "Detached PVE job '${label}' completed during recovery with exit=${grace_state}"
+                    return 1
+                fi
+                [[ "$grace_state" == "RUNNING" ]] || break
+            done
+            PVE_LAST_JOB_STATE="running"
+            log_error "Detached PVE job '${label}' is still running after ${running_grace_wait}s of extended observation; leaving it untouched"
+            return 75
+        fi
+    fi
+
+    # A provider restart is safe only when the launcher failed and the host
+    # explicitly reports that no detached job was started.  An unknown state
+    # is never restarted because the installer may still be changing network
+    # state behind a temporarily unavailable SSH endpoint.
+    if [[ $final_query_rc -eq 0 && "$state" == "NOT_STARTED" && "$launch_rc" -ne 0 && "${PVE_REMOTE_RESTART_ON_LOSS:-true}" == "true" && -n "${ACTIVE_INSTANCE_ID:-}" ]] && \
+       declare -f platform_recover_worker >/dev/null 2>&1; then
+        log_warning "Attempting provider restart for worker transport recovery after PVE job '${label}'"
+        if platform_recover_worker "${ACTIVE_INSTANCE_ID}" "$ip" "$recovery_wait" >/dev/null 2>&1; then
+            query_output=$(platform_exec_once "$ip" \
+                "if [ -s ${status_file} ]; then cat ${status_file}; else echo UNKNOWN; fi" \
+                30 2>/dev/null || true)
+            state=$(printf '%s\n' "$query_output" | tr -d '\r' | tail -n 1)
+            if [[ "$state" == "0" ]]; then
+                pve_mark_job_completed "$ip" "$label" "Detached PVE job '${label}' completed after provider recovery"
+                return $?
+            fi
+        fi
+    fi
+    [[ "$PVE_LAST_JOB_STATE" == "unknown" && "$state" == "NOT_STARTED" ]] && PVE_LAST_JOB_STATE="not_started"
+    log_error "Detached PVE job '${label}' could not be observed after SSH recovery"
+    return 75
+}
+
+pve_check_postcondition() {
+    local ip="$1" kind="$2" check_cmd=""
+    local state_dir="${PVE_STATE_DIR:-/usr/local/bin}"
+    [[ "$state_dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || state_dir="/usr/local/bin"
+    case "$kind" in
+        install)
+            check_cmd='set -o errexit -o nounset
+command -v pvesh >/dev/null 2>&1 && command -v pct >/dev/null 2>&1 && command -v qm >/dev/null 2>&1
+mountpoint -q /etc/pve
+node_name="$(hostname -s)"
+test -d "/etc/pve/nodes/${node_name}/lxc" && test -d "/etc/pve/nodes/${node_name}/qemu-server"
+systemctl is-active --quiet pve-cluster && systemctl is-active --quiet pvedaemon && systemctl is-active --quiet pveproxy
+ss -lnt 2>/dev/null | grep -q ":8006 "
+curl --noproxy 'localhost,127.0.0.1,::1' -ksS --connect-timeout 3 --max-time 10 https://127.0.0.1:8006/api2/json/version >/dev/null'
+            ;;
+        backend)
+            check_cmd='test -s /usr/local/bin/build_backend_pve.txt && command -v pvesh >/dev/null 2>&1 && mountpoint -q /etc/pve'
+            ;;
+        nat)
+            # The NAT script persists the selected subnet/gateway and may use
+            # nftables or iptables depending on the host.  Verify all three
+            # layers so a stale interfaces stanza cannot be accepted alone.
+            check_cmd=$(cat <<'NAT_POSTCONDITION'
+set -o errexit -o nounset
+test -r /etc/network/interfaces
+grep -Eq "^[[:space:]]*auto[[:space:]]+vmbr1([[:space:]]|$)" /etc/network/interfaces
+test -s __STATE_DIR__/pve_nat_subnet && test -s __STATE_DIR__/pve_nat_gateway
+nat_subnet="$(tr -d "[:space:]" < __STATE_DIR__/pve_nat_subnet)"
+nat_gateway="$(tr -d "[:space:]" < __STATE_DIR__/pve_nat_gateway)"
+printf "%s" "$nat_subnet" | grep -Eq "^([0-9]{1,3}[.]){3}0/24$"
+printf "%s" "$nat_gateway" | grep -Eq "^([0-9]{1,3}[.]){3}[0-9]{1,3}$"
+ip link show dev vmbr1 2>/dev/null | grep -Eq "(^|[[:space:]])state[[:space:]]+(UP|UNKNOWN)([[:space:]]|$)"
+ip -o -4 addr show dev vmbr1 2>/dev/null | grep -Fq " ${nat_gateway}/24 "
+nat_rule_found=false
+if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+    if nft list ruleset 2>/dev/null | grep -F "$nat_subnet" | grep -Fq masquerade; then
+        nat_rule_found=true
+    fi
+fi
+if command -v iptables >/dev/null 2>&1 && iptables -t nat -S POSTROUTING 2>/dev/null | grep -F "$nat_subnet" | grep -Fq MASQUERADE; then
+    nat_rule_found=true
+fi
+test "$nat_rule_found" = true
+NAT_POSTCONDITION
+)
+            check_cmd="${check_cmd//__STATE_DIR__/${state_dir}}"
+            ;;
+        *) return 1 ;;
+    esac
+    platform_exec_once "$ip" "$check_cmd" 90 >/dev/null 2>&1
+}
+
+pve_wait_postcondition() {
+    local ip="$1" kind="$2" max_wait="${PVE_POSTCONDITION_MAX_WAIT:-180}"
+    local interval="${PVE_POSTCONDITION_POLL_INTERVAL:-10}" elapsed=0
+    [[ "$max_wait" =~ ^[0-9]+$ && "$max_wait" -gt 0 ]] || max_wait=180
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=10
+    while [[ $elapsed -le $max_wait ]]; do
+        pve_check_postcondition "$ip" "$kind" && return 0
+        [[ $elapsed -eq $max_wait ]] && break
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    return 1
+}
+
+pve_reboot_marker_present() {
+    local ip="$1"
+    platform_exec_once "$ip" "test -s /usr/local/bin/reboot_pve.txt" 30 >/dev/null 2>&1
+}
+
+pve_wait_reboot_marker() {
+    local ip="$1" max_wait="${PVE_REBOOT_MARKER_MAX_WAIT:-180}"
+    local interval="${PVE_REBOOT_MARKER_POLL_INTERVAL:-10}" elapsed=0
+    [[ "$max_wait" =~ ^[0-9]+$ && "$max_wait" -gt 0 ]] || max_wait=180
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=10
+    while [[ $elapsed -le $max_wait ]]; do
+        pve_reboot_marker_present "$ip" && return 0
+        if ! wait_for_ssh "$ip" "$interval" >/dev/null 2>&1; then
+            elapsed=$((elapsed + interval))
+            continue
+        fi
+        [[ $elapsed -eq $max_wait ]] && break
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    return 1
+}
+
+pve_run_job_or_accept_postcondition() {
+    local ip="$1" command="$2" label="$3" kind="$4" max_wait="$5" rc=0
+    PVE_LAST_JOB_STATE="unknown"
+    pve_run_remote_job "$ip" "$command" "$label" "$max_wait" || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    # A live detached job must never be bypassed by a partial postcondition;
+    # doing so would start the next mutating phase concurrently on the host.
+    # A postcondition can explain a known non-zero completion (for example
+    # build_backend.sh deliberately exits 1 when its durable marker exists),
+    # but it cannot prove anything while the remote job state is unknown or
+    # still running.  In those states, advancing could overlap a network
+    # mutation that is still active.
+    if [[ "${PVE_LAST_JOB_STATE:-unknown}" == "failed" ]] && pve_wait_postcondition "$ip" "$kind"; then
+        log_warning "PVE job '${label}' returned ${rc}, but its ${kind} postcondition is present; continuing"
+        return 0
+    fi
+    [[ $rc -eq 75 ]] && return 75
+    return "$rc"
 }
 
 install_env() {
     local id="$1" ip="$2" env="$3"
     log_section "Installing ${env} environment on worker node"
-    local noninteractive_prefix="export noninteractive=true; export DEBIAN_FRONTEND=noninteractive;"
+    # Keep the canonical lowercase flag and its documented uppercase alias in
+    # every remote installer invocation.  Individual runtime repositories may
+    # still read their historical INCUS_NONINTERACTIVE name, so that legacy
+    # compatibility is supplied only where it is needed below.
+    local noninteractive_prefix="export noninteractive=true; export NONINTERACTIVE=true; export DEBIAN_FRONTEND=noninteractive;"
     local install_wait="${ENV_INSTALL_MAX_WAIT:-3600}"
     local apt_lock_wait="${APT_LOCK_MAX_WAIT:-1800}"
     local apt_install_wait="${APT_INSTALL_MAX_WAIT:-1800}"
@@ -424,7 +863,7 @@ install_env() {
             env_prefix="DEBIAN_FRONTEND=noninteractive noninteractive=true NONINTERACTIVE=true CN=false WITHOUTCDN=false"
             ;;
         incus)
-            env_prefix="DEBIAN_FRONTEND=noninteractive noninteractive=true INCUS_NONINTERACTIVE=true INCUS_STORAGE_BACKEND=${INCUS_STORAGE_BACKEND:-dir} WITHOUTCDN=false"
+            env_prefix="DEBIAN_FRONTEND=noninteractive noninteractive=true NONINTERACTIVE=true INCUS_NONINTERACTIVE=true INCUS_STORAGE_BACKEND=${INCUS_STORAGE_BACKEND:-dir} WITHOUTCDN=false"
             ;;
         podman)
             env_prefix="DEBIAN_FRONTEND=noninteractive NEED_DISK_LIMIT=n WITHOUTCDN=false"
@@ -447,40 +886,114 @@ install_env() {
 
     if [[ "$env" == "proxmoxve" ]]; then
         log_info "PVE install step 1/3: installing PVE kernel (reboot required)..."
-        platform_exec_and_wait "${ip}" "${pve_install_cmd}" "$pve_wait" || true
-        log_info "Rebooting worker to load PVE kernel..."
-        platform_exec_and_wait "${ip}" "reboot" 10 || true
-        sleep 25
-        wait_for_ssh "${ip}" "$reboot_wait" || return 75
+        # The first pass intentionally exits after writing reboot_pve.txt.  It
+        # can reload networking before that marker is written, so observe it as
+        # a detached job and never restart the installer from an SSH retry.
+        local pve_pre_job_rc=0 pve_reboot_required=true
+        if pve_check_postcondition "${ip}" install; then
+            # A reused worker may already have PVE installed.  The upstream
+            # installer exits early in that case; do not force an unnecessary
+            # reboot or wait forever for a marker that can never be created.
+            pve_reboot_required=false
+            log_info "Existing PVE runtime detected; skipping the pre-reboot installer pass"
+        elif pve_reboot_marker_present "${ip}"; then
+            log_info "PVE installer left its reboot marker from an earlier pass; continuing with the pending reboot"
+        else
+            pve_run_remote_job "${ip}" "${pve_install_cmd}" \
+                "PVE installer pre-reboot" "$pve_wait" || pve_pre_job_rc=$?
+            if pve_reboot_marker_present "${ip}"; then
+                :
+            elif pve_check_postcondition "${ip}" install; then
+                pve_reboot_required=false
+                log_info "PVE installer reported an already-ready runtime; skipping the kernel reboot"
+            else
+                log_error "PVE pre-reboot installer did not leave reboot marker or a ready PVE runtime (exit=${pve_pre_job_rc})"
+                [[ $pve_pre_job_rc -eq 75 ]] && return 75
+                return "${pve_pre_job_rc:-1}"
+            fi
+        fi
+        if [[ "$pve_reboot_required" == "true" ]]; then
+            if ! pve_wait_reboot_marker "${ip}"; then
+                log_error "PVE pre-reboot installer did not expose /usr/local/bin/reboot_pve.txt"
+                return 75
+            fi
+            if ! pve_wait_for_ssh_stable "${ip}" "$reboot_wait"; then
+                log_error "Worker SSH did not stabilize before the PVE kernel reboot"
+                return 75
+            fi
+            log_info "Rebooting worker to load PVE kernel..."
+            platform_exec_once "${ip}" "reboot" 10 || true
+            sleep 25
+            pve_wait_for_ssh_stable "${ip}" "$reboot_wait" || return 75
+        fi
         ensure_worker_swap "${ip}" "worker after PVE reboot" || log_warning "Swap setup after PVE reboot did not complete"
         stabilize_worker_network_for_env "${ip}" "${env}" "worker after PVE reboot" || true
+        pve_wait_for_ifupdown2_bootstrap "${ip}" "$reboot_wait" || return 75
+        ensure_worker_dns "${ip}" "worker after ifupdown2 bootstrap" || true
         log_info "PVE install step 2/3: completing PVE configuration after reboot..."
-        platform_exec_and_wait "${ip}" "${pve_install_cmd}" "$pve_wait" || return 75
+        local pve_job_rc=0
+        pve_run_job_or_accept_postcondition "${ip}" "${pve_install_cmd}" \
+            "PVE installer post-reboot" install "$pve_wait" || pve_job_rc=$?
+        (( pve_job_rc == 0 )) || return "$pve_job_rc"
         log_info "PVE install step 3a/3: configuring backend bridge..."
-        platform_exec_and_wait "${ip}" "${pve_backend_cmd}" "$install_wait" || return 75
+        pve_run_job_or_accept_postcondition "${ip}" "${pve_backend_cmd}" \
+            "PVE backend bridge" backend "${install_wait}" || pve_job_rc=$?
+        (( pve_job_rc == 0 )) || return "$pve_job_rc"
         log_info "PVE install step 3b/3: building NAT IPv4 network..."
-        platform_exec_and_wait "${ip}" "${pve_nat_cmd}" "$install_wait" || return 75
+        pve_run_job_or_accept_postcondition "${ip}" "${pve_nat_cmd}" \
+            "PVE NAT network" nat "${install_wait}" || pve_job_rc=$?
+        (( pve_job_rc == 0 )) || return "$pve_job_rc"
     elif [[ "$env" == "kubevirt" ]]; then
         # kubevirt needs K3s + KubeVirt + CDI, single-pass install (no reboot needed)
         # K3s + KubeVirt + CDI typically takes 60-120 minutes; use 7200s (2h) to be safe
         log_info "Installing KubeVirt environment (K3s + KubeVirt + CDI)..."
-        run_kubevirt_installer_with_retry "${ip}" "${env_install_cmd}"
+        run_kubevirt_installer_with_retry "${ip}" "${env_install_cmd}" || return $?
     elif [[ "$env" == "qemu" ]]; then
         # qemu needs libvirt + QEMU/KVM, single-pass install
         log_info "Installing QEMU/KVM environment..."
-        platform_exec_and_wait "${ip}" "${env_install_cmd}" "$install_wait"
+        # The upstream installer can return non-zero after successfully
+        # activating the default pool (a second `virsh pool-start` reports
+        # "already active"). Verify the actual runtime postcondition before
+        # failing, and do not rerun a mutating installer on the same worker.
+        local qemu_install_rc=0 qemu_verify_rc=0
+        PLATFORM_EXEC_RETRIES=1 platform_exec_and_wait "${ip}" "${env_install_cmd}" "$install_wait" || qemu_install_rc=$?
+        if [[ "$qemu_install_rc" -ne 0 ]]; then
+            verify_worker_runtime "$id" "$ip" qemu || qemu_verify_rc=$?
+            if [[ "$qemu_verify_rc" -eq 0 ]]; then
+                log_warning "QEMU installer returned ${qemu_install_rc}, but the libvirt pool and network are active; continuing"
+            elif [[ "$qemu_verify_rc" -eq 75 ]]; then
+                return 75
+            else
+                return "$qemu_install_rc"
+            fi
+        fi
     else
-        platform_exec_and_wait "${ip}" "${env_install_cmd}" "$install_wait" || true
-        log_info "Rebooting worker to apply network/kernel settings..."
-        platform_exec_and_wait "${ip}" "reboot" 10 || true
-        log_info "Waiting for SSH after reboot (max ${reboot_wait}s)..."
-        wait_for_ssh "${ip}" "$reboot_wait"
-        ensure_worker_swap "${ip}" "worker after ${env} reboot" || log_warning "Swap setup after ${env} reboot did not complete"
-        stabilize_worker_network_for_env "${ip}" "${env}" "worker after ${env} reboot" || true
-        log_info "Re-running ${env} install to complete post-reboot setup..."
-        platform_exec_and_wait "${ip}" "${env_install_cmd}" "$install_wait"
+        # Most non-PVE installers are expected to finish in one pass.  A
+        # storage-driver bootstrap may intentionally reboot the worker and
+        # make the first SSH command return non-zero, so retry once after SSH
+        # recovers.  A genuine installer failure must still be returned and
+        # must never be followed by an unconditional reboot of a half-built
+        # runtime.
+        local first_install_rc=0
+        platform_exec_and_wait "${ip}" "${env_install_cmd}" "$install_wait" || first_install_rc=$?
+        if [[ "$first_install_rc" -ne 0 ]]; then
+            log_warning "${env} installer first pass returned ${first_install_rc}; waiting for SSH before one recovery retry"
+            wait_for_ssh "${ip}" "$reboot_wait" || return 75
+            log_info "Retrying ${env} installer after the worker recovered"
+            platform_exec_and_wait "${ip}" "${env_install_cmd}" "$install_wait" || return $?
+        else
+            log_info "Rebooting worker to apply network/kernel settings..."
+            platform_exec_and_wait "${ip}" "reboot" 10 || true
+            log_info "Waiting for SSH after reboot (max ${reboot_wait}s)..."
+            wait_for_ssh "${ip}" "$reboot_wait" || return 75
+            ensure_worker_swap "${ip}" "worker after ${env} reboot" || log_warning "Swap setup after ${env} reboot did not complete"
+            stabilize_worker_network_for_env "${ip}" "${env}" "worker after ${env} reboot" || true
+            log_info "Re-running ${env} install to complete post-reboot setup..."
+            platform_exec_and_wait "${ip}" "${env_install_cmd}" "$install_wait" || return $?
+        fi
     fi
     stabilize_worker_network_for_env "${ip}" "${env}" "worker after ${env} install" || true
+    return 0
 }
 
 verify_worker_runtime() {
@@ -492,16 +1005,118 @@ verify_worker_runtime() {
             verify_cmd="command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1"
             ;;
         podman)
-            verify_cmd="command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1"
+            verify_cmd="command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1 && podman network inspect podman-net >/dev/null"
             ;;
         containerd)
-            verify_cmd="command -v ctr >/dev/null 2>&1 && systemctl is-active --quiet containerd"
+            # nerdctl-full changed its bundled CNI directory in 2.4.0 from
+            # /opt/cni/bin to /usr/local/libexec/cni. The installer normally
+            # creates compatibility links, but runtime verification must also
+            # work with an already-installed worker or a package that did not
+            # create those links. Discover one directory containing the full
+            # plugin set. Runtime readiness is checked through ctr, nerdctl
+            # and the installed CNI files; it does not require a named
+            # nerdctl network to have been created yet.
+            verify_cmd=$(cat <<'VERIFY_CONTAINERD'
+containerd_check() {
+    local label="$1"
+    shift
+    local output
+    if output=$("$@" 2>&1); then
+        printf 'CONTAINERD_RUNTIME_PASS: %s\n' "$label"
+        return 0
+    fi
+    printf 'CONTAINERD_RUNTIME_FAIL: %s\n' "$label" >&2
+    [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+    return 1
+}
+containerd_check 'ctr command' command -v ctr || exit 1
+containerd_check 'nerdctl command' command -v nerdctl || exit 1
+# `ctr version` talks to the containerd socket.  It is the authoritative
+# daemon check; `nerdctl info` is intentionally not used because nerdctl 2.4
+# can return a non-zero status while the daemon and CNI installation are
+# healthy (especially when a global --cni-path flag is unsupported).
+containerd_check 'containerd daemon (ctr version)' ctr version || exit 1
+containerd_check 'nerdctl CLI version' nerdctl version || exit 1
+cni_path=""
+# Only the local fixture supplies this filesystem prefix. The SSH wrapper
+# does not forward the runner's environment to real workers.
+containerd_verify_root="${CONTAINERD_VERIFY_ROOT:-}"
+cni_candidates=(/opt/cni/bin /usr/local/libexec/cni /usr/local/lib/cni /usr/lib/cni /usr/libexec/cni)
+cni_config="${containerd_verify_root}/etc/cni/net.d/10-containerd-net.conflist"
+missing_plugins=""
+for candidate in "${cni_candidates[@]}"; do
+    candidate="${containerd_verify_root}${candidate}"
+    complete=true
+    for plugin in bridge host-local loopback portmap firewall tuning; do
+        if [ ! -x "${candidate}/${plugin}" ]; then
+            missing_plugins+=" ${candidate}/${plugin}"
+            complete=false
+        fi
+    done
+    if [ "${complete}" = true ]; then
+        cni_path="${candidate}"
+        break
+    fi
+done
+if [ -z "${cni_path}" ]; then
+    echo "Required Containerd CNI plugins are missing:${missing_plugins}" >&2
+    exit 1
+fi
+echo "Using Containerd CNI plugin directory: ${cni_path}"
+printf 'CONTAINERD_RUNTIME_PASS: CNI plugin directory (%s)\n' "${cni_path}"
+# Some minimal workers do not expose systemd to the SSH session.  The ctr
+# check above already verifies the active socket. Consult systemd only when
+# it can positively report a loaded unit; a shell without a systemd bus must
+# not turn a healthy containerd socket into a false readiness failure.
+if command -v systemctl >/dev/null 2>&1; then
+    unit_state=$(systemctl show containerd.service --property=LoadState --value 2>/dev/null || true)
+    if [ "${unit_state}" = loaded ]; then
+        if ! active_state=$(systemctl show containerd.service --property=ActiveState --value 2>/dev/null) || [ -z "${active_state}" ]; then
+            printf 'CONTAINERD_RUNTIME_SKIP: systemd active state unavailable; ctr socket check is authoritative\n'
+        elif [ "${active_state}" != active ]; then
+            echo "containerd systemd service is not active (state=${active_state:-unknown})" >&2
+            systemctl --no-pager --full status containerd 2>&1 | tail -40 >&2 || true
+            exit 1
+        else
+            printf 'CONTAINERD_RUNTIME_PASS: containerd systemd service active\n'
+        fi
+    else
+        printf 'CONTAINERD_RUNTIME_SKIP: systemd containerd unit is unavailable; ctr socket check is authoritative\n'
+    fi
+else
+    printf 'CONTAINERD_RUNTIME_SKIP: systemd status is unavailable in this execution context; ctr socket check is authoritative\n'
+fi
+test -s "${cni_config}" || {
+    echo "Containerd CNI configuration is missing: ${cni_config}" >&2
+    exit 1
+}
+command -v jq >/dev/null 2>&1 || {
+    echo "jq is required to validate Containerd CNI configuration" >&2
+    exit 1
+}
+if ! jq -e '
+    .name == "containerd-net" and
+    (.plugins | type == "array") and
+    any(.plugins[]?; .type == "bridge" and .ipam.type == "host-local") and
+    ([.plugins[]?.type] | index("portmap")) != null and
+    ([.plugins[]?.type] | index("firewall")) != null and
+    ([.plugins[]?.type] | index("tuning")) != null
+ ' "${cni_config}" >/dev/null; then
+    echo "Containerd CNI configuration has an invalid containerd-net plugin chain" >&2
+    jq -c . "${cni_config}" >&2 || true
+    exit 1
+fi
+printf 'CONTAINERD_RUNTIME_PASS: CNI configuration containerd-net plugin chain\n'
+# `loopback` is required as an executable, not an entry in the conflist.
+printf 'CONTAINERD_RUNTIME_PASS: required CNI executables\n'
+VERIFY_CONTAINERD
+)
             ;;
         lxd)
-            verify_cmd="command -v lxc >/dev/null 2>&1 && lxc info >/dev/null 2>&1"
+            verify_cmd="$(declare -f verify_lxc_runtime)"$'\n'"verify_lxc_runtime lxc"
             ;;
         incus)
-            verify_cmd="command -v incus >/dev/null 2>&1 && incus info >/dev/null 2>&1"
+            verify_cmd="$(declare -f verify_lxc_runtime)"$'\n'"verify_lxc_runtime incus"
             ;;
         proxmoxve)
             verify_cmd=$(cat <<'VERIFY_PROXMOXVE'
@@ -517,12 +1132,12 @@ systemctl is-active --quiet pve-cluster
 systemctl is-active --quiet pvedaemon
 systemctl is-active --quiet pveproxy
 ss -lnt 2>/dev/null | grep -q ':8006 '
-curl -ksS --connect-timeout 3 --max-time 10 https://127.0.0.1:8006/api2/json/version >/dev/null
+curl --noproxy 'localhost,127.0.0.1,::1' -ksS --connect-timeout 3 --max-time 10 https://127.0.0.1:8006/api2/json/version >/dev/null
 VERIFY_PROXMOXVE
 )
             ;;
         qemu)
-            verify_cmd="command -v virsh >/dev/null 2>&1 && (systemctl is-active --quiet libvirtd || systemctl is-active --quiet virtqemud)"
+            verify_cmd="set -o pipefail; virsh pool-list --name | grep -Fxq default && virsh net-list --name | grep -Fxq default"
             ;;
         kubevirt)
             verify_timeout="${KUBEVIRT_RUNTIME_MAX_WAIT:-2400}"
@@ -551,6 +1166,8 @@ while [ "$SECONDS" -lt "$deadline" ]; do
         last_reason="CDI DataVolume CRD missing"
     elif ! kubectl api-resources --api-group=cdi.kubevirt.io 2>/dev/null | grep -q '^datavolumes[[:space:]]'; then
         last_reason="CDI DataVolume API resource not discoverable"
+    elif ! kubectl get storageclass local-path >/dev/null 2>&1; then
+        last_reason="local-path StorageClass required by DataVolume imports is missing"
     else
         echo "KUBEVIRT_RUNTIME_READY"
         kubectl get nodes -o wide || true
@@ -599,6 +1216,11 @@ VERIFY_KUBEVIRT
     log_info "Verifying ${env} runtime on worker..."
     local verify_output=""
     if verify_output=$(platform_exec_and_wait "${ip}" "${verify_cmd}" "$verify_timeout" 2>&1); then
+        if declare -f platform_validate_worker_resources >/dev/null 2>&1 && \
+           ! platform_validate_worker_resources "$env" "$ip" "${ACTIVE_PLATFORM:-}"; then
+            log_warning "${env} runtime is ready, but the worker no longer satisfies its peak resource budget"
+            return 75
+        fi
         log_success "${env} runtime verified on worker"
         [[ "${DEBUG:-0}" == "1" && -n "$verify_output" ]] && printf '%s\n' "$verify_output" >&2
         return 0
@@ -623,8 +1245,16 @@ VERIFY_KUBEVIRT
 # testing. Readiness is exported per instance type so discovery assertions never
 # pass because an unrelated instance happened to have the same broad type.
 prepare_dirty_node() {
-    local id="$1" ip="$2" env="$3"
+    local id="$1" ip="$2" env="$3" requested_types="${4:-${INSTANCE_TYPES:-both}}"
     local expected_fixtures=0 ready_fixtures=0
+    local prepare_container=false prepare_vm=false
+
+    case "$requested_types" in
+        both) prepare_container=true; prepare_vm=true ;;
+        container) prepare_container=true ;;
+        vm) prepare_vm=true ;;
+        *) log_error "Unsupported dirty-node instance type selection: ${requested_types}"; return 75 ;;
+    esac
 
     export DIRTY_NODE_CONTAINER_READY=false
     export DIRTY_NODE_VM_READY=false
@@ -632,6 +1262,7 @@ prepare_dirty_node() {
     export DIRTY_NODE_VM_EXPECTED=false
     export DIRTY_NODE_CONTAINER_NAME=""
     export DIRTY_NODE_VM_NAME=""
+    export DIRTY_NODE_CONTAINER_PROVIDER_ID=""
     export DIRTY_NODE_VM_PROVIDER_ID=""
 
     log_section "Preparing non-clean worker node for discovery tests"
@@ -667,79 +1298,145 @@ prepare_dirty_node() {
             fi
             ;;
         lxd)
-            expected_fixtures=2
-            DIRTY_NODE_CONTAINER_EXPECTED=true
-            DIRTY_NODE_VM_EXPECTED=true
             # Discovery only needs instance definitions. Empty, stopped
             # definitions avoid coupling this test to a public image server.
-            if platform_exec_and_wait "${ip}" "lxc info pre-existing-1 >/dev/null 2>&1 || lxc init pre-existing-1 --empty" 120; then
-                DIRTY_NODE_CONTAINER_READY=true
-                DIRTY_NODE_CONTAINER_NAME="pre-existing-1"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_container" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_CONTAINER_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "lxc info pre-existing-1 >/dev/null 2>&1 || lxc init pre-existing-1 --empty -c limits.cpu=1 -c limits.memory=256MiB" 120; then
+                    DIRTY_NODE_CONTAINER_READY=true
+                    DIRTY_NODE_CONTAINER_NAME="pre-existing-1"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
-            if platform_exec_and_wait "${ip}" "lxc info pre-existing-vm >/dev/null 2>&1 || lxc init pre-existing-vm --empty --vm -c limits.cpu=1 -c limits.memory=512MiB" 180; then
-                DIRTY_NODE_VM_READY=true
-                DIRTY_NODE_VM_NAME="pre-existing-vm"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_vm" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_VM_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "lxc info pre-existing-vm >/dev/null 2>&1 || lxc init pre-existing-vm --empty --vm -c limits.cpu=1 -c limits.memory=512MiB" 180; then
+                    DIRTY_NODE_VM_READY=true
+                    DIRTY_NODE_VM_NAME="pre-existing-vm"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
             ;;
         incus)
-            expected_fixtures=2
-            DIRTY_NODE_CONTAINER_EXPECTED=true
-            DIRTY_NODE_VM_EXPECTED=true
-            if platform_exec_and_wait "${ip}" "incus info pre-existing-1 >/dev/null 2>&1 || incus init pre-existing-1 --empty" 120; then
-                DIRTY_NODE_CONTAINER_READY=true
-                DIRTY_NODE_CONTAINER_NAME="pre-existing-1"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_container" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_CONTAINER_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "incus info pre-existing-1 >/dev/null 2>&1 || incus init pre-existing-1 --empty -c limits.cpu=1 -c limits.memory=256MiB" 120; then
+                    DIRTY_NODE_CONTAINER_READY=true
+                    DIRTY_NODE_CONTAINER_NAME="pre-existing-1"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
-            if platform_exec_and_wait "${ip}" "incus info pre-existing-vm >/dev/null 2>&1 || incus init pre-existing-vm --empty --vm -c limits.cpu=1 -c limits.memory=512MiB" 180; then
-                DIRTY_NODE_VM_READY=true
-                DIRTY_NODE_VM_NAME="pre-existing-vm"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_vm" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_VM_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "incus info pre-existing-vm >/dev/null 2>&1 || incus init pre-existing-vm --empty --vm -c limits.cpu=1 -c limits.memory=512MiB" 180; then
+                    DIRTY_NODE_VM_READY=true
+                    DIRTY_NODE_VM_NAME="pre-existing-vm"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
             ;;
         proxmoxve)
-            expected_fixtures=1
-            DIRTY_NODE_VM_EXPECTED=true
             # A stopped, diskless QEMU definition is sufficient for discovery and
             # import coverage. It avoids image downloads while exercising the same
-            # PVE 8/9 cluster resource API as a normal VM.
-            if platform_exec_and_wait "${ip}" "qm status 990 >/dev/null 2>&1 || qm create 990 --name pre-existing-vm --memory 512 --cores 1 --ostype l26" 120; then
-                DIRTY_NODE_VM_READY=true
-                DIRTY_NODE_VM_NAME="pre-existing-vm"
-                DIRTY_NODE_VM_PROVIDER_ID="990"
-                ready_fixtures=$((ready_fixtures + 1))
+            # PVE 8/9 cluster resource API as a normal VM.  LXC discovery must be
+            # covered as well: pct list is a separate resource family and a VM-only
+            # dirty fixture previously made `both` silently test only half of PVE.
+            if [[ "$prepare_vm" == "true" ]]; then
+                expected_fixtures=1
+                DIRTY_NODE_VM_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "if qm config 990 2>/dev/null | grep -Fxq 'name: pre-existing-vm'; then exit 0; fi; if qm status 990 >/dev/null 2>&1; then echo 'VMID 990 is occupied by a different guest' >&2; exit 1; fi; qm create 990 --name pre-existing-vm --memory 512 --cores 1 --ostype l26" 120; then
+                    DIRTY_NODE_VM_READY=true
+                    DIRTY_NODE_VM_NAME="pre-existing-vm"
+                    DIRTY_NODE_VM_PROVIDER_ID="990"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
+            fi
+            if [[ "$prepare_container" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_CONTAINER_EXPECTED=true
+                # Prefer a real template when the worker already has one.  On a
+                # freshly installed CI node there may be no template at all, so
+                # create a tiny local archive and use it as an unmanaged stopped
+                # guest.  The fixture is intentionally disk-light and has no
+                # network device; discovery/import only needs a valid pct config.
+                local pve_lxc_fixture_cmd
+                pve_lxc_fixture_cmd='set -u
+ctid=991
+if pct config "$ctid" 2>/dev/null | grep -Fxq "hostname: pre-existing-container"; then
+    exit 0
+fi
+if pct status "$ctid" >/dev/null 2>&1; then
+    echo "CTID $ctid is occupied by a different container" >&2
+    exit 1
+fi
+template="$(find /var/lib/vz/template/cache -maxdepth 1 -type f \( -name "*.tar.zst" -o -name "*.tar.xz" -o -name "*.tar.gz" -o -name "*.tar" \) 2>/dev/null | sort | head -n 1 || true)"
+if [ -z "$template" ]; then
+    cache=/var/lib/vz/template/cache
+    mkdir -p "$cache" || exit 1
+    tmpdir="$(mktemp -d /tmp/oneclickvirt-pve-lxc.XXXXXX)" || exit 1
+    trap '\''rm -rf "$tmpdir"'\'' EXIT
+    mkdir -p "$tmpdir/etc" "$tmpdir/bin" || exit 1
+    printf "oneclickvirt-ci\\n" > "$tmpdir/etc/hostname"
+    printf "ID=oneclickvirt-ci\\nNAME=oneclickvirt-ci\\n" > "$tmpdir/etc/os-release"
+    printf "12.0\\n" > "$tmpdir/etc/debian_version"
+    sh_bin="$(command -v sh)" || exit 1
+    cp "$sh_bin" "$tmpdir/bin/sh" || exit 1
+    tar -C "$tmpdir" -czf "$cache/oneclickvirt-ci.tar.gz" . || exit 1
+    template="$cache/oneclickvirt-ci.tar.gz"
+fi
+template_name="$(basename "$template")"
+pct create "$ctid" "local:vztmpl/$template_name" --hostname pre-existing-container --memory 256 --cores 1 --unprivileged 1 --ostype unmanaged --onboot 0 >/dev/null'
+                if platform_exec_and_wait "${ip}" "${pve_lxc_fixture_cmd}" 180; then
+                    DIRTY_NODE_CONTAINER_READY=true
+                    DIRTY_NODE_CONTAINER_NAME="pre-existing-container"
+                    DIRTY_NODE_CONTAINER_PROVIDER_ID="991"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
             ;;
         qemu)
-            expected_fixtures=2
-            DIRTY_NODE_CONTAINER_EXPECTED=true
-            DIRTY_NODE_VM_EXPECTED=true
-            if platform_exec_and_wait "${ip}" "virsh dominfo pre-existing-vm >/dev/null 2>&1 || printf '%s' '<domain type=\"kvm\"><name>pre-existing-vm</name><memory unit=\"MiB\">512</memory><vcpu>1</vcpu><os><type arch=\"x86_64\">hvm</type></os></domain>' | virsh define /dev/stdin" 120; then
-                DIRTY_NODE_VM_READY=true
-                DIRTY_NODE_VM_NAME="pre-existing-vm"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_vm" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_VM_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "virsh dominfo pre-existing-vm >/dev/null 2>&1 || printf '%s' '<domain type=\"kvm\"><name>pre-existing-vm</name><memory unit=\"MiB\">512</memory><vcpu>1</vcpu><os><type arch=\"x86_64\">hvm</type></os></domain>' | virsh define /dev/stdin" 120; then
+                    DIRTY_NODE_VM_READY=true
+                    DIRTY_NODE_VM_NAME="pre-existing-vm"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
-            if platform_exec_and_wait "${ip}" "virsh -c lxc:/// dominfo pre-existing-container >/dev/null 2>&1 || { mkdir -p /tmp/oneclickvirt-ci-lxc-rootfs; emulator=\$(command -v libvirt_lxc 2>/dev/null || echo /usr/libexec/libvirt_lxc); printf '%s' \"<domain type='lxc'><name>pre-existing-container</name><memory unit='MiB'>256</memory><vcpu>1</vcpu><os><type>exe</type><init>/bin/sh</init></os><devices><emulator>\${emulator}</emulator><filesystem type='mount'><source dir='/tmp/oneclickvirt-ci-lxc-rootfs'/><target dir='/'/></filesystem></devices></domain>\" | virsh -c lxc:/// define /dev/stdin; }" 120; then
-                DIRTY_NODE_CONTAINER_READY=true
-                DIRTY_NODE_CONTAINER_NAME="pre-existing-container"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_container" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_CONTAINER_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "virsh -c lxc:/// dominfo pre-existing-container >/dev/null 2>&1 || { mkdir -p /tmp/oneclickvirt-ci-lxc-rootfs; emulator=\$(command -v libvirt_lxc 2>/dev/null || echo /usr/libexec/libvirt_lxc); printf '%s' \"<domain type='lxc'><name>pre-existing-container</name><memory unit='MiB'>256</memory><vcpu>1</vcpu><os><type>exe</type><init>/bin/sh</init></os><devices><emulator>\${emulator}</emulator><filesystem type='mount'><source dir='/tmp/oneclickvirt-ci-lxc-rootfs'/><target dir='/'/></filesystem></devices></domain>\" | virsh -c lxc:/// define /dev/stdin; }" 120; then
+                    DIRTY_NODE_CONTAINER_READY=true
+                    DIRTY_NODE_CONTAINER_NAME="pre-existing-container"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
             ;;
         kubevirt)
-            expected_fixtures=2
-            DIRTY_NODE_CONTAINER_EXPECTED=true
-            DIRTY_NODE_VM_EXPECTED=true
             platform_exec_and_wait "${ip}" "kubectl create namespace kubevirt-vms >/dev/null 2>&1 || true" 60 || true
-            if platform_exec_and_wait "${ip}" "printf '%s' '{\"apiVersion\":\"kubevirt.io/v1\",\"kind\":\"VirtualMachine\",\"metadata\":{\"name\":\"pre-existing-vm\",\"namespace\":\"kubevirt-vms\"},\"spec\":{\"running\":false,\"template\":{\"metadata\":{\"labels\":{\"kubevirt.io/domain\":\"pre-existing-vm\"}},\"spec\":{\"domain\":{\"devices\":{},\"resources\":{\"requests\":{\"memory\":\"512Mi\"}}},\"terminationGracePeriodSeconds\":0}}}}' | kubectl apply -f -" 120; then
-                DIRTY_NODE_VM_READY=true
-                DIRTY_NODE_VM_NAME="pre-existing-vm"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_vm" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_VM_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "printf '%s' '{\"apiVersion\":\"kubevirt.io/v1\",\"kind\":\"VirtualMachine\",\"metadata\":{\"name\":\"pre-existing-vm\",\"namespace\":\"kubevirt-vms\"},\"spec\":{\"running\":false,\"template\":{\"metadata\":{\"labels\":{\"kubevirt.io/domain\":\"pre-existing-vm\"}},\"spec\":{\"domain\":{\"cpu\":{\"cores\":1},\"devices\":{},\"resources\":{\"requests\":{\"memory\":\"512Mi\"}}},\"terminationGracePeriodSeconds\":0}}}}' | kubectl apply -f -" 120; then
+                    DIRTY_NODE_VM_READY=true
+                    DIRTY_NODE_VM_NAME="pre-existing-vm"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
-            if platform_exec_and_wait "${ip}" "printf '%s' '{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"pre-existing-container\",\"namespace\":\"kubevirt-vms\",\"labels\":{\"oneclickvirt.io/type\":\"container\"}},\"spec\":{\"replicas\":0,\"selector\":{\"matchLabels\":{\"app\":\"pre-existing-container\"}},\"template\":{\"metadata\":{\"labels\":{\"app\":\"pre-existing-container\",\"oneclickvirt.io/type\":\"container\"}},\"spec\":{\"containers\":[{\"name\":\"main\",\"image\":\"busybox:latest\"}]}}}}' | kubectl apply -f -" 120; then
-                DIRTY_NODE_CONTAINER_READY=true
-                DIRTY_NODE_CONTAINER_NAME="pre-existing-container"
-                ready_fixtures=$((ready_fixtures + 1))
+            if [[ "$prepare_container" == "true" ]]; then
+                expected_fixtures=$((expected_fixtures + 1))
+                DIRTY_NODE_CONTAINER_EXPECTED=true
+                if platform_exec_and_wait "${ip}" "printf '%s' '{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"pre-existing-container\",\"namespace\":\"kubevirt-vms\",\"labels\":{\"oneclickvirt.io/type\":\"container\"}},\"spec\":{\"replicas\":0,\"selector\":{\"matchLabels\":{\"app\":\"pre-existing-container\"}},\"template\":{\"metadata\":{\"labels\":{\"app\":\"pre-existing-container\",\"oneclickvirt.io/type\":\"container\"}},\"spec\":{\"containers\":[{\"name\":\"main\",\"image\":\"busybox:latest\",\"resources\":{\"requests\":{\"cpu\":\"1\",\"memory\":\"256Mi\"}}}]}}}}' | kubectl apply -f -" 120; then
+                    DIRTY_NODE_CONTAINER_READY=true
+                    DIRTY_NODE_CONTAINER_NAME="pre-existing-container"
+                    ready_fixtures=$((ready_fixtures + 1))
+                fi
             fi
             ;;
         *)
@@ -750,7 +1447,8 @@ prepare_dirty_node() {
 
     export DIRTY_NODE_CONTAINER_READY DIRTY_NODE_VM_READY
     export DIRTY_NODE_CONTAINER_EXPECTED DIRTY_NODE_VM_EXPECTED
-    export DIRTY_NODE_CONTAINER_NAME DIRTY_NODE_VM_NAME DIRTY_NODE_VM_PROVIDER_ID
+    export DIRTY_NODE_CONTAINER_NAME DIRTY_NODE_VM_NAME
+    export DIRTY_NODE_CONTAINER_PROVIDER_ID DIRTY_NODE_VM_PROVIDER_ID
 
     if (( ready_fixtures == expected_fixtures )); then
         log_success "Prepared ${ready_fixtures}/${expected_fixtures} dirty-node fixtures for ${env}"
@@ -764,8 +1462,8 @@ prepare_dirty_node() {
 deploy_master() {
     local id="$1" ip="$2" port="${3:-80}"
     log_section "Deploying master on ${ip} (port ${port})"
-    platform_exec_and_wait "${ip}" "export noninteractive=true; export DEBIAN_FRONTEND=noninteractive; curl -sSL https://raw.githubusercontent.com/oneclickvirt/docker/main/scripts/dockerinstall.sh | bash" 600
-    platform_exec_and_wait "${ip}" "docker pull oneclickvirt/oneclickvirt:latest && docker run -d --name oneclickvirt --restart=always -p ${port}:80 oneclickvirt/oneclickvirt:latest" 300
+    platform_exec_and_wait "${ip}" "export noninteractive=true; export DEBIAN_FRONTEND=noninteractive; curl -fsSL --connect-timeout 30 --max-time 600 https://raw.githubusercontent.com/oneclickvirt/docker/main/scripts/dockerinstall.sh -o /tmp/oneclickvirt-dockerinstall.sh; rc=\$?; if [ \"\$rc\" -eq 0 ]; then chmod +x /tmp/oneclickvirt-dockerinstall.sh && bash /tmp/oneclickvirt-dockerinstall.sh; rc=\$?; fi; rm -f /tmp/oneclickvirt-dockerinstall.sh; exit \"\$rc\"" 600 || return $?
+    platform_exec_and_wait "${ip}" "docker pull oneclickvirt/oneclickvirt:latest && (docker rm -f oneclickvirt >/dev/null 2>&1 || true) && docker run -d --name oneclickvirt --restart=always -p ${port}:80 oneclickvirt/oneclickvirt:latest" 300 || return $?
 }
 
 # MASTER_SERVER_DIR holds the path to the server directory where the binary runs.
@@ -774,7 +1472,17 @@ MASTER_SERVER_DIR=""
 
 ensure_ci_agent_assets() {
     local server_dir="$1"
-    [[ "${ACTION_TEST_GENERATE_STUB_AGENT:-true}" == "true" ]] || return 0
+    if [[ "${ACTION_TEST_GENERATE_STUB_AGENT:-false}" != "true" ]]; then
+        local repository_root
+        repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+        python3 "${repository_root}/scripts/validate_agent_assets.py" "${server_dir}/assets/agent"
+        return $?
+    fi
+    if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
+        log_error "GitHub integration tests require real Agent artifacts; stub Agent is only for explicit local harness tests"
+        return 1
+    fi
+    log_warning "Using an explicit local stub Agent; this does NOT validate real monitoring, traffic or tunnel behavior"
 
     local asset_dir="${server_dir}/assets/agent"
     mkdir -p "$asset_dir" || return 1
@@ -799,17 +1507,20 @@ if command -v python3 >/dev/null 2>&1; then
   exec python3 - <<'PY'
 import json
 import os
+import shlex
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("AGENT_PORT", "23782"))
-TOKEN = ""
+TOKEN = os.environ.get("API_TOKEN", "")
 ENV_PATH = "/opt/oneclickvirt/agent/.env"
 try:
     with open(ENV_PATH, "r", encoding="utf-8") as env_file:
         for line in env_file:
             if line.startswith("API_TOKEN="):
-                TOKEN = line.split("=", 1)[1].strip()
+                if not TOKEN:
+                    values = shlex.split(line.split("=", 1)[1].strip())
+                    TOKEN = values[0] if values else ""
                 break
 except OSError:
     pass
@@ -1066,7 +1777,7 @@ deploy_master_local() {
         
         # Check if HTTP endpoint is responding (accept 200 or 503 - 503 means server is up but DB not ready)
         local status_code
-        status_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:${_port}/health" 2>/dev/null) || true
+        status_code=$(curl --noproxy 'localhost,127.0.0.1,::1' -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:${_port}/health" 2>/dev/null) || true
         if [[ "$status_code" == "200" || "$status_code" == "503" ]]; then
             log_success "Server started and responding (PID ${pid}, elapsed ${elapsed}s, HTTP ${status_code})"
             return 0
@@ -1131,7 +1842,7 @@ reset_master_server() {
     for i in $(seq 1 12); do
         sleep 5
         local sc
-        sc=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:${port}/health" 2>/dev/null) || true
+        sc=$(curl --noproxy 'localhost,127.0.0.1,::1' -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:${port}/health" 2>/dev/null) || true
         if [[ "${sc}" == "200" || "${sc}" == "503" ]]; then
             log_success "Server responding after reset (HTTP ${sc})"
             break
@@ -1146,7 +1857,7 @@ reset_master_server() {
     fi
 
     # 6. Re-initialise system
-    local init_check; init_check=$(curl -s --max-time 10 "http://localhost:${port}/api/v1/public/init/check" 2>/dev/null)
+    local init_check; init_check=$(curl --noproxy 'localhost,127.0.0.1,::1' -s --max-time 10 "http://localhost:${port}/api/v1/public/init/check" 2>/dev/null)
     local need_init; need_init=$(echo "${init_check}" | jq -r '.data.needInit // true' 2>/dev/null)
     if [[ "${need_init}" == "true" ]]; then
         local init_resp; init_resp=$(init_system "http://localhost:${port}" "${ADMIN_USER}" "${ADMIN_PASS}")

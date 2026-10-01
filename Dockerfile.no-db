@@ -26,8 +26,7 @@ COPY scripts/install_agent.sh /app/install_agent.sh
 RUN mkdir -p assets/agent && cp /app/install_agent.sh assets/agent/install_agent.sh
 RUN go version
 RUN go mod download
-RUN sed -i "s/const ServerVersion = \".*\"/const ServerVersion = \"${SERVER_VERSION}\"/" constant/version.go && \
-    sed -i "s/const CompatibleAgentVersion = \".*\"/const CompatibleAgentVersion = \"${SERVER_VERSION}\"/" constant/version.go
+RUN sed -i "s/const ServerVersion = \".*\"/const ServerVersion = \"${SERVER_VERSION}\"/" constant/version.go
 RUN BUILD_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "docker") && \
     BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -installsuffix cgo \
@@ -128,6 +127,23 @@ RUN echo 'user www-data;' > /etc/nginx/nginx.conf && \
     echo '            proxy_set_header X-Forwarded-Host $http_host;' >> /etc/nginx/nginx.conf && \
     echo '            proxy_set_header X-Forwarded-Proto $scheme;' >> /etc/nginx/nginx.conf && \
     echo '            proxy_set_header X-Forwarded-Port $server_port;' >> /etc/nginx/nginx.conf && \
+    echo '        }' >> /etc/nginx/nginx.conf && \
+    echo '        ' >> /etc/nginx/nginx.conf && \
+    echo '        # Never serve dotfiles or fall them back to the SPA.' >> /etc/nginx/nginx.conf && \
+    echo '        location ~ /\.(?!well-known(?:/|$)) {' >> /etc/nginx/nginx.conf && \
+    echo '            deny all;' >> /etc/nginx/nginx.conf && \
+    echo '            access_log off;' >> /etc/nginx/nginx.conf && \
+    echo '            log_not_found off;' >> /etc/nginx/nginx.conf && \
+    echo '        }' >> /etc/nginx/nginx.conf && \
+    echo '        ' >> /etc/nginx/nginx.conf && \
+    echo '        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {' >> /etc/nginx/nginx.conf && \
+    echo '            try_files $uri =404;' >> /etc/nginx/nginx.conf && \
+    echo '            add_header Cache-Control "public, max-age=604800, immutable";' >> /etc/nginx/nginx.conf && \
+    echo '        }' >> /etc/nginx/nginx.conf && \
+    echo '        ' >> /etc/nginx/nginx.conf && \
+    echo '        location = /index.html {' >> /etc/nginx/nginx.conf && \
+    echo '            try_files $uri =404;' >> /etc/nginx/nginx.conf && \
+    echo '            add_header Cache-Control "no-cache, no-store, must-revalidate" always;' >> /etc/nginx/nginx.conf && \
     echo '        }' >> /etc/nginx/nginx.conf && \
     echo '        ' >> /etc/nginx/nginx.conf && \
     echo '        location / {' >> /etc/nginx/nginx.conf && \

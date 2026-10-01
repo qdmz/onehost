@@ -26,15 +26,26 @@ run_module_27() {
 
     # ---- Auto-configure provider (creates a task) ----
     if [[ -n "$PROVIDER_ID" ]]; then
+        local auto_expected="400"
+        case "$ENV_TYPE" in
+            lxd|incus|proxmox|proxmoxve) auto_expected="200|201|infra" ;;
+        esac
         local auto_resp; auto_resp=$(test_api "Auto-configure provider" "POST" \
-            "/api/v1/admin/providers/auto-configure" "200|201|400|500" \
+            "/api/v1/admin/providers/auto-configure" "$auto_expected" \
             '{"providerId":'"$PROVIDER_ID"'}' "$group" "$ADMIN_TOKEN")
         local cfg_task; cfg_task=$(echo "$auto_resp" | jq -r '.data.taskId // .data.task_id // empty' 2>/dev/null)
 
         if [[ -n "$cfg_task" ]]; then
-            wait_configuration_task_complete_nonfatal "$cfg_task" "$ADMIN_TOKEN" "$CONFIG_TASK_MAX_WAIT" 10 || true
+            local cfg_result=""
+            if ! cfg_result=$(wait_configuration_task_complete_nonfatal "$cfg_task" "$ADMIN_TOKEN" "$CONFIG_TASK_MAX_WAIT" 10); then
+                record_fail_result "Auto-configure task completion" "GET" "/api/v1/admin/configuration-tasks/${cfg_task}" \
+                    "completed" "failed" "$cfg_result" "$group"
+            fi
             test_api "Get config task detail" "GET" "/api/v1/admin/configuration-tasks/${cfg_task}" "200" \
                 "" "$group" "$ADMIN_TOKEN"
+        elif [[ "$auto_expected" != "400" ]]; then
+            record_fail_result "Auto-configure task creation" "POST" "/api/v1/admin/providers/auto-configure" \
+                "task id" "missing" "$auto_resp" "$group"
         fi
 
         # ---- Export provider configs ----
@@ -44,7 +55,7 @@ run_module_27() {
             '{"provider_ids":[]}' "$group" "$ADMIN_TOKEN"
 
         # ---- Hardware report ----
-        test_api "Save hardware report" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "200|400|409|500" \
+        test_api "Save hardware report" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "200|infra" \
             '{"pasteUrl":"https://paste.spiritlhl.net/#/show/ENn4E.txt"}' "$group" "$ADMIN_TOKEN"
         test_api "Save hardware report (invalid URL)" "POST" "/api/v1/admin/providers/${PROVIDER_ID}/hardware-report" "400" \
             '{"pasteUrl":"https://example.com/badreport.txt"}' "$group" "$ADMIN_TOKEN"

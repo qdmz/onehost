@@ -3,6 +3,7 @@ package containerd
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -18,17 +19,34 @@ import (
 )
 
 const (
-	providerType      = "containerd"
-	cliName           = "nerdctl"
-	ipv4Network       = "containerd-net"
-	ipv4Subnet        = "172.21.0.0/16"
-	ipv6Network       = "containerd-ipv6"
-	imageDir          = "/usr/local/bin/containerd_ct_images"
-	ipv6CheckFile     = "/usr/local/bin/containerd_check_ipv6"
-	storageDriverFile = "/usr/local/bin/containerd_storage_driver"
-	scriptRepo        = "oneclickvirt/containerd"
-	serviceCheckName  = "nerdctl"
+	providerType                       = "containerd"
+	cliName                            = "nerdctl"
+	ipv4Network                        = "containerd-net"
+	ipv4Subnet                         = "172.21.0.0/16"
+	ipv6Network                        = "containerd-ipv6"
+	imageDir                           = "/usr/local/bin/containerd_ct_images"
+	ipv6CheckFile                      = "/usr/local/bin/containerd_check_ipv6"
+	storageDriverFile                  = "/usr/local/bin/containerd_storage_driver"
+	scriptRepo                         = "oneclickvirt/containerd"
+	serviceCheckName                   = "nerdctl"
+	containerdIPv6NetworkModeFile      = "/usr/local/bin/containerd_ipv6_network_mode"
+	containerdIPv6SubnetFile           = "/usr/local/bin/containerd_ipv6_subnet"
+	containerdIPv6NetworkModeNAT       = "nat"
+	containerdIPv6NDPRequiredFile      = "/usr/local/bin/containerd_ipv6_ndp_required"
+	containerdIPv6NDPReadyFile         = "/usr/local/bin/containerd_ipv6_ndp_ready"
+	containerdIPv6NDPReadyRequiredFile = "/usr/local/bin/containerd_ipv6_ndp_ready_required"
 )
+
+func rejectContainerdNAT66PublicStaticIPv6(staticIPv6 string, nat66 bool) error {
+	if !nat66 || strings.TrimSpace(staticIPv6) == "" {
+		return nil
+	}
+	normalized, err := utils.NormalizeIPv6Address(staticIPv6)
+	if err == nil && utils.IsPublicIPv6(normalized) {
+		return fmt.Errorf("节点 Containerd IPv6 当前仅提供 ULA NAT66 出站连接，不能分配公网静态 IPv6 %s", normalized)
+	}
+	return nil
+}
 
 // ContainerdProvider Containerd/nerdctl容器运行时Provider（独立实现，不依赖docker包）
 type ContainerdProvider struct {
@@ -370,23 +388,18 @@ func (c *ContainerdProvider) GetInstance(ctx context.Context, id string) (*provi
 		return nil, fmt.Errorf("not connected")
 	}
 
-	output, err := c.sshClient.ExecuteWithLogging(fmt.Sprintf("%s inspect %s --format '{{.Name}}|{{.State.Status}}|{{.Config.Image}}|{{.Id}}|{{.Created}}'", cliName, shellSingleQuote(id)), "CONTAINERD_INSPECT")
+	output, err := c.sshClient.ExecuteWithLogging(fmt.Sprintf("%s inspect %s --format '{{.Name}}|{{.State.Status}}|{{.Config.Image}}|{{.ID}}'", cliName, shellSingleQuote(id)), "CONTAINERD_INSPECT")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get instance: %w", err)
 	}
 
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return nil, fmt.Errorf("instance not found")
-	}
-
-	fields := strings.Split(output, "|")
-	if len(fields) < 4 {
-		return nil, fmt.Errorf("invalid instance data: unexpected format")
+	record, parseErr := utils.ParseContainerInspectOutput(output)
+	if parseErr != nil {
+		return nil, fmt.Errorf("invalid containerd inspect output: %w", parseErr)
 	}
 
 	status := "unknown"
-	statusField := strings.ToLower(fields[1])
+	statusField := strings.ToLower(record.Status)
 	if strings.Contains(statusField, "running") {
 		status = "running"
 	} else if strings.Contains(statusField, "exited") {
@@ -396,10 +409,10 @@ func (c *ContainerdProvider) GetInstance(ctx context.Context, id string) (*provi
 	}
 
 	instance := &provider.Instance{
-		ID:     fields[3],
-		Name:   strings.TrimPrefix(fields[0], "/"),
+		ID:     record.ID,
+		Name:   strings.TrimPrefix(record.Name, "/"),
 		Status: status,
-		Image:  fields[2],
+		Image:  record.Image,
 	}
 
 	if status == "running" {
@@ -413,8 +426,8 @@ func (c *ContainerdProvider) enrichInstanceWithNetworkInfo(instance *provider.In
 	cmd := fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{$config.IPAddress}}{{end}}'", cliName, shellSingleQuote(instance.Name))
 	output, err := c.sshClient.Execute(cmd)
 	if err == nil {
-		ipAddress := strings.TrimSpace(output)
-		if ipAddress != "" && ipAddress != "<no value>" {
+		ipAddress, parseErr := utils.ParseFirstIPv4AddressOutput(output)
+		if parseErr == nil {
 			instance.PrivateIP = ipAddress
 			instance.IP = ipAddress
 		}
@@ -437,8 +450,8 @@ fi
 `, shellSingleQuote(instance.Name), cliName)
 	vethOutput, err := c.sshClient.Execute(vethCmd)
 	if err == nil {
-		vethInterface := utils.CleanCommandOutput(vethOutput)
-		if vethInterface != "" {
+		vethInterface, parseErr := utils.ParseFirstNetworkInterfaceOutput(vethOutput)
+		if parseErr == nil {
 			if instance.Metadata == nil {
 				instance.Metadata = make(map[string]string)
 			}
@@ -450,8 +463,8 @@ fi
 		fallbackCmd := fmt.Sprintf("%s inspect %s --format '{{.NetworkSettings.IPAddress}}'", cliName, shellSingleQuote(instance.Name))
 		fallbackOutput, fallbackErr := c.sshClient.Execute(fallbackCmd)
 		if fallbackErr == nil {
-			ipAddress := strings.TrimSpace(fallbackOutput)
-			if ipAddress != "" && ipAddress != "<no value>" {
+			ipAddress, parseErr := utils.ParseFirstIPv4AddressOutput(fallbackOutput)
+			if parseErr == nil {
 				instance.PrivateIP = ipAddress
 				instance.IP = ipAddress
 			}
@@ -464,8 +477,8 @@ fi
 		cmd = fmt.Sprintf("%s inspect %s --format '{{range $net, $config := .NetworkSettings.Networks}}{{if $config.GlobalIPv6Address}}{{$config.GlobalIPv6Address}}{{end}}{{end}}'", cliName, shellSingleQuote(instance.Name))
 		output, err = c.sshClient.Execute(cmd)
 		if err == nil {
-			ipv6Address := strings.TrimSpace(output)
-			if ipv6Address != "" && ipv6Address != "<no value>" {
+			ipv6Address, parseErr := utils.ParseFirstIPv6AddressOutput(output)
+			if parseErr == nil {
 				instance.IPv6Address = ipv6Address
 			}
 		}
@@ -481,17 +494,72 @@ func (c *ContainerdProvider) checkIPv6NetworkAvailable() bool {
 	if err != nil {
 		return false
 	}
-	ndpresponderCmd := fmt.Sprintf("%s inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null", cliName)
-	ndpresponderOutput, err := c.sshClient.Execute(ndpresponderCmd)
-	if err != nil || strings.TrimSpace(ndpresponderOutput) != "running" {
-		return false
+	if c.containerdIPv6NetworkUsesNAT66() {
+		if global.APP_LOG != nil {
+			global.APP_LOG.Debug("Containerd IPv6网络使用 ULA NAT66，跳过公网 NDP responder 检查",
+				zap.String("provider", c.config.Name))
+		}
+		return true
+	}
+	ndpRequired := c.containerdIPv6NDPRequired()
+	if ndpRequired {
+		ndpresponderCmd := fmt.Sprintf("%s inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null", cliName)
+		ndpresponderOutput, err := c.sshClient.Execute(ndpresponderCmd)
+		if err != nil || strings.TrimSpace(ndpresponderOutput) != "running" {
+			return false
+		}
 	}
 	ipv6ConfigCmd := fmt.Sprintf("[ -f %s ] && [ -s %s ] && [ \"$(sed -e '/^[[:space:]]*$/d' %s)\" != \"\" ] && echo 'valid' || echo 'invalid'", ipv6CheckFile, ipv6CheckFile, ipv6CheckFile)
 	ipv6ConfigOutput, err := c.sshClient.Execute(ipv6ConfigCmd)
 	if err != nil || strings.TrimSpace(ipv6ConfigOutput) != "valid" {
 		return false
 	}
+	if ndpRequired {
+		readyCmd := fmt.Sprintf("if [ \"$(tr -d '[:space:]' < %s 2>/dev/null || true)\" = true ]; then test -s %s; fi", shellSingleQuote(containerdIPv6NDPReadyRequiredFile), shellSingleQuote(containerdIPv6NDPReadyFile))
+		if _, err := c.sshClient.Execute(readyCmd); err != nil {
+			return false
+		}
+	}
 	return true
+}
+
+func (c *ContainerdProvider) containerdIPv6NDPRequired() bool {
+	command := fmt.Sprintf("if [ -s %s ]; then tr -d '[:space:]' < %s; else printf true; fi", shellSingleQuote(containerdIPv6NDPRequiredFile), shellSingleQuote(containerdIPv6NDPRequiredFile))
+	output, err := c.sshClient.Execute(command)
+	if err != nil {
+		return true
+	}
+	return !strings.EqualFold(strings.TrimSpace(output), "false")
+}
+
+func (c *ContainerdProvider) containerdIPv6NetworkUsesNAT66() bool {
+	if !c.connected || c.sshClient == nil {
+		return false
+	}
+	modeOutput, modeErr := c.sshClient.Execute(fmt.Sprintf("cat %s 2>/dev/null || true", shellSingleQuote(containerdIPv6NetworkModeFile)))
+	if modeErr != nil || !strings.EqualFold(strings.TrimSpace(modeOutput), containerdIPv6NetworkModeNAT) {
+		return false
+	}
+	subnetOutput, subnetErr := c.sshClient.Execute(fmt.Sprintf("cat %s 2>/dev/null || true", shellSingleQuote(containerdIPv6SubnetFile)))
+	if subnetErr != nil {
+		return false
+	}
+	for _, network := range utils.ExtractIPv6Networks(subnetOutput, 128) {
+		prefix, parseErr := netip.ParsePrefix(network.CIDR())
+		if parseErr == nil && prefix.Bits() == 64 && prefix.Addr().IsPrivate() {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ContainerdProvider) resolveContainerdNetwork(networkType, staticIPv6 string) (utils.ContainerNetworkSelection, error) {
+	hasIPv6 := utils.NetworkTypeHasIPv6(networkType)
+	available := hasIPv6 && c.checkIPv6NetworkAvailable()
+	if err := rejectContainerdNAT66PublicStaticIPv6(staticIPv6, available && c.containerdIPv6NetworkUsesNAT66()); err != nil {
+		return utils.ContainerNetworkSelection{}, err
+	}
+	return utils.ResolveContainerNetwork(networkType, staticIPv6, ipv4Network, ipv6Network, available)
 }
 
 // ExecuteSSHCommand 执行SSH命令

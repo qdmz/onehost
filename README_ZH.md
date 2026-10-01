@@ -234,9 +234,9 @@ Proxmox VE、QEMU/KVM、KubeVirt 等虚拟化后端；前端同时提供**用户
 | 镜像标签 | 说明 | 适用场景 |
 |---------|------|---------|
 | `oneclickvirt/oneclickvirt:latest` | 一体化版本（内置数据库）最新版 | 快速部署 |
-| `oneclickvirt/oneclickvirt:20260717` | 一体化版本特定日期版本 | 需要固定版本 |
+| `oneclickvirt/oneclickvirt:20260925` | 一体化版本特定日期版本 | 需要固定版本 |
 | `oneclickvirt/oneclickvirt:no-db` | 独立数据库版本最新版 | 不内置数据库 |
-| `oneclickvirt/oneclickvirt:no-db-20260717` | 独立数据库版本特定日期 | 不内置数据库 |
+| `oneclickvirt/oneclickvirt:no-db-20260925` | 独立数据库版本特定日期 | 不内置数据库 |
 
 所有镜像均支持 `linux/amd64` 和 `linux/arm64` 架构。
 
@@ -249,6 +249,9 @@ Proxmox VE、QEMU/KVM、KubeVirt 等虚拟化后端；前端同时提供**用户
 docker run -d \
   --name oneclickvirt \
   -p 80:80 \
+  -p 10000-10099:10000-10099 \
+  -e OCV_CONTROLLER_PORT_RANGE_START=10000 \
+  -e OCV_CONTROLLER_PORT_RANGE_END=10099 \
   -v oneclickvirt-data:/var/lib/mysql \
   -v oneclickvirt-storage:/app/storage \
   --restart unless-stopped \
@@ -263,6 +266,9 @@ docker run -d \
 docker run -d \
   --name oneclickvirt \
   -p 80:80 \
+  -p 10000-10099:10000-10099 \
+  -e OCV_CONTROLLER_PORT_RANGE_START=10000 \
+  -e OCV_CONTROLLER_PORT_RANGE_END=10099 \
   -e FRONTEND_URL="https://your-domain.com" \
   -v oneclickvirt-data:/var/lib/mysql \
   -v oneclickvirt-storage:/app/storage \
@@ -276,6 +282,9 @@ docker run -d \
 docker run -d \
   --name oneclickvirt \
   -p 80:80 \
+  -p 10000-10099:10000-10099 \
+  -e OCV_CONTROLLER_PORT_RANGE_START=10000 \
+  -e OCV_CONTROLLER_PORT_RANGE_END=10099 \
   -e FRONTEND_URL="https://your-domain.com" \
   -v oneclickvirt-data:/var/lib/mysql \
   -v oneclickvirt-storage:/app/storage \
@@ -294,6 +303,9 @@ docker run -d \
 docker run -d \
   --name oneclickvirt \
   -p 80:80 \
+  -p 10000-10099:10000-10099 \
+  -e OCV_CONTROLLER_PORT_RANGE_START=10000 \
+  -e OCV_CONTROLLER_PORT_RANGE_END=10099 \
   -e FRONTEND_URL="https://your-domain.com" \
   -e DB_HOST="your-mysql-host" \
   -e DB_PORT="3306" \
@@ -312,6 +324,9 @@ docker run -d \
 - `DB_NAME`: 数据库名称
 - `DB_USER`: 数据库用户名
 - `DB_PASSWORD`: 数据库密码
+- `OCV_CONTROLLER_PORT_RANGE_START` / `OCV_CONTROLLER_PORT_RANGE_END`：Agent 控制端内穿使用的 TCP 端口范围。宿主机与容器必须发布完全相同的范围，文档默认值为 `10000-10099`。仅在预期并发内穿数量确实需要时扩大，因为 Docker 会把发布范围展开为逐端口绑定。
+
+控制端内穿监听实际运行在面板容器内部。Docker 的 `-p` 范围必须与两个 `OCV_CONTROLLER_PORT_RANGE_*` 环境变量完全一致；配置范围外的端口会被拒绝，不再出现数据库显示 active、但公网不可达的情况。源码或裸机部署不设置这两个变量时，继续保留原有的 `10000-65535` 分配范围。
 
 `no-db` 镜像会将运行时配置保存到 `oneclickvirt-storage` 卷内的 `/app/storage/config.yaml`。更新镜像或重建容器时必须继续挂载同一个存储卷；初始化页面写入的数据库配置和系统级配置会随该卷保留。非空的 `DB_*` 环境变量优先于配置文件，因此重建时也可继续传入同一组数据库环境变量。显式挂载 `/app/config.yaml` 的部署仍会优先使用该文件。
 
@@ -365,6 +380,8 @@ services:
     ports:
       - "你的端口:80"  # 例如 "80:80" 或 "8080:80"
 ```
+
+Agent 控制端内穿范围通过 `.env` 同时设置 `OCV_CONTROLLER_PORT_RANGE_START` 和 `OCV_CONTROLLER_PORT_RANGE_END`；Compose 会自动在 `api` 服务发布相同的 TCP 范围。范围应按实际容量设置，不要无条件发布全部端口。
 
 **停止服务：**
 
@@ -432,6 +449,33 @@ bash install_full.sh --db-type mysql --no-db-fallback
 
 </details>
 
+### 主控面板版本管理
+
+登录超级管理员后，可在主控页面页脚的“升级管理”中查看当前版本、可用 Release、远程回退版本、本地备份和对应的人工命令。
+
+- 面板仅会在 Linux、root 用户、受控 systemd 服务、主控二进制和待更新 Web 目录均位于受控安装根目录且无符号链接时执行自动升级、回退或重启。切换前会创建最多五份本地备份，失败时尝试恢复主控和 Web 资产；数据库迁移不会自动逆向回退。
+- Release 必须包含 `SHA256SUMS` 资产。面板先下载校验清单，再校验所选 Linux 主控包和（部署配置为管理受控静态目录时的）`web-dist.zip`，随后才会解包或修改本机文件。历史 Release 没有该清单时会显示为不可自动应用，仍可使用原脚本手动处理。
+- Docker、Docker Compose 和源码部署不会由面板写入运行环境，只会显示命令。Compose 当前项目使用 `docker compose up -d --build --force-recreate api web` 重建 API 与 Web，保留 `mysql_data` 命名卷；Docker 自定义端口、域名、环境变量或 `no-db` 部署应先导出并复用原始容器参数。
+- 已配置的反向代理只有在 `ONECLICKVIRT_PROXY_SERVICES` 明确列出时才会在受控 systemd 重启后执行 `reload`。Release 元数据和资产下载会依次使用 GitHub、`ONECLICKVIRT_UPDATE_API_ENDPOINTS` 和现有 CDN/API 反代端点；所有面板下载地址均要求 HTTPS。
+
+常用覆盖项（建议写入受控服务的环境文件后重启服务）：
+
+| 变量 | 用途 |
+| --- | --- |
+| `ONECLICKVIRT_UPDATE_ENABLED=false` | 完全禁用面板升级、回退和重启按钮。 |
+| `ONECLICKVIRT_UPDATE_MODE` | 强制部署模式：`systemd`、`docker`、`compose`、`source`、`embedded`、`unknown` 或 `disabled`。Compose 容器无法可靠自识别时可显式设为 `compose`。 |
+| `ONECLICKVIRT_UPDATE_PROXY` | 逗号分隔的 HTTPS 发布资产/CDN 反代前缀。 |
+| `ONECLICKVIRT_UPDATE_API_ENDPOINTS` | 逗号分隔的 HTTPS GitHub API 或 API 反代根地址。 |
+| `ONECLICKVIRT_UPDATE_REPO` | Release 仓库，默认 `oneclickvirt/oneclickvirt`。 |
+| `ONECLICKVIRT_UPDATE_FLAVOR` | `standalone` 或 `allinone`；通常由安装器记录的 `SERVER_ASSET` 自动识别。 |
+| `ONECLICKVIRT_UPDATE_WEB` | 显式启用或禁用受控静态 Web 目录的替换。`install_full.sh` 会设为 `true`，因为其反向代理会提供 `web-dist.zip` 静态文件。 |
+| `ONECLICKVIRT_INSTALL_ROOT`、`ONECLICKVIRT_SERVER_BIN`、`ONECLICKVIRT_WEB_DIR` | 受控安装根目录、主控二进制和受管理的静态 Web 目录。自动模式要求相应更新目标在安装根目录内。 |
+| `ONECLICKVIRT_SERVICE_NAME`、`ONECLICKVIRT_SERVICE_FILE` | 受控 systemd 服务及其 unit 文件。 |
+| `ONECLICKVIRT_PROXY_SERVICES` | 逗号分隔的 Nginx/OpenResty/Caddy 等 systemd 服务名，升级或重启后执行 `reload`。 |
+| `ONECLICKVIRT_UPDATE_SCRIPT` | 页脚“命令”页使用的原安装脚本路径；未找到时显示官方下载后执行的命令。 |
+| `ONECLICKVIRT_UPDATE_HEALTH_PORT` | 重启后的本机 `/api/v1/health` 检查端口，默认读取主控配置或使用 `8888`。 |
+| `ONECLICKVIRT_UPDATE_ALLOW_UNVERIFIED=true` | 仅用于受控恢复场景，允许缺少 `SHA256SUMS` 的旧 Release；生产环境不建议设置。 |
+
 ### 方式四：自己编译打包
 
 <details>
@@ -448,6 +492,9 @@ docker build -t oneclickvirt .
 docker run -d \
   --name oneclickvirt \
   -p 80:80 \
+  -p 10000-10099:10000-10099 \
+  -e OCV_CONTROLLER_PORT_RANGE_START=10000 \
+  -e OCV_CONTROLLER_PORT_RANGE_END=10099 \
   -v oneclickvirt-data:/var/lib/mysql \
   -v oneclickvirt-storage:/app/storage \
   --restart unless-stopped \
@@ -471,6 +518,9 @@ docker build -f Dockerfile.no-db -t oneclickvirt:no-db .
 docker run -d \
   --name oneclickvirt \
   -p 80:80 \
+  -p 10000-10099:10000-10099 \
+  -e OCV_CONTROLLER_PORT_RANGE_START=10000 \
+  -e OCV_CONTROLLER_PORT_RANGE_END=10099 \
   -e FRONTEND_URL="https://your-domain.com" \
   -e DB_HOST="your-mysql-host" \
   -e DB_PORT="3306" \
@@ -487,6 +537,10 @@ docker run -d \
 直接执行 Go 源码编译时也是同样逻辑：`server/assets/agent/` 里的本地 Agent 资源是可选的，缺失时会回退到官方 GitHub 安装脚本和 Release 包，不会因此导致控制端构建失败。
 
 </details>
+
+### Proxmox VE 集成检查
+
+`proxmoxve` 集成任务使用 [`oneclickvirt/pve`](https://github.com/oneclickvirt/pve) 的安装脚本，在可销毁的 Worker 上执行分离式安装阶段，等待内核重启以及可能由 `ifupdown2` 引导服务触发的第二次重启，然后校验 PVE 运行时、网桥、NAT 状态和主控侧 Provider 链路。只有在分离任务无法继续观测时才会将失联归类为基础设施跳过，不会把它当作模块测试通过。PVE 仓库本身还会执行脚本语法、网络回归和 ShellCheck 检查。
 
 ### 方式五：手动开发部署
 
@@ -670,10 +724,6 @@ docker compose restart api
   &nbsp;&nbsp;
   <a href="https://linux.do/">
     <img src="https://cdn3.ldstatic.com/original/4X/d/1/4/d146c68151340881c884d95e0da4acdf369258c6.png" alt="Linux DO" height="44">
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://www.jtti.cc/zh/activity/special-offer.html?z=oneclickvirt">
-    <img src="https://www.jtti.cc/static/images/common/article_logo.png" alt="Jtti.cc" height="44">
   </a>
 </p>
 

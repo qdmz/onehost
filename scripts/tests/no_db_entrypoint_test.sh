@@ -107,6 +107,14 @@ test_healthcheck_runtime_dependencies_are_installed() {
     assert_contains "${NO_DB_DOCKERFILE}" "CMD wget --quiet"
 }
 
+test_nginx_configs_block_dotfiles() {
+    local compose_nginx_config="${REPO_ROOT}/deploy/default.conf"
+    assert_contains "${NO_DB_DOCKERFILE}" 'location ~ /\.(?!well-known(?:/|$)) {'
+    assert_contains "${NO_DB_DOCKERFILE}" 'deny all;'
+    assert_contains "${compose_nginx_config}" 'location ~ /\.(?!well-known(?:/|$)) {'
+    assert_contains "${compose_nginx_config}" 'deny all;'
+}
+
 test_lifecycle_config_uses_single_password_source() (
     local temp_dir source_config target_config missing_key_config test_password
     temp_dir="$(mktemp -d)"
@@ -134,10 +142,25 @@ test_lifecycle_config_uses_single_password_source() (
     fi
 )
 
+test_lifecycle_config_helper_classifies_direct_discovery_as_environment_gap() (
+    local output rc=0
+    output="$(TEST_DB_PASSWORD='unused' bash "${LIFECYCLE_CONFIG_PREPARER}" 2>&1)" || rc=$?
+    [[ "${rc}" == "75" ]] || {
+        echo "Direct lifecycle helper discovery should return environment status 75, got ${rc}" >&2
+        exit 1
+    }
+    [[ "${output}" == *"/app/config.yaml.default"* && "${output}" == *"environment prerequisite"* ]] || {
+        echo "Direct lifecycle helper discovery did not explain the missing image config" >&2
+        exit 1
+    }
+)
+
 test_persistent_config_survives_restart
 test_explicit_config_mount_remains_authoritative
 test_frontend_url_updates_persisted_config_and_proxy_scheme
 test_healthcheck_runtime_dependencies_are_installed
+test_nginx_configs_block_dotfiles
 test_lifecycle_config_uses_single_password_source
+test_lifecycle_config_helper_classifies_direct_discovery_as_environment_gap
 
 echo "no-db entrypoint tests passed"

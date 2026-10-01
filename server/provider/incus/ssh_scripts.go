@@ -21,6 +21,9 @@ func isIncusConfigUnsupportedError(err error) bool {
 	return strings.Contains(errMsg, "unknown key") ||
 		strings.Contains(errMsg, "invalid config") ||
 		strings.Contains(errMsg, "not supported") ||
+		strings.Contains(errMsg, "does not support") ||
+		strings.Contains(errMsg, "doesn't support") ||
+		strings.Contains(errMsg, "unsupported") ||
 		strings.Contains(errMsg, "cgroup controller is missing")
 }
 
@@ -51,35 +54,6 @@ func (i *IncusProvider) configureInstanceSecurity(ctx context.Context, config pr
 		if err := i.setInstanceConfig(ctx, config.Name, "security.secureboot", "false"); err != nil {
 			global.APP_LOG.Warn("设置SecureBoot失败", zap.Error(err))
 		}
-
-		if err := i.setInstanceConfig(ctx, config.Name, "limits.cpu.priority", "0"); err != nil {
-			if isIncusConfigUnsupportedError(err) {
-				global.APP_LOG.Warn("设置CPU优先级失败，当前节点不支持该配置，已跳过", zap.Error(err))
-			} else {
-				global.APP_LOG.Warn("设置CPU优先级失败", zap.Error(err))
-			}
-		}
-
-		swapEnabled := true
-		if err := i.setInstanceConfig(ctx, config.Name, "limits.memory.swap", swapValue); err != nil {
-			if isIncusConfigUnsupportedError(err) {
-				swapEnabled = false
-				global.APP_LOG.Warn("设置内存交换失败，当前节点不支持该配置，已跳过", zap.Error(err))
-			} else {
-				swapEnabled = false
-				global.APP_LOG.Warn("设置内存交换失败", zap.Error(err))
-			}
-		}
-
-		if swapEnabled && swapValue == "true" {
-			if err := i.setInstanceConfig(ctx, config.Name, "limits.memory.swap.priority", "1"); err != nil {
-				if isIncusConfigUnsupportedError(err) {
-					global.APP_LOG.Warn("设置内存交换优先级失败，当前节点不支持该配置，已跳过", zap.Error(err))
-				} else {
-					global.APP_LOG.Warn("设置内存交换优先级失败", zap.Error(err))
-				}
-			}
-		}
 	} else {
 		nestingValue := "true"
 		if config.AllowNesting != nil && !*config.AllowNesting {
@@ -88,11 +62,12 @@ func (i *IncusProvider) configureInstanceSecurity(ctx context.Context, config pr
 
 		// 容器安全配置
 		if err := i.setInstanceConfig(ctx, config.Name, "security.nesting", nestingValue); err != nil {
-			if isIncusConfigUnsupportedError(err) {
-				global.APP_LOG.Warn("设置容器嵌套失败，当前节点不支持该配置，已跳过", zap.Error(err))
-			} else {
-				global.APP_LOG.Warn("设置容器嵌套失败", zap.Error(err))
-			}
+			// security.nesting is the explicit container capability requested by
+			// the provider. Treat a failed write as a create failure; otherwise a
+			// Docker-in-Docker instance is reported as ready while the kernel still
+			// rejects nested operations. The error text retains the unsupported-key
+			// detail for nodes whose Incus build cannot provide the feature.
+			return fmt.Errorf("设置容器嵌套 security.nesting=%s 失败: %w", nestingValue, err)
 		}
 
 		// CPU优先级配置
@@ -119,7 +94,7 @@ func (i *IncusProvider) configureInstanceSecurity(ctx context.Context, config pr
 		if swapEnabled && swapValue == "true" {
 			if err := i.setInstanceConfig(ctx, config.Name, "limits.memory.swap.priority", "1"); err != nil {
 				if isIncusConfigUnsupportedError(err) {
-					global.APP_LOG.Warn("设置内存交换优先级失败，当前节点不支持该配置，已跳过", zap.Error(err))
+					global.APP_LOG.Debug("当前节点不支持内存交换优先级，已跳过", zap.Error(err))
 				} else {
 					global.APP_LOG.Warn("设置内存交换优先级失败", zap.Error(err))
 				}
@@ -200,7 +175,7 @@ func (i *IncusProvider) setInstanceConfig(ctx context.Context, instanceName stri
 
 	// SSH方式设置配置（优先 key=value 新语法，兼容回退到旧语法）
 	cmdNew := fmt.Sprintf("incus config set %s %s=%s", shellSingleQuote(instanceName), shellSingleQuote(key), shellSingleQuote(value))
-	_, newErr := i.sshClient.Execute(cmdNew)
+	newOutput, newErr := i.sshClient.Execute(cmdNew)
 	if newErr == nil {
 		global.APP_LOG.Debug("Incus SSH设置实例配置成功",
 			zap.String("instance", instanceName),
@@ -211,9 +186,10 @@ func (i *IncusProvider) setInstanceConfig(ctx context.Context, instanceName stri
 	}
 
 	cmdLegacy := fmt.Sprintf("incus config set %s %s %s", shellSingleQuote(instanceName), shellSingleQuote(key), shellSingleQuote(value))
-	_, legacyErr := i.sshClient.Execute(cmdLegacy)
+	legacyOutput, legacyErr := i.sshClient.Execute(cmdLegacy)
 	if legacyErr != nil {
-		return fmt.Errorf("SSH设置实例配置失败: new syntax error=%v, legacy syntax error=%w", newErr, legacyErr)
+		return fmt.Errorf("SSH设置实例配置失败: new syntax error=%v, output=%s; legacy syntax error=%w, output=%s",
+			newErr, utils.RedactSensitiveCommand(newOutput, 1000), legacyErr, utils.RedactSensitiveCommand(legacyOutput, 1000))
 	}
 
 	global.APP_LOG.Debug("Incus SSH设置实例配置成功",
@@ -355,7 +331,7 @@ func (i *IncusProvider) ensureSSHScriptsAvailable(providerCountry string) error 
 			zap.String("scriptPath", scriptPath))
 
 		// 下载脚本文件
-		if err := i.downloadFileToRemote(downloadURL, scriptPath); err != nil {
+		if err := i.downloadFileToRemoteWithTimeout(downloadURL, scriptPath, sshScriptDownloadTimeout); err != nil {
 			global.APP_LOG.Error("下载SSH脚本失败",
 				zap.String("script", script),
 				zap.Error(err))

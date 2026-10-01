@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,17 @@ func (p *ProxmoxProvider) getDownloadURL(originalURL string, useCDN bool) string
 // shellSingleQuote 将任意字符串安全包裹为 shell 单引号字面量。
 func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+var safeProxmoxConfigValue = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+
+// shellConfigValue keeps the traditional compact command form for normal PVE
+// bridge/storage names while quoting unusual configured values safely.
+func shellConfigValue(value string) string {
+	if safeProxmoxConfigValue.MatchString(value) {
+		return value
+	}
+	return shellSingleQuote(value)
 }
 
 func (p *ProxmoxProvider) downloadRemoteFile(url, tmpPath, dstPath string, timeout time.Duration) (string, error) {
@@ -224,7 +236,7 @@ func (p *ProxmoxProvider) safeRemove(ctx context.Context, path string) error {
 	}
 
 	// 检查路径是否存在
-	checkCmd := fmt.Sprintf("[ -e '%s' ]", path)
+	checkCmd := fmt.Sprintf("[ -e %s ]", shellSingleQuote(path))
 	_, err := p.sshClient.Execute(checkCmd)
 	if err != nil {
 		// 路径不存在，无需删除
@@ -232,7 +244,7 @@ func (p *ProxmoxProvider) safeRemove(ctx context.Context, path string) error {
 	}
 
 	global.APP_LOG.Debug("删除路径", zap.String("path", path))
-	removeCmd := fmt.Sprintf("rm -rf '%s'", path)
+	removeCmd := fmt.Sprintf("rm -rf %s", shellSingleQuote(path))
 	_, err = p.sshClient.Execute(removeCmd)
 	return err
 }
@@ -252,38 +264,58 @@ func (p *ProxmoxProvider) cleanupIPv6NATRules(ctx context.Context, vmctid string
 	}
 
 	global.APP_LOG.Debug("清理IPv6 NAT规则", zap.String("vmctid", vmctid))
-	vmInternalIPv6 := fmt.Sprintf("2001:db8:1::%s", vmctid)
+	vmid, parseErr := strconv.Atoi(strings.TrimSpace(vmctid))
+	if parseErr != nil || vmid <= 0 {
+		return fmt.Errorf("无效的VMID")
+	}
 
-	// 查找外部IPv6地址
-	if _, err := p.sshClient.Execute(fmt.Sprintf("[ -f '%s' ]", rulesFile)); err == nil {
-		// 获取外部IPv6地址
-		getExternalIPCmd := fmt.Sprintf("grep -oP 'DNAT --to-destination %s' '%s' | head -1 | grep -oP '(?<=-d )[^ ]+' || true", vmInternalIPv6, rulesFile)
-		hostExternalIPv6, _ := p.sshClient.Execute(getExternalIPCmd)
-		hostExternalIPv6 = strings.TrimSpace(hostExternalIPv6)
-
-		if hostExternalIPv6 != "" {
-			global.APP_LOG.Debug("删除IPv6 NAT规则",
-				zap.String("internal", vmInternalIPv6),
-				zap.String("external", hostExternalIPv6))
-
-			// 删除ip6tables规则
-			_, _ = p.sshClient.Execute(fmt.Sprintf("ip6tables -t nat -D PREROUTING -d '%s' -j DNAT --to-destination '%s' 2>/dev/null || true", hostExternalIPv6, vmInternalIPv6))
-			_, _ = p.sshClient.Execute(fmt.Sprintf("ip6tables -t nat -D POSTROUTING -s '%s' -j SNAT --to-source '%s' 2>/dev/null || true", vmInternalIPv6, hostExternalIPv6))
-
-			// 从规则文件中删除相关行
-			_, _ = p.sshClient.Execute(fmt.Sprintf("sed -i '/DNAT --to-destination %s/d' '%s' 2>/dev/null || true", vmInternalIPv6, rulesFile))
-			_, _ = p.sshClient.Execute(fmt.Sprintf("sed -i '/SNAT --to-source %s/d' '%s' 2>/dev/null || true", hostExternalIPv6, rulesFile))
-
-			// 从已使用IP文件中删除
-			if _, err := p.sshClient.Execute(fmt.Sprintf("[ -f '%s' ]", usedIPsFile)); err == nil {
-				_, _ = p.sshClient.Execute(fmt.Sprintf("sed -i '/^%s$/d' '%s' 2>/dev/null || true", hostExternalIPv6, usedIPsFile))
-				global.APP_LOG.Debug("释放IPv6地址", zap.String("ipv6", hostExternalIPv6))
-			}
-
-			// 重启服务
-			_, _ = p.sshClient.Execute("systemctl daemon-reload")
-			_, _ = p.sshClient.Execute("systemctl restart ipv6nat.service")
+	// Prefer the PVE-persisted ULA subnet. The legacy documentation prefix is
+	// retained only so deleting an old instance still releases its old mapping.
+	internalAddresses := make([]string, 0, 2)
+	if natConfig, configErr := p.getProxmoxNATIPv6Config(ctx, p.getBridgeName("nat")); configErr == nil {
+		if address, addressErr := proxmoxNATIPv6ForVMID(&natConfig, vmid); addressErr == nil {
+			internalAddresses = append(internalAddresses, address)
 		}
+	}
+	if legacyAddress, legacyErr := proxmoxLegacyNATIPv6ForVMID(vmid); legacyErr == nil {
+		internalAddresses = append(internalAddresses, legacyAddress)
+	}
+
+	rulesPresent := false
+	if _, err := p.sshClient.Execute(fmt.Sprintf("[ -f %s ]", utils.ShellSingleQuote(rulesFile))); err == nil {
+		rulesPresent = true
+	}
+	updatedRules := false
+	for _, vmInternalIPv6 := range internalAddresses {
+		hostExternalIPv6, lookupErr := p.lookupNATMappedIPv6(vmInternalIPv6)
+		if lookupErr != nil {
+			continue
+		}
+		global.APP_LOG.Debug("删除IPv6 NAT规则",
+			zap.String("internal", vmInternalIPv6),
+			zap.String("external", hostExternalIPv6))
+
+		quotedInternal := utils.ShellSingleQuote(vmInternalIPv6)
+		quotedExternal := utils.ShellSingleQuote(hostExternalIPv6)
+		_, _ = p.sshClient.Execute(fmt.Sprintf("ip6tables -t nat -D PREROUTING -d %s -j DNAT --to-destination %s 2>/dev/null || true", quotedExternal, quotedInternal))
+		_, _ = p.sshClient.Execute(fmt.Sprintf("ip6tables -t nat -D POSTROUTING -s %s -j SNAT --to-source %s 2>/dev/null || true", quotedInternal, quotedExternal))
+
+		if rulesPresent {
+			temporaryTemplate := utils.ShellSingleQuote(rulesFile + ".tmp.XXXXXX")
+			_, _ = p.sshClient.Execute(fmt.Sprintf("tmp=$(mktemp %s) || exit 1; grep -Fv -- %s %s > \"$tmp\" || true; cat \"$tmp\" > %s; rm -f \"$tmp\"", temporaryTemplate, quotedInternal, utils.ShellSingleQuote(rulesFile), utils.ShellSingleQuote(rulesFile)))
+			updatedRules = true
+		}
+
+		if _, err := p.sshClient.Execute(fmt.Sprintf("[ -f %s ]", utils.ShellSingleQuote(usedIPsFile))); err == nil {
+			temporaryTemplate := utils.ShellSingleQuote(usedIPsFile + ".tmp.XXXXXX")
+			_, _ = p.sshClient.Execute(fmt.Sprintf("tmp=$(mktemp %s) || exit 1; grep -Fvx -- %s %s > \"$tmp\" || true; cat \"$tmp\" > %s; rm -f \"$tmp\"", temporaryTemplate, quotedExternal, utils.ShellSingleQuote(usedIPsFile), utils.ShellSingleQuote(usedIPsFile)))
+			global.APP_LOG.Debug("释放IPv6地址", zap.String("ipv6", hostExternalIPv6))
+		}
+	}
+
+	if updatedRules {
+		_, _ = p.sshClient.Execute("systemctl daemon-reload")
+		_, _ = p.sshClient.Execute("systemctl restart ipv6nat.service")
 	}
 
 	return nil
@@ -308,7 +340,7 @@ func (p *ProxmoxProvider) cleanupVMFiles(ctx context.Context, vmid string) error
 		}
 
 		// 列出存储中与该VM相关的卷
-		listVolCmd := fmt.Sprintf("pvesm list '%s' | awk -v vmid='%s' '$5 == vmid {print $1}'", storage, vmid)
+		listVolCmd := fmt.Sprintf("pvesm list %s | awk -v vmid=%s '$5 == vmid {print $1}'", shellSingleQuote(storage), shellSingleQuote(vmid))
 		volOutput, err := p.sshClient.Execute(listVolCmd)
 		if err != nil {
 			global.APP_LOG.Warn("列出存储卷失败", zap.String("storage", storage), zap.Error(err))
@@ -323,7 +355,7 @@ func (p *ProxmoxProvider) cleanupVMFiles(ctx context.Context, vmid string) error
 			}
 
 			// 获取卷路径并删除
-			pathCmd := fmt.Sprintf("pvesm path '%s' 2>/dev/null || true", volid)
+			pathCmd := fmt.Sprintf("pvesm path %s 2>/dev/null || true", shellSingleQuote(volid))
 			volPath, _ := p.sshClient.Execute(pathCmd)
 			volPath = strings.TrimSpace(volPath)
 
@@ -366,7 +398,7 @@ func (p *ProxmoxProvider) cleanupCTFiles(ctx context.Context, ctid string) error
 		}
 
 		// 列出存储中与该CT相关的卷
-		listVolCmd := fmt.Sprintf("pvesm list '%s' | awk -v ctid='%s' '$5 == ctid {print $1}'", storage, ctid)
+		listVolCmd := fmt.Sprintf("pvesm list %s | awk -v ctid=%s '$5 == ctid {print $1}'", shellSingleQuote(storage), shellSingleQuote(ctid))
 		volOutput, err := p.sshClient.Execute(listVolCmd)
 		if err != nil {
 			global.APP_LOG.Warn("列出存储卷失败", zap.String("storage", storage), zap.Error(err))
@@ -381,7 +413,7 @@ func (p *ProxmoxProvider) cleanupCTFiles(ctx context.Context, ctid string) error
 			}
 
 			// 获取卷路径并删除
-			pathCmd := fmt.Sprintf("pvesm path '%s' 2>/dev/null || true", volid)
+			pathCmd := fmt.Sprintf("pvesm path %s 2>/dev/null || true", shellSingleQuote(volid))
 			volPath, _ := p.sshClient.Execute(pathCmd)
 			volPath = strings.TrimSpace(volPath)
 
@@ -440,7 +472,7 @@ func (p *ProxmoxProvider) rebuildIPTablesRules(ctx context.Context) error {
 	global.APP_LOG.Debug("重建iptables规则")
 
 	// 应用规则文件
-	restoreCmd := fmt.Sprintf("cat '%s' | iptables-restore", rulesFile)
+	restoreCmd := fmt.Sprintf("cat %s | iptables-restore", shellSingleQuote(rulesFile))
 	_, err := p.sshClient.Execute(restoreCmd)
 	return err
 }
@@ -521,14 +553,13 @@ func (p *ProxmoxProvider) isPrivateIPv6(address string) bool {
 
 	// 私有IPv6地址范围检查
 	privateRanges := []string{
-		"fe80:",        // 链路本地地址
-		"fc00:",        // 唯一本地地址
-		"fd00:",        // 唯一本地地址
-		"2001:db8:",    // 文档用途（只有2001:db8:才是私有的）
-		"::1",          // 回环地址
-		"::ffff:",      // IPv4映射地址
-		"fd42:",        // Docker等使用的私有地址
-		"2001:db8:1::", // 在NAT映射中使用的内部地址
+		"fe80:",     // 链路本地地址
+		"fc00:",     // 唯一本地地址
+		"fd00:",     // 唯一本地地址
+		"2001:db8:", // 文档用途（只有2001:db8:才是私有的）
+		"::1",       // 回环地址
+		"::ffff:",   // IPv4映射地址
+		"fd42:",     // Docker等使用的私有地址
 	}
 
 	for _, prefix := range privateRanges {

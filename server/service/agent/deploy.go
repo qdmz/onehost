@@ -20,8 +20,10 @@ const (
 	AgentInstallDir  = "/opt/oneclickvirt/agent"
 	AgentPort        = 23782
 	AgentServiceName = "oneclickvirt-agent"
+	agentEgressGuard = "/usr/local/bin/oneclickvirt-egress-boot-guard"
+	egressGuardUnit  = "oneclickvirt-egress-guard"
 
-	maxInlineAgentArchiveBytes = 512 * 1024
+	maxInlineAgentArchiveBytes = 32 * 1024
 )
 
 // AgentConfig holds the configuration parameters for the agent deployment.
@@ -59,7 +61,7 @@ func (c *AgentConfig) resourceInterval() int {
 
 func buildEnvFile(cfg *AgentConfig) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("API_TOKEN=%s\n", cfg.Token))
+	sb.WriteString(fmt.Sprintf("API_TOKEN=%s\n", systemdEnvironmentValue(cfg.Token)))
 	sb.WriteString(fmt.Sprintf("TRAFFIC_COLLECT_INTERVAL=%d\n", cfg.trafficInterval()))
 	sb.WriteString(fmt.Sprintf("RESOURCE_COLLECT_INTERVAL=%d\n", cfg.resourceInterval()))
 	sb.WriteString("RUST_LOG=info\n")
@@ -67,13 +69,21 @@ func buildEnvFile(cfg *AgentConfig) string {
 	if method == "" {
 		method = "nft"
 	}
-	sb.WriteString(fmt.Sprintf("TRAFFIC_COLLECT_METHOD=%s\n", method))
+	sb.WriteString(fmt.Sprintf("TRAFFIC_COLLECT_METHOD=%s\n", systemdEnvironmentValue(method)))
 	if cfg.ExtraExcludeCIDRsV4 != "" {
-		sb.WriteString(fmt.Sprintf("EXTRA_EXCLUDE_CIDRS_V4=%s\n", cfg.ExtraExcludeCIDRsV4))
+		sb.WriteString(fmt.Sprintf("EXTRA_EXCLUDE_CIDRS_V4=%s\n", systemdEnvironmentValue(cfg.ExtraExcludeCIDRsV4)))
 	}
 	if cfg.ExtraExcludeCIDRsV6 != "" {
-		sb.WriteString(fmt.Sprintf("EXTRA_EXCLUDE_CIDRS_V6=%s\n", cfg.ExtraExcludeCIDRsV6))
+		sb.WriteString(fmt.Sprintf("EXTRA_EXCLUDE_CIDRS_V6=%s\n", systemdEnvironmentValue(cfg.ExtraExcludeCIDRsV6)))
 	}
+	// Transparent egress uses only a fixed, audited dependency set.  The
+	// agent still reports missing kernel capabilities separately; this flag
+	// permits the guarded package-manager probe to install user-space tools.
+	sb.WriteString("ONECLICKVIRT_EGRESS_AUTO_INSTALL=true\n")
+	// Controller-managed agents are explicitly authorized to reconcile the
+	// desired egress state selected by an administrator. The Agent still
+	// validates capabilities and keeps affected sources fail-closed on errors.
+	sb.WriteString("ONECLICKVIRT_EGRESS_APPLY=true\n")
 
 	// Reverse proxy configuration
 	sb.WriteString(fmt.Sprintf("ENABLE_REVERSE_PROXY=%t\n", cfg.EnableReverseProxy))
@@ -92,15 +102,44 @@ func buildEnvFile(cfg *AgentConfig) string {
 			}
 			sb.WriteString(fmt.Sprintf("PROXY_HTTPS_ADDR=0.0.0.0:%d\n", httpsPort))
 			if cfg.ProxyTLSCertPath != "" {
-				sb.WriteString(fmt.Sprintf("PROXY_TLS_CERT=%s\n", cfg.ProxyTLSCertPath))
+				sb.WriteString(fmt.Sprintf("PROXY_TLS_CERT=%s\n", systemdEnvironmentValue(cfg.ProxyTLSCertPath)))
 			}
 			if cfg.ProxyTLSKeyPath != "" {
-				sb.WriteString(fmt.Sprintf("PROXY_TLS_KEY=%s\n", cfg.ProxyTLSKeyPath))
+				sb.WriteString(fmt.Sprintf("PROXY_TLS_KEY=%s\n", systemdEnvironmentValue(cfg.ProxyTLSKeyPath)))
 			}
 		}
 	}
 
 	return sb.String()
+}
+
+// systemdEnvironmentValue writes a value in the quoted EnvironmentFile form.
+// Values originate from provider/user configuration, so newlines and control
+// characters must never be allowed to create additional environment entries.
+func systemdEnvironmentValue(value string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // buildDeployScript generates a self-contained bash deploy script for the agent.
@@ -109,14 +148,21 @@ func buildDeployScript(cfg *AgentConfig, version, arch string, downloadURLs []st
 	binaryName := fmt.Sprintf("%s-linux-%s", AgentBinaryName, arch)
 	archiveName := fmt.Sprintf("%s.tar.gz", binaryName)
 	envContent := buildEnvFile(cfg)
+	collectMethod := cfg.TrafficCollectMethod
+	if collectMethod == "" {
+		collectMethod = "nft"
+	}
 
 	serviceUnit := fmt.Sprintf(`[Unit]
 Description=OneclickVirt Monitoring Agent
-After=network.target
+After=network.target %s.service
+Wants=%s.service
 
 [Service]
 Type=simple
 WorkingDirectory=%s
+EnvironmentFile=-%s/.env
+ExecStartPre=%s
 ExecStart=%s/%s
 Restart=always
 RestartSec=5
@@ -124,12 +170,107 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-`, AgentInstallDir, AgentInstallDir, AgentBinaryName)
+`, egressGuardUnit, egressGuardUnit, AgentInstallDir, AgentInstallDir, agentEgressGuard, AgentInstallDir, AgentBinaryName)
+
+	guardScript := `#!/bin/sh
+set -eu
+
+SOURCE_DIR="${ONECLICKVIRT_EGRESS_STATE_DIR:-/var/lib/oneclickvirt/egress}"
+SOURCE_FILE="${SOURCE_DIR}/managed-sources"
+NFT_BIN="${ONECLICKVIRT_EGRESS_NFT_BIN:-nft}"
+TABLE_FAMILY="inet"
+TABLE_NAME="oneclickvirt_egress_boot"
+
+[ -f "$SOURCE_FILE" ] || exit 0
+[ -s "$SOURCE_FILE" ] || exit 0
+command -v "$NFT_BIN" >/dev/null 2>&1 || {
+    printf '%s\n' "oneclickvirt egress boot guard: nft is unavailable" >&2
+    exit 1
+}
+
+TMP_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/oneclickvirt-egress-guard.XXXXXX")
+trap 'rm -f "$TMP_SCRIPT"' EXIT HUP INT TERM
+
+TABLE_EXISTS=0
+if "$NFT_BIN" list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then
+    TABLE_EXISTS=1
+fi
+if [ "$TABLE_EXISTS" -eq 1 ]; then
+    printf 'flush table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME" > "$TMP_SCRIPT"
+else
+    printf 'add table %s %s\n' "$TABLE_FAMILY" "$TABLE_NAME" > "$TMP_SCRIPT"
+fi
+cat >> "$TMP_SCRIPT" << 'NFTEOF'
+add chain inet oneclickvirt_egress_boot boot_forward { type filter hook forward priority -200; policy accept; }
+add chain inet oneclickvirt_egress_boot boot_output { type filter hook output priority -200; policy accept; }
+add chain inet oneclickvirt_egress_boot boot_input { type filter hook input priority -200; policy accept; }
+NFTEOF
+
+VALID_SOURCES=0
+while IFS= read -r source || [ -n "$source" ]; do
+    [ -n "$source" ] || {
+        printf '%s\n' "oneclickvirt egress boot guard: empty source line" >&2
+        exit 1
+    }
+    case "$source" in
+        *[!0-9A-Fa-f:./]*|*/*/*|*/)
+            printf '%s\n' "oneclickvirt egress boot guard: invalid source entry" >&2
+            exit 1
+            ;;
+    esac
+    case "$source" in
+        *:*/*) FAMILY="ip6"; MAX_PREFIX=128 ;;
+        *.*/*) FAMILY="ip"; MAX_PREFIX=32 ;;
+        *)
+            printf '%s\n' "oneclickvirt egress boot guard: source is not an IP CIDR" >&2
+            exit 1
+            ;;
+    esac
+    PREFIX=${source##*/}
+    case "$PREFIX" in
+        ''|*[!0-9]*)
+            printf '%s\n' "oneclickvirt egress boot guard: invalid CIDR prefix" >&2
+            exit 1
+            ;;
+    esac
+    if ! awk -v prefix="$PREFIX" -v maximum="$MAX_PREFIX" 'BEGIN { exit !(prefix <= maximum) }'; then
+        printf '%s\n' "oneclickvirt egress boot guard: CIDR prefix out of range" >&2
+        exit 1
+    fi
+    printf 'add rule inet oneclickvirt_egress_boot boot_forward %s saddr %s counter drop\n' "$FAMILY" "$source" >> "$TMP_SCRIPT"
+    printf 'add rule inet oneclickvirt_egress_boot boot_output %s saddr %s counter drop\n' "$FAMILY" "$source" >> "$TMP_SCRIPT"
+    printf 'add rule inet oneclickvirt_egress_boot boot_input %s saddr %s counter drop\n' "$FAMILY" "$source" >> "$TMP_SCRIPT"
+    VALID_SOURCES=$((VALID_SOURCES + 1))
+done < "$SOURCE_FILE"
+
+[ "$VALID_SOURCES" -gt 0 ] || exit 0
+"$NFT_BIN" -c -f "$TMP_SCRIPT" >/dev/null
+"$NFT_BIN" -f "$TMP_SCRIPT" >/dev/null
+`
+
+	guardUnit := fmt.Sprintf(`[Unit]
+Description=OneClickVirt early-boot egress fail-closed guard
+Documentation=https://github.com/oneclickvirt/oneclickvirt
+DefaultDependencies=no
+After=local-fs.target nftables.service firewalld.service
+Before=network-pre.target network.target network-online.target %s.service docker.service containerd.service crio.service podman.service libvirtd.service lxc.service lxd.service incus.service pve-guests.service kubelet.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%s/.env
+ExecStart=%s
+RemainAfterExit=yes
+
+[Install]
+RequiredBy=network-pre.target
+`, AgentServiceName, AgentInstallDir, agentEgressGuard)
 
 	// We use printf to write files to avoid heredoc nesting issues within the script itself.
 	// envContent and serviceUnit are base64-encoded inside the script so any special chars are safe.
 	envB64 := base64.StdEncoding.EncodeToString([]byte(envContent))
 	svcB64 := base64.StdEncoding.EncodeToString([]byte(serviceUnit))
+	guardB64 := base64.StdEncoding.EncodeToString([]byte(guardScript))
+	guardUnitB64 := base64.StdEncoding.EncodeToString([]byte(guardUnit))
 
 	// Space-separated URL list for the shell script to iterate over (CDN mirrors first, GitHub last).
 	urlList := strings.Join(downloadURLs, " ")
@@ -145,15 +286,37 @@ EMBEDDED_ARCHIVE_B64="%s"
 SERVICE_NAME="%s"
 VERSION="%s"
 
-echo "[1/6] check and install traffic monitoring dependency..."
-# Read collect method from .env if already present, otherwise default to nft
-COLLECT_METHOD=""
-if [ -f "$INSTALL_DIR/.env" ]; then
-    COLLECT_METHOD=$(grep 'TRAFFIC_COLLECT_METHOD=' "$INSTALL_DIR/.env" 2>/dev/null | sed 's/TRAFFIC_COLLECT_METHOD=//' || true)
+echo "[0/6] check native egress dependencies..."
+EGRESS_MISSING=""
+command -v ip >/dev/null 2>&1 || EGRESS_MISSING="$EGRESS_MISSING iproute"
+command -v nft >/dev/null 2>&1 || EGRESS_MISSING="$EGRESS_MISSING nftables"
+command -v wg >/dev/null 2>&1 || EGRESS_MISSING="$EGRESS_MISSING wireguard-tools"
+if [ -n "$EGRESS_MISSING" ]; then
+    echo "  missing:$EGRESS_MISSING"
+    EGRESS_INSTALL_OK=0
+    if command -v apt-get >/dev/null 2>&1; then
+        if apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+    elif command -v dnf >/dev/null 2>&1; then
+        if dnf install -y -q iproute nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+    elif command -v yum >/dev/null 2>&1; then
+        if yum install -y -q iproute nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+    elif command -v apk >/dev/null 2>&1; then
+        if apk add --quiet iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+    elif command -v pacman >/dev/null 2>&1; then
+        if pacman -Sy --noconfirm iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+    elif command -v zypper >/dev/null 2>&1; then
+        if zypper --non-interactive install iproute2 nftables wireguard-tools >/dev/null 2>&1; then EGRESS_INSTALL_OK=1; fi
+    fi
+    if [ "$EGRESS_INSTALL_OK" -ne 1 ]; then
+        echo "  [WARN] native egress dependencies could not be installed; capability endpoint will report the exact missing tools"
+    fi
 fi
-# The new .env will be written below; parse the base64-encoded one for the intended method
-INTENDED_METHOD=$(printf '%%s' "%s" | base64 -d 2>/dev/null | grep 'TRAFFIC_COLLECT_METHOD=' | sed 's/TRAFFIC_COLLECT_METHOD=//' || echo "nft")
-COLLECT_METHOD="${INTENDED_METHOD:-nft}"
+echo "[OK] 0/6 native egress dependency probe complete"
+
+echo "[1/6] check and install traffic monitoring dependency..."
+# Use the configured method directly: systemd .env values are quoted, so
+# grep/sed would otherwise compare the literal '"ipt"' against 'ipt'.
+COLLECT_METHOD=%s
 
 if [ "$COLLECT_METHOD" = "ipt" ]; then
     echo "  Traffic collect method: iptables"
@@ -216,7 +379,13 @@ echo "[OK] 2/6 install directory created"
 echo "[3/6] download agent binary (version $VERSION)..."
 cd "$INSTALL_DIR"
 DOWNLOADED=0
-if [ -n "$EMBEDDED_ARCHIVE_B64" ]; then
+if [ -n "${OCV_AGENT_ARCHIVE:-}" ]; then
+    # Large controller-local assets are staged in bounded chunks over the
+    # existing authenticated transport, not embedded in a huge shell argv.
+    cp "$OCV_AGENT_ARCHIVE" "$ARCHIVE_NAME"
+    DOWNLOADED=1
+    echo "  source: staged controller asset"
+elif [ -n "$EMBEDDED_ARCHIVE_B64" ]; then
     if printf '%%s' "$EMBEDDED_ARCHIVE_B64" | base64 -d > "$ARCHIVE_NAME" 2>/dev/null && [ -s "$ARCHIVE_NAME" ]; then
         DOWNLOADED=1
         echo "  source: embedded controller asset"
@@ -259,13 +428,18 @@ if [ ! -x "$BINARY_NAME" ]; then
 fi
 echo "[OK] 4/6 binary ready at $INSTALL_DIR/$BINARY_NAME"
 
-echo "[5/6] write .env and systemd service..."
+echo "[5/6] write .env, boot guard, and systemd services..."
 printf '%%s' "%s" | base64 -d > "$INSTALL_DIR/.env"
+chmod 600 "$INSTALL_DIR/.env"
+printf '%%s' "%s" | base64 -d > "%s"
+chmod 700 "%s"
+printf '%%s' "%s" | base64 -d > /etc/systemd/system/"%s".service
 printf '%%s' "%s" | base64 -d > /etc/systemd/system/"$SERVICE_NAME".service
 echo "[OK] 5/6 configuration written"
 
 echo "[6/6] enable and start service..."
 systemctl daemon-reload
+systemctl enable "%s".service
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 echo "[OK] 6/6 service started"
@@ -279,9 +453,15 @@ echo "DEPLOY_SUCCESS"
 		embeddedArchiveB64,
 		AgentServiceName,
 		version,
-		envB64, // for dependency detection
+		utils.ShellSingleQuote(collectMethod),
 		envB64,
+		guardB64,
+		agentEgressGuard,
+		agentEgressGuard,
+		guardUnitB64,
+		egressGuardUnit,
 		svcB64,
+		egressGuardUnit,
 	)
 	return script
 }
@@ -305,6 +485,16 @@ func DeployAgentWithConfig(ctx context.Context, providerInstance provider.Provid
 	archiveName := fmt.Sprintf("%s.tar.gz", binaryName)
 	downloadURLs := buildDownloadURLList(version, archiveName)
 	embeddedArchiveB64 := inlineAgentArchiveB64(archiveName)
+	deployCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
+	defer cancel()
+	stagedArchive := ""
+	if content, assetErr := assets.ReadAgentAsset(archiveName); assetErr == nil && len(content) > maxInlineAgentArchiveBytes {
+		stagedArchive, err = stageAgentArchive(deployCtx, providerInstance.ExecuteSSHCommand, content)
+		if err != nil {
+			return "", fmt.Errorf("stage controller Agent asset: %w", err)
+		}
+		defer removeStagedAgentArchive(providerInstance.ExecuteSSHCommand, stagedArchive)
+	}
 
 	providerName := providerInstance.GetName()
 
@@ -313,14 +503,15 @@ func DeployAgentWithConfig(ctx context.Context, providerInstance provider.Provid
 
 	// Upload via printf + base64 decode, then execute, then clean up regardless of outcome.
 	// Using a unique tmp file to avoid collisions on concurrent deploys.
-	tmpScript := fmt.Sprintf("/tmp/ocv_agent_deploy_%s.sh", version)
+	safeVersion := utils.SanitizeShellArg(version)
+	if safeVersion == "" {
+		safeVersion = "unknown"
+	}
+	tmpScript := fmt.Sprintf("/tmp/ocv_agent_deploy_%s_%s.sh", safeVersion, newAgentTransferID())
 	uploadAndRun := fmt.Sprintf(
-		`printf '%%s' '%s' | base64 -d > %s && chmod +x %s && %s; RC=$?; rm -f %s; exit $RC`,
-		scriptB64, tmpScript, tmpScript, tmpScript, tmpScript,
+		`umask 077; printf '%%s' '%s' | base64 -d > %s && chmod +x %s && OCV_AGENT_ARCHIVE=%s %s; RC=$?; rm -f %s; exit $RC`,
+		scriptB64, utils.ShellSingleQuote(tmpScript), utils.ShellSingleQuote(tmpScript), utils.ShellSingleQuote(stagedArchive), utils.ShellSingleQuote(tmpScript), utils.ShellSingleQuote(tmpScript),
 	)
-
-	deployCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
-	defer cancel()
 
 	out, execErr := providerInstance.ExecuteSSHCommand(deployCtx, uploadAndRun)
 	out = strings.TrimSpace(out)
@@ -362,7 +553,11 @@ func UninstallAgent(ctx context.Context, providerInstance provider.Provider) err
 	commands := []string{
 		fmt.Sprintf("systemctl stop %s 2>/dev/null || true", AgentServiceName),
 		fmt.Sprintf("systemctl disable %s 2>/dev/null || true", AgentServiceName),
+		fmt.Sprintf("systemctl disable --now %s.service 2>/dev/null || true", egressGuardUnit),
 		fmt.Sprintf("rm -f /etc/systemd/system/%s.service", AgentServiceName),
+		fmt.Sprintf("rm -f /etc/systemd/system/%s.service", egressGuardUnit),
+		fmt.Sprintf("rm -f %s", agentEgressGuard),
+		"nft delete table inet oneclickvirt_egress_boot 2>/dev/null || true",
 		"systemctl daemon-reload",
 		fmt.Sprintf("rm -rf %s", AgentInstallDir),
 	}

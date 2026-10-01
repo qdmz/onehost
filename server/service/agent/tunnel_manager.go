@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +32,12 @@ type TunnelSession struct {
 	ackCh    chan tunnelAckPayload // 等待 tunnel_ack 的通道
 	activity chan struct{}
 	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func (s *TunnelSession) stop() {
+	s.doneOnce.Do(func() { close(s.done) })
+	_ = s.client.Close()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -41,6 +49,7 @@ type TunnelManager struct {
 	mu        sync.RWMutex
 	sessions  map[string]*TunnelSession // connID → session
 	hashIndex map[uint64]*TunnelSession // connHash → session（快速路由二进制帧）
+	closed    bool
 }
 
 // NewTunnelManager 创建隧道管理器，需要注入已连接的 AgentConn。
@@ -57,7 +66,7 @@ func NewTunnelManager(ac *AgentConn) *TunnelManager {
 func (tm *TunnelManager) HandleControllerPort(listenAddr string, targetHost string, targetPort int, stopCh <-chan struct{}) error {
 	return tm.handleControllerPortWithResolver(
 		listenAddr,
-		fmt.Sprintf("%s:%d", targetHost, targetPort),
+		net.JoinHostPort(strings.Trim(strings.TrimSpace(targetHost), "[]"), fmt.Sprintf("%d", targetPort)),
 		func() (string, int, error) {
 			return targetHost, targetPort, nil
 		},
@@ -74,9 +83,14 @@ func (tm *TunnelManager) handleControllerPortWithResolver(listenAddr string, tar
 }
 
 func (tm *TunnelManager) serveControllerPort(ln net.Listener, listenAddr string, targetDescription string, resolver tunnelTargetResolver, stopCh <-chan struct{}) error {
+	serveDone := make(chan struct{})
+	defer close(serveDone)
 	go func() {
-		<-stopCh
-		ln.Close()
+		select {
+		case <-stopCh:
+			ln.Close()
+		case <-serveDone:
+		}
 	}()
 
 	global.APP_LOG.Info("控制端端口转发已启动",
@@ -103,7 +117,7 @@ func (tm *TunnelManager) serveControllerPort(ln net.Listener, listenAddr string,
 			default:
 			}
 			global.APP_LOG.Warn("Accept 失败", zap.Error(err))
-			continue
+			return err
 		}
 		listenerConns.Store(conn, struct{}{})
 		go func() {
@@ -138,6 +152,11 @@ func (tm *TunnelManager) handleConn(client net.Conn, targetHost string, targetPo
 	connHash := uint64(0)
 
 	tm.mu.Lock()
+	if tm.closed {
+		tm.mu.Unlock()
+		_ = client.Close()
+		return
+	}
 	for attempt := 0; attempt < 8; attempt++ {
 		candidateID := randomID()
 		candidateHash := hashString(candidateID)
@@ -170,15 +189,14 @@ func (tm *TunnelManager) handleConn(client net.Conn, targetHost string, targetPo
 	tm.mu.Unlock()
 
 	defer func() {
-		client.Close()
-		select {
-		case <-sess.done:
-		default:
-			close(sess.done)
-		}
+		sess.stop()
 		tm.mu.Lock()
-		delete(tm.sessions, connID)
-		delete(tm.hashIndex, connHash)
+		if tm.sessions[connID] == sess {
+			delete(tm.sessions, connID)
+		}
+		if tm.hashIndex[connHash] == sess {
+			delete(tm.hashIndex, connHash)
+		}
 		tm.mu.Unlock()
 		// 通知 Agent 关闭隧道（使用短超时，避免阻塞新隧道建立）
 		closePayload, _ := json.Marshal(tunnelClosePayload{ConnID: connID})
@@ -191,7 +209,7 @@ func (tm *TunnelManager) handleConn(client net.Conn, targetHost string, targetPo
 	openMsg, _ := json.Marshal(wsMessage{Type: msgTypeTunnelOpen, Payload: openPayload})
 	_, openErr := sendTunnelOpenWithRetry(connID, func() error {
 		return tm.ac.writeTextMessage(openMsg, 10*time.Second)
-	}, sess.ackCh, tunnelOpenAckAttempts, tunnelOpenAckTimeout)
+	}, sess.ackCh, tunnelOpenAckAttempts, tunnelOpenAckTimeout, sess.done, tm.ac.doneCh)
 	if openErr != nil {
 		global.APP_LOG.Warn("tunnel_open 握手失败",
 			zap.String("connID", connID),
@@ -246,6 +264,7 @@ func (tm *TunnelManager) handleConn(client net.Conn, targetHost string, targetPo
 				copy(frame[:8], header)
 				copy(frame[8:], buf[:n])
 				if werr := tm.ac.writeBinaryMessage(frame, 10*time.Second); werr != nil {
+					sess.stop()
 					return
 				}
 				// Occasional micro-delay (0-3ms, ~20% probability) to
@@ -255,6 +274,17 @@ func (tm *TunnelManager) handleConn(client net.Conn, targetHost string, targetPo
 				}
 			}
 			if err != nil {
+				if err == io.EOF {
+					// A TCP read EOF may be CloseWrite, not full connection
+					// closure. Preserve the response direction until Agent EOF.
+					payload, _ := json.Marshal(tunnelClosePayload{ConnID: connID})
+					msg, _ := json.Marshal(wsMessage{Type: "tunnel_eof", Payload: payload})
+					if tm.ac.writeTextMessage(msg, 2*time.Second) != nil {
+						sess.stop()
+					}
+				} else {
+					sess.stop()
+				}
 				return
 			}
 		}
@@ -272,10 +302,11 @@ func (tm *TunnelManager) handleConn(client net.Conn, targetHost string, targetPo
 			}
 			idleTimer.Reset(tunnelSessionIdleTimeout)
 		case data, ok := <-sess.sendCh:
-			if !ok {
+			if !ok || data == nil {
 				return
 			}
 			notifyActivity()
+			_ = client.SetWriteDeadline(time.Now().Add(tunnelSessionIdleTimeout))
 			if _, err := client.Write(data); err != nil {
 				return
 			}
@@ -285,6 +316,8 @@ func (tm *TunnelManager) handleConn(client net.Conn, targetHost string, targetPo
 				zap.Duration("idleTimeout", tunnelSessionIdleTimeout))
 			return
 		case <-sess.done:
+			return
+		case <-tm.ac.doneCh:
 			return
 		}
 	}
@@ -305,7 +338,7 @@ func (tm *TunnelManager) DeliverByHash(connHash uint64, data []byte) {
 		global.APP_LOG.Warn("隧道会话缓冲区已满，主动终止以避免静默丢包",
 			zap.Uint("providerID", tm.ac.ProviderID),
 			zap.Uint64("connHash", connHash))
-		sess.client.Close()
+		sess.stop()
 	}
 }
 
@@ -351,7 +384,13 @@ func (tm *TunnelManager) CloseSession(connID string) {
 	sess, ok := tm.sessions[connID]
 	tm.mu.RUnlock()
 	if ok {
-		sess.client.Close()
+		// The read loop delivers data and close in wire order. A FIFO sentinel
+		// lets the TCP writer flush the final response before closing the client.
+		select {
+		case sess.sendCh <- nil:
+		default:
+			sess.stop()
+		}
 	}
 }
 
@@ -360,8 +399,9 @@ func (tm *TunnelManager) CloseSession(connID string) {
 // handleConn goroutine 持有的资源，防止它们在监听器停止后继续写入 WebSocket。
 // 同时关闭 client 连接和 done 通道，确保 handleConn 主循环退出。
 func (tm *TunnelManager) CloseAllSessions() {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.closed = true
 
 	if len(tm.sessions) == 0 {
 		return
@@ -372,14 +412,7 @@ func (tm *TunnelManager) CloseAllSessions() {
 		zap.Int("count", len(tm.sessions)))
 
 	for _, sess := range tm.sessions {
-		// 关闭 done 通道（触发 handleConn 主循环退出）
-		select {
-		case <-sess.done:
-		default:
-			close(sess.done)
-		}
-		// 关闭 client 连接（触发读/写 goroutine 退出）
-		sess.client.Close()
+		sess.stop()
 	}
 }
 
@@ -399,7 +432,10 @@ func GetOrCreateTunnelManager(providerID uint) (*TunnelManager, error) {
 	if hub == nil {
 		return nil, fmt.Errorf("AgentHub 未初始化")
 	}
-	ac, ok := hub.GetConn(providerID)
+	// Keep the connection snapshot valid through manager publication.
+	hub.mu.RLock()
+	defer hub.mu.RUnlock()
+	ac, ok := hub.conns[providerID]
 	if !ok || ac == nil {
 		return nil, fmt.Errorf("provider %d 的 Agent 当前离线或未连接", providerID)
 	}
@@ -414,6 +450,7 @@ func GetOrCreateTunnelManager(providerID uint) (*TunnelManager, error) {
 		}
 		// AgentConn 已更换，需要重建 TunnelManager
 		delete(tunnelMgrs, providerID)
+		mgr.CloseAllSessions()
 	}
 
 	mgr := NewTunnelManager(ac)
