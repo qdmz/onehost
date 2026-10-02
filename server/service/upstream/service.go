@@ -16,18 +16,18 @@ import (
 
 	"oneclickvirt/constant"
 	"oneclickvirt/global"
-	idcsmart "oneclickvirt/provider/idcsmart"
 	productModel "oneclickvirt/model/product"
 	providerModel "oneclickvirt/model/provider"
+	idcsmart "oneclickvirt/provider/idcsmart"
 )
 
 // ProductConfig 保存在 Product.UpstreamConfig 中的上游产品配置
 type ProductConfig struct {
-	UpstreamProductID string             `json:"upstream_product_id"` // 上游产品ID
-	DefaultOS         string             `json:"default_os"`          // 默认操作系统标识
-	OSList            []idcsmart.OSInfo  `json:"os_list"`
-	PeriodType        string             `json:"period_type"`
-	PeriodValue       int                `json:"period_value"`
+	UpstreamProductID string                 `json:"upstream_product_id"` // 上游产品ID
+	DefaultOS         string                 `json:"default_os"`          // 默认操作系统标识
+	OSList            []idcsmart.OSInfo      `json:"os_list"`
+	PeriodType        string                 `json:"period_type"`
+	PeriodValue       int                    `json:"period_value"`
 	Raw               map[string]interface{} `json:"raw"`
 }
 
@@ -40,11 +40,12 @@ func loadIDCConfig(p *providerModel.Provider) (*idcsmart.Config, error) {
 	if err := json.Unmarshal([]byte(p.AuthConfig), &cfg); err != nil {
 		return nil, fmt.Errorf("解析上游配置失败: %w", err)
 	}
-	if cfg.BaseURL == "" {
-		return nil, fmt.Errorf("智简魔方 BaseURL 未配置")
-	}
 	if cfg.SignMethod == "" {
 		cfg.SignMethod = "md5"
+	}
+	// 使用 Validate 统一校验，给出明确的错误提示
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	return &cfg, nil
 }
@@ -71,9 +72,23 @@ func TestConnection(providerID uint) error {
 	return cli.TestConnection()
 }
 
+// GetUpstreamProductTypes 获取上游产品类型列表及各类型产品数量（用于选择性同步 UI）
+func GetUpstreamProductTypes(providerID uint) ([]idcsmart.ProductTypeInfo, error) {
+	var p providerModel.Provider
+	if err := global.APP_DB.First(&p, providerID).Error; err != nil {
+		return nil, fmt.Errorf("节点不存在: %w", err)
+	}
+	cli, err := newClient(&p)
+	if err != nil {
+		return nil, err
+	}
+	return cli.GetProductTypes()
+}
+
 // SyncProducts 从上游拉取产品并同步为 OneHost 可售产品
+// productTypes 为空表示同步全部类型；非空则只同步指定类型的产品
 // 返回同步数量与被跳过的条目数
-func SyncProducts(providerID uint) (int, int, error) {
+func SyncProducts(providerID uint, productTypes []string) (int, int, error) {
 	var p providerModel.Provider
 	if err := global.APP_DB.First(&p, providerID).Error; err != nil {
 		return 0, 0, fmt.Errorf("节点不存在: %w", err)
@@ -94,6 +109,22 @@ func SyncProducts(providerID uint) (int, int, error) {
 			skipped++
 			continue
 		}
+		// 选择性同步：如果指定了 productTypes 过滤器，只同步匹配类型的产品
+		if len(productTypes) > 0 {
+			matched := false
+			for _, pt := range productTypes {
+				if up.Type == pt {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				skipped++
+				continue
+			}
+		}
+		// 根据上游产品类型自动映射 OneHost 产品类别
+		productCategory := idcsmart.ProductTypeToCategory(up.Type)
 		pc := ProductConfig{
 			UpstreamProductID: up.ID,
 			DefaultOS:         defaultOS(up.OSList),
@@ -110,18 +141,19 @@ func SyncProducts(providerID uint) (int, int, error) {
 			First(&exist)
 		if tx.Error == nil && exist.ID > 0 {
 			updates := map[string]interface{}{
-				"description":    up.Description,
-				"cpu":            up.CPU,
-				"memory":         up.Memory,
-				"disk":           up.Disk,
-				"bandwidth":      up.Bandwidth,
-				"traffic":        up.Traffic,
-				"price":          up.Price,
-				"period_type":    pc.PeriodType,
-				"period_value":   pc.PeriodValue,
-				"upstream_config": string(pcJSON),
+				"description":         up.Description,
+				"cpu":                 up.CPU,
+				"memory":              up.Memory,
+				"disk":                up.Disk,
+				"bandwidth":           up.Bandwidth,
+				"traffic":             up.Traffic,
+				"price":               up.Price,
+				"period_type":         pc.PeriodType,
+				"period_value":        pc.PeriodValue,
+				"upstream_config":     string(pcJSON),
 				"default_provider_id": p.ID,
-				"provider_ids":    strconv.Itoa(int(p.ID)),
+				"provider_ids":        strconv.Itoa(int(p.ID)),
+				"category":            productCategory,
 			}
 			if err := global.APP_DB.Model(&exist).Updates(updates).Error; err != nil {
 				global.APP_LOG.Warn("更新上游产品失败", zap.Uint("providerID", providerID), zap.String("name", up.Name), zap.Error(err))
@@ -136,7 +168,7 @@ func SyncProducts(providerID uint) (int, int, error) {
 			Name:              up.Name,
 			Description:       up.Description,
 			Type:              "vm",
-			Category:          "vm",
+			Category:          productCategory,
 			CPU:               up.CPU,
 			Memory:            up.Memory,
 			Disk:              up.Disk,
@@ -198,21 +230,21 @@ func ProvisionOrder(order *productModel.ProductOrder) error {
 
 	// 先创建本地实例记录（状态 creating），再异步轮询上游状态
 	inst := providerModel.Instance{
-		Name:          fmt.Sprintf("idc-%s", uuid.New().String()[:8]),
-		Provider:      provider.Name,
-		ProviderID:    provider.ID,
-		ProviderVMID:  "pending",
-		UpstreamType:  constant.UpstreamTypeIDC,
-		Status:        "creating",
-		InstanceType:  "vm",
-		CPU:           order.CPU,
-		Memory:        int64(order.Memory),
-		Disk:          int64(order.Disk),
-		Bandwidth:     order.Bandwidth,
-		NetworkType:   "dedicated_ipv4",
-		UserID:        order.UserID,
-		Image:         osID,
-		OSType:        osID,
+		Name:         fmt.Sprintf("idc-%s", uuid.New().String()[:8]),
+		Provider:     provider.Name,
+		ProviderID:   provider.ID,
+		ProviderVMID: "pending",
+		UpstreamType: constant.UpstreamTypeIDC,
+		Status:       "creating",
+		InstanceType: "vm",
+		CPU:          order.CPU,
+		Memory:       int64(order.Memory),
+		Disk:         int64(order.Disk),
+		Bandwidth:    order.Bandwidth,
+		NetworkType:  "dedicated_ipv4",
+		UserID:       order.UserID,
+		Image:        osID,
+		OSType:       osID,
 	}
 	if order.ExpireAt != nil {
 		inst.ExpiresAt = order.ExpireAt
@@ -419,6 +451,7 @@ func mapUpstreamProduct(raw map[string]interface{}) idcsmart.UpstreamProduct {
 	up.ID = strField(raw, "id", "product_id", "pid", "upstream_id")
 	up.Name = strField(raw, "name", "product_name", "title")
 	up.Description = strField(raw, "description", "desc", "remark")
+	up.Type = strField(raw, "type", "product_type", "ptype")
 	up.CPU = intField(raw, "cpu", "cpu_core", "cores")
 	up.Memory = intField(raw, "memory", "mem", "ram", "memory_mb")
 	up.Disk = intField(raw, "disk", "disk_size", "disk_mb", "storage")

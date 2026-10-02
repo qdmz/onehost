@@ -287,6 +287,8 @@ func InitAdminRouter(Router *gin.RouterGroup) {
 		// 上游对接（智简魔方 API 代理销售，普通管理员可访问）
 		NormalAdminGroup.GET("/upstream/providers", admin.ListUpstreamProviders)
 		NormalAdminGroup.POST("/upstream/providers", admin.CreateUpstreamProvider)
+		NormalAdminGroup.GET("/upstream/providers/:id", admin.GetUpstreamProvider)
+		NormalAdminGroup.GET("/upstream/providers/:id/product-types", admin.GetUpstreamProductTypes)
 		NormalAdminGroup.PUT("/upstream/providers/:id", admin.UpdateUpstreamProvider)
 		NormalAdminGroup.DELETE("/upstream/providers/:id", admin.DeleteUpstreamProvider)
 		NormalAdminGroup.POST("/upstream/test", admin.TestUpstreamConnection)
