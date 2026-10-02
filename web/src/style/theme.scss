@@ -905,3 +905,84 @@ html.dark {
   --warning-bg: #1c1500;
   --error-bg: #1c0a0a;
 }
+
+/* ============================================================
+ * OneHost 现代 UI 增强层 - 霓虹/玻璃拟态/完全响应式
+ * 增量追加，不影响原有变量
+ * ============================================================ */
+
+:root {
+  /* ── 霓虹主题配色 ── */
+  --neon-primary: #6366f1;
+  --neon-primary-light: #818cf8;
+  --neon-primary-dark: #4f46e5;
+  --neon-accent: #06b6d4;
+  --neon-accent-light: #22d3ee;
+  --neon-purple: #a855f7;
+  --neon-pink: #ec4899;
+  --neon-green: #10b981;
+  --neon-amber: #f59e0b;
+  --neon-red: #ef4444;
+
+  /* ── 暗色背景系统 ── */
+  --dark-bg: #0f172a;
+  --dark-surface: #1e293b;
+  --dark-surface-elevated: #334155;
+  --dark-card: rgba(30, 41, 59, 0.75);
+  --dark-input: rgba(255, 255, 255, 0.06);
+  --dark-hover: rgba(99, 102, 241, 0.12);
+  --dark-active: rgba(99, 102, 241, 0.2);
+
+  /* ── 文字系统 ── */
+  --dark-text-primary: #f8fafc;
+  --dark-text-secondary: #94a3b8;
+  --dark-text-muted: #64748b;
+  --dark-text-highlight: #e0e7ff;
+
+  /* ── 边框系统 ── */
+  --dark-border: rgba(99, 102, 241, 0.25);
+  --dark-border-subtle: rgba(148, 163, 184, 0.12);
+  --dark-border-focus: rgba(99, 102, 241, 0.6);
+
+  /* ── 霓虹 glow 阴影 ── */
+  --glow-sm: 0 2px 6px rgba(0, 0, 0, 0.3);
+  --glow-md: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --glow-lg: 0 12px 40px rgba(99, 102, 241, 0.15);
+  --glow-ring: 0 0 0 3px rgba(99, 102, 241, 0.15);
+  --glow-neon: 0 0 20px rgba(99, 102, 241, 0.3);
+
+  /* ── 增强圆角 ── */
+  --radius-modern: 14px;
+  --radius-modern-lg: 20px;
+  --radius-modern-xl: 28px;
+
+  /* ── 增强间距 ── */
+  --space-2xs: 4px;
+  --space-modern: 18px;
+  --space-modern-lg: 28px;
+
+  /* ── 过渡 ── */
+  --modern-transition: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* ── 布局 ── */
+  --content-max-width: 1200px;
+  --sidebar-width: 260px;
+  --sidebar-collapsed: 68px;
+  --navbar-height: 60px;
+}
+
+/* ── 暗色模式增强 ── */
+html.dark {
+  --dark-bg: #020617;
+  --dark-surface: #0f172a;
+  --dark-surface-elevated: #1e293b;
+  --dark-card: rgba(15, 23, 42, 0.85);
+  --dark-input: rgba(255, 255, 255, 0.08);
+  --dark-hover: rgba(99, 102, 241, 0.16);
+  --dark-active: rgba(99, 102, 241, 0.24);
+  --dark-text-primary: #f1f5f9;
+  --dark-text-secondary: #94a3b8;
+  --dark-text-muted: #64748b;
+  --dark-border: rgba(99, 102, 241, 0.35);
+  --dark-border-subtle: rgba(148, 163, 184, 0.18);
+}
