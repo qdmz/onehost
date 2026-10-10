@@ -4,6 +4,7 @@ export default {
   addProvider: '添加上游节点',
   providerList: '上游节点列表',
   empty: '暂无上游节点，点击右上角「添加上游节点」开始配置',
+  emptyTitle: '还没有上游节点',
   name: '节点名称',
   namePlaceholder: '如：智简魔方-香港机房',
   status: '状态',
@@ -45,5 +46,28 @@ export default {
   testHint: '点击「立即测试」验证 API 配置是否可用',
   testNow: '立即测试',
   close: '关闭',
-  regionPlaceholder: '如：香港 / 美国'
+  regionPlaceholder: '如：香港 / 美国',
+  // 新增
+  config: '配置',
+  configReady: '已配置',
+  configMissing: '未配置',
+  configExists: '当前已有 API 配置',
+  configMissingAlert: '当前节点尚未配置 API 信息，请填写下方配置',
+  notSet: '未设置',
+  statTotal: '节点总数',
+  statActive: '启用中',
+  statConfigured: '已配置',
+  statProducts: '同步产品',
+  // 选择性同步
+  selectiveSyncTitle: '选择性同步产品',
+  selectiveSyncHint: '选择要同步的产品类型，未选将跳过。不选则同步全部类型。',
+  selectAll: '全选',
+  confirmSync: '开始同步',
+  noProductTypes: '未能获取产品类型，将同步全部产品',
+  // V10 API
+  authTypeV10: 'V10 RESTful API',
+  authTypeApiClient: 'API ID + Key 签名',
+  authTypeModule: '用户名密码',
+  email: '登录邮箱',
+  emailPlaceholder: 'V10 API 登录邮箱'
 }
