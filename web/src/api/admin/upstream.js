@@ -10,6 +10,13 @@ export const getUpstreamProviderList = () => {
   })
 }
 
+export const getUpstreamProvider = (id) => {
+  return request({
+    url: `/v1/admin/upstream/providers/${id}`,
+    method: 'get'
+  })
+}
+
 export const createUpstreamProvider = (data) => {
   return request({
     url: '/v1/admin/upstream/providers',
@@ -44,11 +51,25 @@ export const testUpstreamConnection = (data) => {
 }
 
 // 同步上游产品为可售产品
-export const syncUpstreamProducts = (providerId) => {
+// productTypes: 可选，选择性同步 — 只同步指定类型的产品（如 ['dcimcloud', 'dcim']）
+export const syncUpstreamProducts = (providerId, productTypes) => {
+  const data = { providerId }
+  if (productTypes && productTypes.length > 0) {
+    data.productTypes = productTypes
+  }
   return request({
     url: '/v1/admin/upstream/sync',
     method: 'post',
-    data: { providerId },
+    data,
     timeout: 120000
+  })
+}
+
+// 获取上游产品类型列表（用于选择性同步 UI）
+export const getUpstreamProductTypes = (id) => {
+  return request({
+    url: `/v1/admin/upstream/providers/${id}/product-types`,
+    method: 'get',
+    timeout: 60000
   })
 }

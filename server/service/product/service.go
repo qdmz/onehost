@@ -11,12 +11,12 @@ import (
 	"oneclickvirt/global"
 	adminModel "oneclickvirt/model/admin"
 	"oneclickvirt/model/common"
-	providerModel "oneclickvirt/model/provider"
 	productModel "oneclickvirt/model/product"
+	providerModel "oneclickvirt/model/provider"
 	systemModel "oneclickvirt/model/system"
 	userModel "oneclickvirt/model/user"
-	userService "oneclickvirt/service/user"
 	upstreamService "oneclickvirt/service/upstream"
+	userService "oneclickvirt/service/user"
 	"oneclickvirt/utils"
 
 	"go.uber.org/zap"
@@ -250,28 +250,28 @@ func (s *Service) CreateOrder(userID uint, req productModel.CreateOrderRequest) 
 	expireAt := s.calculateExpireAt(product.PeriodType, product.PeriodValue, req.Quantity, time.Now())
 
 	order := productModel.ProductOrder{
-		OrderNo:       orderNo,
-		UserID:        userID,
-		ProductID:     req.ProductID,
-		ProductName:   product.Name,
-		ProductType:   product.Type,
-		CPU:           product.CPU,
-		Memory:        product.Memory,
-		Disk:          product.Disk,
-		Bandwidth:     product.Bandwidth,
-		Traffic:       product.Traffic,
-		PeriodType:    product.PeriodType,
-		PeriodValue:   product.PeriodValue,
-		Price:         product.Price,
-		Quantity:      req.Quantity,
-		TotalAmount:   totalAmount,
-		PaymentStatus: 0, // 未支付
+		OrderNo:         orderNo,
+		UserID:          userID,
+		ProductID:       req.ProductID,
+		ProductName:     product.Name,
+		ProductType:     product.Type,
+		CPU:             product.CPU,
+		Memory:          product.Memory,
+		Disk:            product.Disk,
+		Bandwidth:       product.Bandwidth,
+		Traffic:         product.Traffic,
+		PeriodType:      product.PeriodType,
+		PeriodValue:     product.PeriodValue,
+		Price:           product.Price,
+		Quantity:        req.Quantity,
+		TotalAmount:     totalAmount,
+		PaymentStatus:   0, // 未支付
 		ProvisionStatus: 0, // 待开通
-		ImageID:       image.ID,
-		ImageName:     image.Name,
-		UpstreamType:  product.UpstreamType, // 上游代理产品标记
-		UpstreamOS:    image.Name,           // 上游操作系统标识（即 OS ID）
-		ExpireAt:      &expireAt,
+		ImageID:         image.ID,
+		ImageName:       image.Name,
+		UpstreamType:    product.UpstreamType, // 上游代理产品标记
+		UpstreamOS:      image.Name,           // 上游操作系统标识（即 OS ID）
+		ExpireAt:        &expireAt,
 	}
 
 	if err := global.APP_DB.Create(&order).Error; err != nil {
@@ -1017,6 +1017,11 @@ func (s *Service) selectProvider(product *productModel.Product, defaultProviderI
 		if err := global.APP_DB.First(&p, id).Error; err != nil {
 			return false
 		}
+		// 上游代理节点（如智简魔方）不能作为本地虚拟化节点使用，
+		// 它们没有 SSH/Agent 连接通道，仅通过上游 API 管理。
+		if p.ConnectionType == "upstream" {
+			return false
+		}
 		ok := (p.ConnectionType == "agent" && p.AgentStatus == "online") ||
 			(p.ConnectionType != "agent" && (p.Status == "active" || p.Status == "partial"))
 		return ok && !p.IsFrozen && p.AllowClaim
@@ -1290,28 +1295,28 @@ func (s *Service) GetAdminProductList(req productModel.AdminProductListRequest) 
 // CreateAdminProduct 管理员创建产品
 func (s *Service) CreateAdminProduct(req productModel.CreateProductRequest) (*productModel.Product, error) {
 	product := productModel.Product{
-		Name:         req.Name,
-		Description:  req.Description,
-		Type:         req.Type,
-		Category:     req.Category,
-		CPU:          req.CPU,
-		Memory:       req.Memory,
-		Disk:         req.Disk,
-		Bandwidth:    req.Bandwidth,
-		Traffic:      req.Traffic,
-		Price:        req.Price,
-		PeriodType:   req.PeriodType,
-		PeriodValue:  req.PeriodValue,
-		MaxSnapshots: req.MaxSnapshots,
-		MaxPorts:     req.MaxPorts,
-		Stock:        req.Stock,
-		MaxPerUser:   req.MaxPerUser,
-		Status:       req.Status,
-		SortOrder:    req.SortOrder,
-		Icon:         req.Icon,
-		IsRecommended: req.IsRecommended,
-		ImageIDs:     req.ImageIDs,
-		ProviderIDs:  req.ProviderIDs,
+		Name:              req.Name,
+		Description:       req.Description,
+		Type:              req.Type,
+		Category:          req.Category,
+		CPU:               req.CPU,
+		Memory:            req.Memory,
+		Disk:              req.Disk,
+		Bandwidth:         req.Bandwidth,
+		Traffic:           req.Traffic,
+		Price:             req.Price,
+		PeriodType:        req.PeriodType,
+		PeriodValue:       req.PeriodValue,
+		MaxSnapshots:      req.MaxSnapshots,
+		MaxPorts:          req.MaxPorts,
+		Stock:             req.Stock,
+		MaxPerUser:        req.MaxPerUser,
+		Status:            req.Status,
+		SortOrder:         req.SortOrder,
+		Icon:              req.Icon,
+		IsRecommended:     req.IsRecommended,
+		ImageIDs:          req.ImageIDs,
+		ProviderIDs:       req.ProviderIDs,
 		DefaultProviderID: req.DefaultProviderID,
 		DefaultImageID:    req.DefaultImageID,
 	}
@@ -1334,28 +1339,28 @@ func (s *Service) UpdateAdminProduct(productID uint, req productModel.UpdateProd
 	}
 
 	updates := map[string]interface{}{
-		"name":          req.Name,
-		"description":   req.Description,
-		"type":          req.Type,
-		"category":      req.Category,
-		"cpu":           req.CPU,
-		"memory":        req.Memory,
-		"disk":          req.Disk,
-		"bandwidth":     req.Bandwidth,
-		"traffic":       req.Traffic,
-		"price":         req.Price,
-		"period_type":   req.PeriodType,
-		"period_value":  req.PeriodValue,
-		"max_snapshots": req.MaxSnapshots,
-		"max_ports":     req.MaxPorts,
-		"stock":         req.Stock,
-		"max_per_user":  req.MaxPerUser,
-		"status":        req.Status,
-		"sort_order":    req.SortOrder,
-		"icon":          req.Icon,
-		"is_recommended": req.IsRecommended,
-		"image_ids":     req.ImageIDs,
-		"provider_ids":  req.ProviderIDs,
+		"name":                req.Name,
+		"description":         req.Description,
+		"type":                req.Type,
+		"category":            req.Category,
+		"cpu":                 req.CPU,
+		"memory":              req.Memory,
+		"disk":                req.Disk,
+		"bandwidth":           req.Bandwidth,
+		"traffic":             req.Traffic,
+		"price":               req.Price,
+		"period_type":         req.PeriodType,
+		"period_value":        req.PeriodValue,
+		"max_snapshots":       req.MaxSnapshots,
+		"max_ports":           req.MaxPorts,
+		"stock":               req.Stock,
+		"max_per_user":        req.MaxPerUser,
+		"status":              req.Status,
+		"sort_order":          req.SortOrder,
+		"icon":                req.Icon,
+		"is_recommended":      req.IsRecommended,
+		"image_ids":           req.ImageIDs,
+		"provider_ids":        req.ProviderIDs,
 		"default_provider_id": req.DefaultProviderID,
 		"default_image_id":    req.DefaultImageID,
 	}

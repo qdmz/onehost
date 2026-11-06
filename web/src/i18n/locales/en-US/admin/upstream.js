@@ -4,6 +4,7 @@ export default {
   addProvider: 'Add Upstream',
   providerList: 'Upstream Providers',
   empty: 'No upstream providers yet. Click "Add Upstream" to configure one.',
+  emptyTitle: 'No upstream providers yet',
   name: 'Name',
   namePlaceholder: 'e.g. IDCsmart-HongKong',
   status: 'Status',
@@ -45,5 +46,28 @@ export default {
   testHint: 'Click "Test Now" to verify the API config.',
   testNow: 'Test Now',
   close: 'Close',
-  regionPlaceholder: 'e.g. Hong Kong / US'
+  regionPlaceholder: 'e.g. Hong Kong / US',
+  // New entries
+  config: 'Config',
+  configReady: 'Configured',
+  configMissing: 'Not Configured',
+  configExists: 'API config already set',
+  configMissingAlert: 'No API config set for this node. Please fill in the config below.',
+  notSet: 'not set',
+  statTotal: 'Total Nodes',
+  statActive: 'Active',
+  statConfigured: 'Configured',
+  statProducts: 'Synced Products',
+  // Selective sync
+  selectiveSyncTitle: 'Selective Product Sync',
+  selectiveSyncHint: 'Select product types to sync. Unselected types will be skipped. Leave all unchecked to sync everything.',
+  selectAll: 'Select All',
+  confirmSync: 'Start Sync',
+  noProductTypes: 'Could not load product types. Will sync all products.',
+  // V10 API
+  authTypeV10: 'V10 RESTful API',
+  authTypeApiClient: 'API ID + Key Sign',
+  authTypeModule: 'Username/Password',
+  email: 'Login Email',
+  emailPlaceholder: 'V10 API login email'
 }
