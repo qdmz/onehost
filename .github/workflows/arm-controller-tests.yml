@@ -120,7 +120,7 @@ jobs:
         run: python3 scripts/validate_agent_assets.py server/assets/agent
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache: true
